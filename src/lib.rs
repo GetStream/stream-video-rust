@@ -1,5 +1,4 @@
 #![doc = include_str!("../README.md")]
-#![cfg_attr(docsrs, feature(doc_auto_cfg))]
 #![doc(html_favicon_url = "https://avatars.githubusercontent.com/u/8597527?s=32&v=4")]
 #![doc(html_logo_url = "https://avatars.githubusercontent.com/u/8597527?s=128&v=4")]
 #![doc(issue_tracker_base_url = "https://github.com/GetStream/stream-video-rust/issues/")]
