@@ -1,0 +1,25 @@
+# Rust build artifacts
+/target
+
+# Environment / secrets — never commit the real .env (see .env.example, which IS tracked)
+.env
+.env.local
+!.env.example
+
+# getstream CLI local credentials — `.stream/creds.yaml` holds the API key+secret
+.stream/
+
+# Rustfmt backups
+**/*.rs.bk
+
+# macOS
+.DS_Store
+
+# Cargo.lock is intentionally KEPT (tracked) for this crate — do not ignore it.
+/.agents
+/.idea
+
+# Editor / agent tooling
+/.cursor
+/.claude/skills
+/skills-lock.json

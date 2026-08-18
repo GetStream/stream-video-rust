@@ -1,0 +1,359 @@
+syntax = "proto3";
+
+package stream.video.sfu.event;
+
+import "video/sfu/models/models.proto";
+import "video/sfu/signal_rpc/signal.proto";
+
+option csharp_namespace = "Stream.Video.v1.Sfu.Events";
+option go_package = "github.com/GetStream/protocol/protobuf/video/sfu/event";
+option java_multiple_files = true;
+option java_outer_classname = "SfuEventsV1";
+
+// SFUEvent is a message that is sent from the SFU to the client.
+message SfuEvent {
+  oneof event_payload {
+    // SubscriberOffer sends the SDP offer for establishing the
+    // subscriber PeerConnection.
+    SubscriberOffer subscriber_offer = 1;
+    // PublisherAnswer sends the SDP answer to the offer sent by
+    // the client for establishing the Publisher PeerConnection.
+    PublisherAnswer publisher_answer = 2;
+    // ConnectionQualityChanged is sent to inform the connection
+    // quality of the participants in the call. It does not have
+    // to contain the full list of call participants in it.
+    ConnectionQualityChanged connection_quality_changed = 3;
+    // AudioLevelChanged is sent for change in audio levels of
+    // the participants.
+    AudioLevelChanged audio_level_changed = 4;
+    // ICETrickle contains the ICE candidate required to establish
+    // the ICE transport: part of establishing the PeerConnection
+    // and also for ICE restarts.
+    models.ICETrickle ice_trickle = 5;
+    // ChangePublishQuality advises the publisher to switch on/off
+    // various qualities of their video stream based on the subscription.
+    // This is done to save the bandwidth and the CPU of the publisher.
+    ChangePublishQuality change_publish_quality = 6;
+    // ParticipantJoined notifies the client that a new participant
+    // has joined the call. This is not sent for anonymous users.
+    ParticipantJoined participant_joined = 10;
+    // ParticipantLeft notifies the client that a call participant
+    // has left the call. This is not sent for anonymous users.
+    ParticipantLeft participant_left = 11;
+    // DominantSpeakerChanged notifies the client about the current
+    // dominant speaker. This is required for certain use cases like
+    // the spotlight view.
+    DominantSpeakerChanged dominant_speaker_changed = 12;
+    // JoinResponse acknowledges a participant successfully joining
+    // the call. This is sent in response to the JoinRequest.
+    JoinResponse join_response = 13;
+    // HealthCheckResponse is sent in response to the HealthCheckRequest.
+    // It contains the participant count in the call.
+    HealthCheckResponse health_check_response = 14;
+    // TrackPublished is sent when a new track (like audio, video, screenshare)
+    // is published by a participant in the call. It is also sent on mute/unmute.
+    TrackPublished track_published = 16;
+    // TrackUnpublished is sent when a track (like audio, video, screenshare)
+    // is no longer published. It is sent on muting a track or when the participant
+    // is leaving the call.
+    TrackUnpublished track_unpublished = 17;
+    // Error is used to communicate any error related to the participant. The
+    // error code and the message explain what went wrong. Whether the participant
+    // can retry is also indicated.
+    Error error = 18;
+    // CallGrantsUpdated tells what tracks a participant is allowed to publish.
+    CallGrantsUpdated call_grants_updated = 19;
+    // GoAway tells the client to migrate away from the SFU it is connected to.
+    // The reason field indicates why this message was sent.
+    GoAway go_away = 20;
+    // ICERestart tells the client to perform ICE restart.
+    ICERestart ice_restart = 21;
+    // PinsChanged is sent the list of pins in the call changes. This event contains the entire list of pins.
+    PinsChanged pins_updated = 22;
+    // CallEnded is sent by the SFU to the client to signal that the call has ended.
+    // The reason may specify why the call has ended.
+    CallEnded call_ended = 23;
+    // ParticipantUpdated is sent when user data is updated
+    ParticipantUpdated participant_updated = 24;
+    // ParticipantMigrationComplete is sent when the participant migration is complete
+    ParticipantMigrationComplete participant_migration_complete = 25;
+    // ChangePublishOptions is sent to signal the change in publish options such as a new codec or simulcast layers
+    ChangePublishOptions change_publish_options = 27;
+    // InboundStateNotification
+    InboundStateNotification inbound_state_notification = 28;
+  }
+}
+
+message ChangePublishOptions {
+  repeated models.PublishOption publish_options = 1;
+  string reason = 2;
+}
+
+message ChangePublishOptionsComplete {
+}
+
+message ParticipantMigrationComplete {
+}
+
+message PinsChanged {
+  // the list of pins in the call.
+  // Pins are ordered in descending order (most important first).
+  repeated models.Pin pins = 1;
+}
+
+message Error {
+  models.Error error = 4;
+  // returns the reconnect strategy to be used by the client
+  models.WebsocketReconnectStrategy reconnect_strategy = 5;
+}
+
+message ICETrickle {
+  models.PeerType peer_type = 1;
+  string ice_candidate = 2;
+}
+
+message ICERestart {
+  models.PeerType peer_type = 1;
+}
+
+// SfuRequest is a message that is sent from the client to the SFU.
+message SfuRequest {
+  oneof request_payload {
+    JoinRequest join_request = 1;
+    HealthCheckRequest health_check_request = 2;
+    LeaveCallRequest leave_call_request = 3;
+  }
+}
+
+message LeaveCallRequest {
+  string session_id = 1;
+  string reason = 2;
+}
+
+message HealthCheckRequest {
+}
+
+message HealthCheckResponse {
+  models.ParticipantCount participant_count = 1;
+}
+
+message TrackPublished {
+  string user_id = 1;
+  string session_id = 2;
+  models.TrackType type = 3;
+
+  // Participant information here is included as an optimisation
+  // for large calls where broadcasting on every participant join
+  // is expensive. You should **NOT** assume that this will always
+  // be available though you can use it to update the participant
+  // list when it is there.
+  models.Participant participant = 4;
+}
+
+message TrackUnpublished {
+  string user_id = 1;
+  string session_id = 2;
+  models.TrackType type = 3;
+  models.TrackUnpublishReason cause = 4;
+
+  // Participant information here is included as an optimisation
+  // for large calls where broadcasting on every participant join
+  // is expensive. You should **NOT** assume that this will always
+  // be available though you can use it to update the participant
+  // list when it is there.
+  models.Participant participant = 5;
+}
+
+message JoinRequest {
+  string token = 1;
+  string session_id = 2;
+  // user_session id can change during reconnects, this helps us to
+  // identify the user across reconnects and should remain consistent until the user explicitly
+  // disconnects, is kicked or the call is ended.
+  string unified_session_id = 13;
+  // dumb SDP that allow us to extract subscriber's decode codecs
+  string subscriber_sdp = 3;
+  string publisher_sdp = 8;
+  models.ClientDetails client_details = 4;
+  // Deprecated: use ReconnectDetails instead
+  Migration migration = 5 [deprecated = true];
+  // Fast reconnect flag explicitly indicates that if the participant session
+  // and the associated state is still present in the SFU, the client is ready
+  // to restore the PeerConnection with an ICE restart. If the SFU replies with
+  // "reconnected: true" in its JoinResponse, then it is safe to perform an ICE
+  // restart or else the existing PeerConnections must be cleaned up.
+  //
+  // For the SFU, fast_reconnect:false indicates that even if it has the state
+  // cached, the client state is not in sync and hence it must be cleaned up before
+  // proceeding further.
+  bool fast_reconnect = 6 [deprecated = true];
+
+  ReconnectDetails reconnect_details = 7;
+  repeated models.PublishOption preferred_publish_options = 9;
+  repeated models.SubscribeOption preferred_subscribe_options = 10;
+  repeated models.ClientCapability capabilities = 11;
+  models.ParticipantSource source = 12;
+}
+
+message ReconnectDetails {
+  models.WebsocketReconnectStrategy strategy = 1;
+  repeated models.TrackInfo announced_tracks = 3;
+  repeated signal.TrackSubscriptionDetails subscriptions = 4;
+  uint32 reconnect_attempt = 5;
+  string from_sfu_id = 6;
+  // only set in case of rejoin
+  string previous_session_id = 7;
+  // the reconnect reason
+  string reason = 8;
+}
+
+message Migration {
+  string from_sfu_id = 1;
+  repeated models.TrackInfo announced_tracks = 2;
+  repeated signal.TrackSubscriptionDetails subscriptions = 3;
+}
+
+message JoinResponse {
+  models.CallState call_state = 1;
+  bool reconnected = 2;
+  int32 fast_reconnect_deadline_seconds = 3;
+  repeated models.PublishOption publish_options = 4;
+}
+
+// ParticipantJoined is fired when a user joins a call
+message ParticipantJoined {
+  string call_cid = 1;
+  models.Participant participant = 2;
+  bool is_pinned = 3;
+}
+
+// ParticipantJoined is fired when a user leaves a call
+message ParticipantLeft {
+  string call_cid = 1;
+  models.Participant participant = 2;
+}
+
+// ParticipantUpdated is fired when user data is updated
+message ParticipantUpdated {
+  string call_cid = 1;
+  models.Participant participant = 2;
+}
+
+// SubscriberOffer is sent when the SFU adds tracks to a subscription
+message SubscriberOffer {
+  bool ice_restart = 1;
+  string sdp = 2;
+  uint32 negotiation_id = 3;
+}
+
+message PublisherAnswer {
+  string sdp = 1;
+}
+
+// ConnectionQuality is sent to inform about connection quality changes
+// eg. thierry's connection is not good -> render a red icon Zoom style
+message ConnectionQualityChanged {
+  repeated ConnectionQualityInfo connection_quality_updates = 1;
+}
+
+message ConnectionQualityInfo {
+  string user_id = 1;
+  string session_id = 2;
+  models.ConnectionQuality connection_quality = 3;
+}
+
+// DominantSpeakerChanged is sent by the SFU to notify when there is a new dominant speaker in the call
+message DominantSpeakerChanged {
+  string user_id = 1;
+  string session_id = 2;
+}
+
+message AudioLevel {
+  string user_id = 1;
+  string session_id = 2;
+  // 0.0 means complete silence, 1.0 loudest
+  float level = 3;
+  bool is_speaking = 4;
+}
+
+// AudioLevelChanged is sent by the SFU to notify about audio levels by user
+message AudioLevelChanged {
+  repeated AudioLevel audio_levels = 1;
+}
+
+message AudioSender {
+  models.Codec codec = 2;
+  models.TrackType track_type = 3;
+  int32 publish_option_id = 4;
+}
+
+// VideoLayerSetting is used to specify various parameters of a particular encoding in simulcast.
+// The parameters are specified here - https://developer.mozilla.org/en-US/docs/Web/API/RTCRtpEncodingParameters
+// SDKs use these parameters sent from the server to dynamically adjust these parameters to save CPU, bandwidth
+message VideoLayerSetting {
+  string name = 1;
+  bool active = 2;
+  int32 max_bitrate = 3;
+  float scale_resolution_down_by = 4;
+  models.Codec codec = 6;
+  uint32 max_framerate = 7;
+  string scalability_mode = 8;
+}
+
+message VideoSender {
+  models.Codec codec = 2;
+  repeated VideoLayerSetting layers = 3;
+  models.TrackType track_type = 4;
+  int32 publish_option_id = 5;
+  models.DegradationPreference degradation_preference = 6;
+}
+
+// sent to users when they need to change the quality of their video
+message ChangePublishQuality {
+  repeated AudioSender audio_senders = 1;
+  repeated VideoSender video_senders = 2;
+}
+
+// CallGrants is sent to users when there is a change in the call permissions
+// to publish audio, video or share the screen for a user or a role. This is
+// idempotent and can be sent at any time. Only the current_grants in the latest
+// message should be considered. In other words, this is not dependent on any
+// other message (including previous call_grants_updated message)
+//
+// When this message is received, the client (say, React component) should mute
+// the tracks which are not allowed anymore. For example, if the message has
+// grants {audio:true, video:false} while the user is publishing video, then the
+// client component should mute the video track and gray out the video button.
+// This way, the user will not be able to publish video until the permissions
+// are granted again. Also, muting the track on the client side will prevent
+// the SFU from receiving the video track and will save bandwidth.
+//
+// In simple words, this is exactly the same as muting a track on the client.
+// Here, instead of the user instructing the client, SFU would be doing it.
+message CallGrantsUpdated {
+  models.CallGrants current_grants = 1;
+  string message = 2;
+}
+
+// Go away is sent by the SFU to the client to signal to migrate away from the SFU.
+// The evict reason may specify why the user is being evicted.
+message GoAway {
+  models.GoAwayReason reason = 1;
+}
+
+// CallEnded is sent by the SFU to the client to signal that the call has ended.
+// The reason may specify why the call has ended.
+message CallEnded {
+  models.CallEndedReason reason = 1;
+}
+
+message InboundStateNotification {
+  repeated InboundVideoState inbound_video_states = 1;
+}
+
+message InboundVideoState {
+  string user_id = 1;
+  string session_id = 2;
+  models.TrackType track_type = 3;
+  bool paused = 4;
+}

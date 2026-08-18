@@ -1,0 +1,30 @@
+name: Advisories
+
+# A security advisory is published against a dependency version, not against a
+# commit. `main` can become vulnerable with no pull request open and no code
+# changing — which is how RUSTSEC-2026-0150 (the unmaintained `audiopus_sys`
+# Opus binding, since replaced by `opusic-sys`) would have surfaced. A
+# PR-triggered check cannot catch that, so the scan runs on a schedule.
+#
+# Cargo.lock is committed, so the dependency set only moves in a pull request,
+# where CI's Lint job runs the same `cargo deny check`.
+
+on:
+  schedule:
+    # Mondays, 07:00 UTC. Scheduled workflows run from the default branch only.
+    - cron: "0 7 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  advisories:
+    name: Advisories
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
