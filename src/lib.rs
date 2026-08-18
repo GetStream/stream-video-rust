@@ -1,4 +1,8 @@
 #![doc = include_str!("../README.md")]
+#![cfg_attr(docsrs, feature(doc_auto_cfg))]
+#![doc(html_favicon_url = "https://avatars.githubusercontent.com/u/8597527?s=32&v=4")]
+#![doc(html_logo_url = "https://avatars.githubusercontent.com/u/8597527?s=128&v=4")]
+#![doc(issue_tracker_base_url = "https://github.com/GetStream/stream-video-rust/issues/")]
 
 pub mod client;
 pub mod error;
@@ -10,10 +14,16 @@ pub mod webhook;
 
 use std::sync::Arc;
 
-use client::{Client, ClientConfig, NetworkLimits};
+use client::Client;
+#[doc(inline)]
+pub use client::{ClientConfig, DEFAULT_BASE_URL, NetworkLimits, RetryConfig};
+#[doc(inline)]
 pub use error::{ApiError, Error, Result, TokenError, WebhookError};
+#[doc(inline)]
 pub use token::{TokenClaims, TokenOptions};
+#[doc(inline)]
 pub use video::{Call, VideoClient};
+#[doc(inline)]
 pub use webhook::{WebhookEvent, parse_event, verify_signature};
 
 /// Environment variable holding the Stream API key.

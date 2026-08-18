@@ -4,6 +4,10 @@
 //! timeout, 30s request timeout, 10s connect timeout. Requests are authenticated
 //! with a server JWT (`{"server": true}`) sent as `Authorization` +
 //! `Stream-Auth-Type: jwt`, and every request carries the `api_key` query param.
+//!
+//! The HTTP client itself is crate-private. Public tunables ([`ClientConfig`],
+//! [`RetryConfig`], [`NetworkLimits`]) are re-exported at the crate root for
+//! [`crate::Stream::with_config`].
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 

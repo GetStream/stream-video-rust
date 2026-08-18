@@ -91,6 +91,50 @@ cargo bench --bench timer_drift
 Use benchmark results to evaluate a measured media-path change; do not treat a
 single machine's timing as a portable SDK guarantee.
 
+## Publishing
+
+The crate name on crates.io is [`getstream`](https://crates.io/crates/getstream).
+There is no `stream/` org prefix — ownership is whichever crates.io accounts
+(and optional GitHub teams) you add as owners.
+
+### First publish (local)
+
+1. Sign in to [crates.io](https://crates.io) with GitHub.
+2. Create a token at [crates.io/settings/tokens](https://crates.io/settings/tokens)
+   with the `publish-new` scope, then run `cargo login` and paste it.
+3. From a clean checkout of the release commit:
+
+   ```bash
+   cargo publish --locked --dry-run
+   cargo publish --locked
+   ```
+
+4. On the crate's crates.io settings page, add other Stream maintainers as
+   owners (`cargo owner --add <github-username>`). If the GetStream GitHub org
+   has authorized crates.io, you can also add a team with
+   `cargo owner --add github:GetStream:<team>`.
+
+A version can never be overwritten. To pull a broken release from new
+downloads, use `cargo yank --version <version>`.
+
+### Later releases (GitHub Actions)
+
+After the crate exists, configure Trusted Publishing on the crate settings
+page: repository `GetStream/stream-video-rust`, workflow `publish.yml`, no
+environment. That lets GitHub Actions publish without storing a crates.io
+token.
+
+Bump `version` in `Cargo.toml`, merge to `main`, then tag the same value:
+
+```bash
+# Cargo.toml version is 0.1.0-preview.1 → tag v0.1.0-preview.1
+git tag -a v0.1.0-preview.1 -m "v0.1.0-preview.1"
+git push origin v0.1.0-preview.1
+```
+
+The [Publish](.github/workflows/publish.yml) workflow verifies the tag matches
+`Cargo.toml` and runs `cargo publish --locked`.
+
 ## Pull requests
 
 - Keep changes focused and include tests for observable behavior.

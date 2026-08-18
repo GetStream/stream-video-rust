@@ -3,8 +3,9 @@ name = "getstream"
 version = "0.1.0-preview.1"
 edition = "2024"
 rust-version = "1.88"
+authors = ["Stream.io, Inc. <support@getstream.io>"]
 license-file = "LICENSE"
-description = "Rust SDK for Stream Video (server REST + SFU WebRTC)."
+description = "Official Rust SDK for Stream Video (server REST + SFU WebRTC)."
 readme = "README.md"
 repository = "https://github.com/GetStream/stream-video-rust"
 homepage = "https://getstream.io/video/"
@@ -27,11 +28,13 @@ include = [
 ]
 
 [package.metadata.docs.rs]
-# docs.rs builds the full native media stack: its build image ships libvpx-dev,
-# cmake, clang, and pkg-config, which is everything `env-libvpx-sys` (system
-# libvpx via pkg-config + bindgen) and `opusic-sys` (vendored libopus via CMake)
-# need. The crate has no Cargo features, so nothing else to select here.
-rustdoc-args = ["--cfg", "docsrs"]
+# docs.rs uses rust-lang/crates-build-env, which ships libvpx-dev, cmake, clang,
+# and pkg-config — everything `env-libvpx-sys` (system libvpx via pkg-config +
+# bindgen) and `opusic-sys` (vendored libopus via CMake) need. Restrict to the
+# Linux gnu target: the default extra targets (Windows/macOS) are cross-built
+# and cannot discover a system libvpx. The crate has no Cargo features.
+targets = ["x86_64-unknown-linux-gnu"]
+rustdoc-args = ["--cfg", "docsrs", "--generate-link-to-definition"]
 
 # WebRTC (SFU join/publish/subscribe/media) is the core purpose of this SDK, so
 # the RTC stack is always compiled in — there is no `webrtc` Cargo feature. A
