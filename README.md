@@ -78,14 +78,14 @@ sudo apt install libvpx-dev cmake pkg-config build-essential
 ## Installation
 
 ```bash
-cargo add getstream@0.1.0-preview.1 tokio tracing
+cargo add getstream@0.1.0-preview.2 tokio tracing
 ```
 
 Or in `Cargo.toml`:
 
 ```toml
 [dependencies]
-getstream = "0.1.0-preview.1"
+getstream = "0.1.0-preview.2"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
 tracing = "0.1"
 ```

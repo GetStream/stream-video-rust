@@ -1,3 +1,8 @@
+# v0.1.0-preview.2
+
+docs.rs builds on current nightly. `doc_auto_cfg` was removed in 1.92 and
+merged into `doc_cfg`; the crate no longer enables that feature.
+
 # v0.1.0-preview.1
 
 First public preview of `getstream`, the server-side Stream Video SDK for Rust:
