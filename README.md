@@ -1,4 +1,4 @@
-# 🦀 Official Rust SDK for [Stream Video](https://getstream.io/video/)
+# 🦀 Official Rust SDK for [Stream Video](https://getstream.io/video/) (Preview)
 
 [![crates.io](https://img.shields.io/crates/v/getstream.svg)](https://crates.io/crates/getstream)
 [![docs.rs](https://img.shields.io/docsrs/getstream)](https://docs.rs/getstream)
@@ -41,6 +41,24 @@ remote audio and video, transform it, and publish media back into the call.
   video bitrate, and control SFU-side noise cancellation.
 - Emit structured, secret-redacted diagnostics through `tracing`.
 
+## Crate map
+
+crates.io has no organization namespace. This package is Stream's official
+Rust crate, published as [`getstream`](https://crates.io/crates/getstream).
+
+| Item | Role |
+| --- | --- |
+| [`Stream`](https://docs.rs/getstream/latest/getstream/struct.Stream.html) | Server client: users, tokens, and webhook verification |
+| [`Call`](https://docs.rs/getstream/latest/getstream/struct.Call.html) / [`VideoClient`](https://docs.rs/getstream/latest/getstream/struct.VideoClient.html) | Video REST and `Call::join` |
+| [`rtc`](https://docs.rs/getstream/latest/getstream/rtc/index.html) | SFU participant, local/remote tracks, and PCM utilities |
+| [`models`](https://docs.rs/getstream/latest/getstream/models/index.html) | REST request and response types |
+| [`ClientConfig`](https://docs.rs/getstream/latest/getstream/struct.ClientConfig.html) | HTTP timeouts, retries, and payload limits |
+| [`webhook`](https://docs.rs/getstream/latest/getstream/webhook/index.html) | Signature verification and typed events |
+
+The wire-level `rtc` transport modules (`proto`, `peer`, `sfu_ws`, `signal`,
+`publisher`, `tracer`, `coordinator_ws`) are public because they track Stream's
+SFU protocol, but they are exempt from compatibility guarantees.
+
 ## Requirements
 
 The WebRTC media stack is part of every build. Install Rust 1.88 or newer, a C
@@ -60,22 +78,25 @@ sudo apt install libvpx-dev cmake pkg-config build-essential
 ## Installation
 
 ```bash
-cargo add getstream tokio tracing
+cargo add getstream@0.1.0-preview.1 tokio tracing
 ```
 
 Or in `Cargo.toml`:
 
 ```toml
 [dependencies]
-getstream = "0.1"
+getstream = "0.1.0-preview.1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
 tracing = "0.1"
 ```
 
+`getstream = "0.1"` will not match this preview. Cargo only selects a pre-release
+when the version requirement includes one.
+
 The API reference is published at [docs.rs/getstream](https://docs.rs/getstream);
 from a checkout, generate it locally with `cargo doc --open`.
 
-While the crate is `0.x`, minor releases may contain breaking changes. The
+This is a `0.x` preview, so minor releases may contain breaking changes. The
 wire-level `rtc` transport modules (`proto`, `peer`, `sfu_ws`, `signal`,
 `publisher`, `tracer`, `coordinator_ws`) track Stream's SFU protocol directly and
 are exempt from compatibility guarantees at any version bump.
