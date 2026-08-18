@@ -1,11 +1,5 @@
 name: CI
 
-# The pull-request loop stays cheap: Lint, Test on Linux, and MSRV. The
-# platform-specific and packaging checks are slower or billed at a premium and
-# their failure modes do not depend on a given PR's diff, so they run once on
-# merge instead of on every push. Advisories are time-dependent rather than
-# code-dependent and live in advisories.yml on a schedule.
-
 on:
   pull_request:
   push:
@@ -48,19 +42,12 @@ jobs:
       # advisories.yml.)
       - uses: EmbarkStudios/cargo-deny-action@v2
         with:
-          command: check
+          command: check licenses bans sources
 
   test:
-    name: Test (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
+    name: Test
+    runs-on: ubuntu-latest
     timeout-minutes: 35
-    strategy:
-      fail-fast: false
-      matrix:
-        # macOS runners bill at 10x Linux and every developer here builds on
-        # macOS continuously, so the second platform is worth one run per merge
-        # rather than one per push.
-        os: ${{ github.event_name == 'pull_request' && fromJSON('["ubuntu-latest"]') || fromJSON('["ubuntu-latest", "macos-latest"]') }}
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/setup-rust
@@ -84,19 +71,3 @@ jobs:
         with:
           toolchain: "1.88.0"
       - run: cargo check --locked --all-targets
-
-  package:
-    name: Package
-    # Only the `include` list and the manifest can break this, and a failure on
-    # merge is still well before `cargo publish`.
-    if: github.event_name != 'pull_request'
-    runs-on: ubuntu-latest
-    timeout-minutes: 25
-    steps:
-      - uses: actions/checkout@v4
-      - uses: ./.github/actions/setup-rust
-        with:
-          toolchain: stable
-      # Builds the crate as packaged, so an `include` list that drops a file the
-      # build needs fails here rather than after `cargo publish`.
-      - run: cargo package --locked

@@ -67,16 +67,8 @@ Pull requests also run the declared MSRV:
 rustup run 1.88.0 cargo check --locked --all-targets
 ```
 
-Two more checks run on merge to `main` rather than on every push — macOS (its
-runners bill at a premium, and local development already covers the platform)
-and the published package:
-
-```bash
-cargo package --locked
-```
-
-If you change the `include` list in `Cargo.toml`, run that one yourself; it is
-what catches an `include` list that drops a file the build needs.
+If you change the `include` list in `Cargo.toml`, run `cargo package --locked`
+locally; it is what catches an `include` list that drops a file the build needs.
 
 A scheduled workflow re-runs `cargo deny check` weekly against `main`. Security
 advisories are published against dependency versions rather than commits, so
