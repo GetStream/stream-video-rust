@@ -1,0 +1,102 @@
+name: CI
+
+# The pull-request loop stays cheap: Lint, Test on Linux, and MSRV. The
+# platform-specific and packaging checks are slower or billed at a premium and
+# their failure modes do not depend on a given PR's diff, so they run once on
+# merge instead of on every push. Advisories are time-dependent rather than
+# code-dependent and live in advisories.yml on a schedule.
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_INCREMENTAL: "0"
+  CARGO_TERM_COLOR: always
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-rust
+        with:
+          toolchain: stable
+          components: clippy,rustfmt
+      - run: cargo fmt --all --check
+      - run: cargo clippy --locked --all-targets --all-features -- -D warnings
+      # The README is the crate-level doc (`#![doc = include_str!]`), so a broken
+      # relative link there fails the docs.rs build. Catch it here instead.
+      - name: Docs
+        run: cargo doc --locked --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings
+      # Licenses are code-dependent: a dependency with an unreviewed license
+      # should fail the PR that adds it. (Advisories are not — see
+      # advisories.yml.)
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      matrix:
+        # macOS runners bill at 10x Linux and every developer here builds on
+        # macOS continuously, so the second platform is worth one run per merge
+        # rather than one per push.
+        os: ${{ github.event_name == 'pull_request' && fromJSON('["ubuntu-latest"]') || fromJSON('["ubuntu-latest", "macos-latest"]') }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-rust
+        with:
+          toolchain: stable
+      - run: cargo test --locked --lib
+      - run: cargo test --locked --doc
+      # Compile the live suites and both examples. The live tests skip cleanly
+      # without credentials (tests/common/mod.rs), so no secrets are needed here
+      # — the Live workflow runs them for real.
+      - run: cargo test --locked --no-run
+      - run: cargo build --locked --examples
+
+  msrv:
+    name: MSRV
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-rust
+        with:
+          toolchain: "1.88.0"
+      - run: cargo check --locked --all-targets
+
+  package:
+    name: Package
+    # Only the `include` list and the manifest can break this, and a failure on
+    # merge is still well before `cargo publish`.
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-rust
+        with:
+          toolchain: stable
+      # Builds the crate as packaged, so an `include` list that drops a file the
+      # build needs fails here rather than after `cargo publish`.
+      - run: cargo package --locked

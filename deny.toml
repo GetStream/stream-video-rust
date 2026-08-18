@@ -1,0 +1,52 @@
+# cargo-deny configuration.
+#
+# In-process H264 uses the BSD-2-Clause OpenH264 wrapper/source; VP8/VP9 use
+# libvpx (BSD). Neither example shells out to FFmpeg — all encode/decode is
+# in-process and no GPL codec is linked. H264 patent obligations are separate
+# from software licenses.
+
+[advisories]
+# Fail on all security advisories. There are no ignores: the previously
+# unmaintained Opus binding (`audiopus_sys`, RUSTSEC-2026-0150) was replaced by
+# the maintained `opusic-sys`, so no advisory needs suppressing.
+
+[licenses]
+# Dependency-license policy. If a new dependency introduces an unreviewed
+# license, the build should fail here; the SDK itself uses the Stream License.
+allow = [
+    # Local SPDX reference for this SDK's custom license. The clarification
+    # below is accepted only while the exact LICENSE file hash matches.
+    "LicenseRef-Stream",
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+    # `env-libvpx-sys` (our libvpx binding) is MPL-2.0: weak, file-level copyleft
+    # that applies only to that crate's own source, never to code that merely
+    # depends on it.
+    "MPL-2.0",
+    # The Mozilla CA root bundle shipped by `webpki-roots` is data under the
+    # Community Data License Agreement – Permissive 2.0.
+    "CDLA-Permissive-2.0",
+]
+confidence-threshold = 0.9
+
+[[licenses.clarify]]
+crate = "getstream"
+expression = "LicenseRef-Stream"
+license-files = [{ path = "LICENSE", hash = 0x152fe54f }]
+
+[bans]
+# Duplicate versions and wildcard requirements are common in the transitive
+# graph and are not a correctness or licensing concern for this SDK.
+multiple-versions = "allow"
+wildcards = "allow"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

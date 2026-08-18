@@ -1,0 +1,116 @@
+[package]
+name = "getstream"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+license-file = "LICENSE"
+description = "Rust SDK for Stream Video (server REST + SFU WebRTC)."
+readme = "README.md"
+repository = "https://github.com/GetStream/stream-video-rust"
+homepage = "https://getstream.io/video/"
+documentation = "https://docs.rs/getstream"
+keywords = ["video", "webrtc", "sfu", "stream", "rtc"]
+categories = ["api-bindings", "multimedia::video", "network-programming"]
+# A published crate's own `.cargo/config.toml` is never read by Cargo (config is
+# discovered from the *consumer's* directory tree), so it is deliberately absent
+# from this list — see the note above `[dependencies]`.
+include = [
+    "/.env.example",
+    "/build.rs",
+    "/CHANGELOG.md",
+    "/CONTRIBUTING.md",
+    "/examples/**",
+    "/LICENSE",
+    "/proto/**",
+    "/README.md",
+    "/src/**",
+]
+
+[package.metadata.docs.rs]
+# docs.rs builds the full native media stack: its build image ships libvpx-dev,
+# cmake, clang, and pkg-config, which is everything `env-libvpx-sys` (system
+# libvpx via pkg-config + bindgen) and `opusic-sys` (vendored libopus via CMake)
+# need. The crate has no Cargo features, so nothing else to select here.
+rustdoc-args = ["--cfg", "docsrs"]
+
+# WebRTC (SFU join/publish/subscribe/media) is the core purpose of this SDK, so
+# the RTC stack is always compiled in — there is no `webrtc` Cargo feature. A
+# plain `cargo build` resolves the full media stack (prost + WebSocket at
+# runtime, protox + prost-build at build time) and runs proto codegen. protox is
+# pure Rust, so no `protoc` is required. See README "Requirements" for the one
+# system dependency (libvpx) and the vendored-opus build tools.
+
+[dependencies]
+# Opus encode/decode for the audio media path. `opusic-sys` is a maintained
+# libopus binding (tracks libopus 1.6.1) that bundles + static-links a *vendored*
+# libopus, so the SDK build needs no system libopus at link or runtime. It
+# replaces the unmaintained `audiopus_sys` (RUSTSEC-2026-0150); see
+# `src/rtc/opus.rs` for the thin safe wrapper. The bundled CMake build needs
+# `cmake` and a C compiler on PATH and nothing else: its `CMakeLists.txt`
+# declares `cmake_minimum_required(VERSION 3.16)`, which satisfies CMake 4's
+# minimum-policy floor without any build-time environment override.
+opusic-sys = "0.7.4"
+base64 = "0.23.1"
+bytes = "1.12.1"
+futures-util = "0.3.34"
+hmac = "0.13.0"
+prost = "0.14.4"
+prost-types = "0.14.4"
+reqwest = { version = "0.13.4", default-features = false, features = ["rustls", "json", "charset", "http2", "stream"] }
+rustls = { version = "0.23.43", default-features = false, features = ["ring"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+sha2 = "0.11.0"
+thiserror = "2.0.20"
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "time", "sync"] }
+tokio-tungstenite = { version = "0.30.0", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
+tracing = "0.1.44"
+url = "2.5.8"
+uuid = { version = "1.24.0", features = ["v4"] }
+# VP8/VP9 encoder FFI for the video publish path (`rtc::vpx`). The `generate`
+# feature runs bindgen at build time so any installed libvpx version works (no
+# version-locked pre-generated bindings). This links a **system** libvpx
+# (`brew install libvpx` / `apt install libvpx-dev`) discovered via pkg-config —
+# see README "Requirements". (We bind libvpx directly rather than
+# via `vpx-encode`, which hardcodes the encoder config and cannot disable frame
+# lag or force keyframes — both required for realtime SFU publishing.)
+env-libvpx-sys = { version = "5.1.3", features = ["generate"] }
+webrtc = "0.17.2"
+flate2 = "1.1.9"
+# In-process H264 via the maintained ralfbiedert wrapper. Pin 0.8.1 because
+# 0.9.x's wide dependency requires Rust 1.89 while this crate supports 1.88.
+# OpenH264 is BSD-2-Clause; downstreams must assess H264 patent obligations.
+openh264 = "=0.8.1"
+
+[dev-dependencies]
+# Example-only convenience for the two executable demos. OpenAI-specific bridge
+# orchestration stays in `examples/gpt_realtime_bot.rs`; `tokio` here adds the
+# runtime and signal features used only by the examples.
+anyhow = "1.0.86"
+criterion = "0.8.2"
+dotenvy = "0.15.7"
+hmac = "0.13.0"
+sha2 = "0.11.0"
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "time", "sync", "signal"] }
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+uuid = { version = "1.24.0", features = ["v4"] }
+
+# Proto codegen (build.rs) always runs: protox parses the vendored `.proto`
+# sources in pure Rust (no `protoc`) and prost-build emits the Rust types.
+[build-dependencies]
+prost-build = "0.14.4"
+protox = "0.9.1"
+
+[[example]]
+name = "join_call"
+
+[[example]]
+name = "gpt_realtime_bot"
+
+[[bench]]
+name = "media_baseline"
+harness = false
+
+[[bench]]
+name = "timer_drift"
+harness = false

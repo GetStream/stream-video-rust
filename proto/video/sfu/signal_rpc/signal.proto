@@ -1,0 +1,189 @@
+syntax = "proto3";
+
+package stream.video.sfu.signal;
+
+import "video/sfu/models/models.proto";
+
+option csharp_namespace = "Stream.Video.v1.Sfu.Signal";
+option go_package = "github.com/GetStream/protocol/protobuf/video/sfu/signal_rpc";
+option java_multiple_files = true;
+option java_outer_classname = "SfuSignalV1";
+
+service SignalServer {
+  // SetPublisher sends the WebRTC offer for the peer connection used to publish A/V
+  rpc SetPublisher(SetPublisherRequest) returns (SetPublisherResponse);
+
+  // answer is sent by the client to the SFU after receiving a subscriber_offer.
+  rpc SendAnswer(SendAnswerRequest) returns (SendAnswerResponse);
+
+  // SendICECandidate sends an ICE candidate to the client
+  rpc IceTrickle(models.ICETrickle) returns (ICETrickleResponse);
+
+  // UpdateSubscribers is used to notify the SFU about the list of video subscriptions
+  // TODO: sync subscriptions based on this + update tracks using the dimension info sent by the user
+  rpc UpdateSubscriptions(UpdateSubscriptionsRequest) returns (UpdateSubscriptionsResponse);
+
+  rpc UpdateMuteStates(UpdateMuteStatesRequest) returns (UpdateMuteStatesResponse);
+
+  rpc IceRestart(ICERestartRequest) returns (ICERestartResponse);
+
+  rpc SendStats(SendStatsRequest) returns (SendStatsResponse);
+
+  rpc SendMetrics(SendMetricsRequest) returns (SendMetricsResponse);
+
+  rpc StartNoiseCancellation(StartNoiseCancellationRequest) returns (StartNoiseCancellationResponse);
+
+  rpc StopNoiseCancellation(StopNoiseCancellationRequest) returns (StopNoiseCancellationResponse);
+}
+
+message StartNoiseCancellationRequest {
+  string session_id = 1;
+}
+
+message StartNoiseCancellationResponse {
+  models.Error error = 1;
+}
+
+message StopNoiseCancellationRequest {
+  string session_id = 1;
+}
+
+message StopNoiseCancellationResponse {
+  models.Error error = 1;
+}
+
+message Reconnection {
+  float time_seconds = 1;
+  models.WebsocketReconnectStrategy strategy = 2;
+}
+
+message Telemetry {
+  oneof data {
+    float connection_time_seconds = 1;
+    Reconnection reconnection = 2;
+  }
+}
+
+message SendMetricsRequest {
+  string session_id = 1;
+  string unified_session_id = 2;
+
+  repeated models.InboundRtp inbounds = 3;
+  repeated models.OutboundRtp outbounds = 4;
+  repeated models.RemoteInboundRtp remote_inbounds = 5;
+  repeated models.RemoteOutboundRtp remote_outbounds = 6;
+}
+
+message SendMetricsResponse {
+}
+
+message SendStatsRequest {
+  string session_id = 1;
+  string subscriber_stats = 2;
+  string publisher_stats = 3;
+  string webrtc_version = 4;
+  string sdk = 5;
+  string sdk_version = 6;
+
+  models.InputDevices audio_devices = 7;
+  models.InputDevices video_devices = 8;
+  oneof device_state {
+    models.AndroidState android = 9;
+    models.AppleState apple = 10;
+  }
+
+  Telemetry telemetry = 11;
+  models.RTMPIngress rtmp = 12;
+  string subscriber_rtc_stats = 13 [deprecated = true];
+  string publisher_rtc_stats = 14 [deprecated = true];
+  string rtc_stats = 15;
+  // Encode stats for the publisher
+  repeated models.PerformanceStats encode_stats = 16;
+  // Decode stats for the subscriber
+  repeated models.PerformanceStats decode_stats = 17;
+  // user_session id can change during reconnects, this helps us to
+  // identify the user across reconnects and should remain consistent until the user explicitly
+  // disconnects, is kicked or the call is ended.
+  string unified_session_id = 18;
+}
+
+message SendStatsResponse {
+  models.Error error = 1;
+}
+
+message ICERestartRequest {
+  string session_id = 1;
+  stream.video.sfu.models.PeerType peer_type = 2;
+}
+
+message ICERestartResponse {
+  models.Error error = 1;
+}
+
+message UpdateMuteStatesRequest {
+  string session_id = 1;
+  repeated TrackMuteState mute_states = 3;
+}
+
+message UpdateMuteStatesResponse {
+  models.Error error = 4;
+}
+
+message TrackMuteState {
+  models.TrackType track_type = 1;
+  bool muted = 2;
+}
+
+message AudioMuteChanged {
+  bool muted = 1;
+}
+
+message VideoMuteChanged {
+  bool muted = 2;
+}
+
+message UpdateSubscriptionsRequest {
+  string session_id = 2;
+  repeated TrackSubscriptionDetails tracks = 3;
+}
+
+message UpdateSubscriptionsResponse {
+  models.Error error = 4;
+}
+
+message TrackSubscriptionDetails {
+  string user_id = 1;
+  string session_id = 2;
+  stream.video.sfu.models.TrackType track_type = 3;
+  stream.video.sfu.models.VideoDimension dimension = 4;
+}
+
+message SendAnswerRequest {
+  stream.video.sfu.models.PeerType peer_type = 1;
+  string sdp = 2;
+  string session_id = 3;
+  uint32 negotiation_id = 4;
+}
+
+message SendAnswerResponse {
+  models.Error error = 4;
+}
+
+message ICETrickleResponse {
+  models.Error error = 4;
+}
+
+message SetPublisherRequest {
+  // sdp offer
+  string sdp = 1;
+  string session_id = 2;
+  repeated models.TrackInfo tracks = 3;
+}
+
+message SetPublisherResponse {
+  // sdp answer
+  string sdp = 1;
+  string session_id = 2;
+  bool ice_restart = 3;
+  models.Error error = 4;
+}

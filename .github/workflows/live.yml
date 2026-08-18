@@ -1,0 +1,48 @@
+name: Live
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.repository }}-live
+  cancel-in-progress: false
+
+env:
+  CARGO_INCREMENTAL: "0"
+  CARGO_TERM_COLOR: always
+  STREAM_API_KEY: ${{ secrets.STREAM_API_KEY }}
+  STREAM_API_SECRET: ${{ secrets.STREAM_API_SECRET }}
+  OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+  OPENAI_REALTIME_MODEL: ${{ secrets.OPENAI_REALTIME_MODEL }}
+
+jobs:
+  live:
+    name: Live
+    runs-on: ubuntu-latest
+    timeout-minutes: 55
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-rust
+        with:
+          toolchain: stable
+      - name: Require credentials
+        run: |
+          if [[ -z "${STREAM_API_KEY:-}" || -z "${STREAM_API_SECRET:-}" || -z "${OPENAI_API_KEY:-}" ]]; then
+            echo "STREAM_API_KEY, STREAM_API_SECRET, and OPENAI_API_KEY are required." >&2
+            exit 1
+          fi
+      - run: >-
+          cargo test --locked
+          --test video_rest
+          --test rtc_join
+          --test rtc_media
+          --test join_call
+          --test rtc_soak
+          --test gpt_realtime_bot
+          -- --nocapture --test-threads=1
