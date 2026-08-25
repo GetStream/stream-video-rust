@@ -1,0 +1,30 @@
+[build-system]
+requires = ["maturin>=1.8,<2"]
+build-backend = "maturin"
+
+[project]
+name = "getstream-rtc-core"
+dynamic = ["version"]
+requires-python = ">=3.10"
+description = "Python bindings for the Stream Video Rust RTC stack."
+readme = "README.md"
+authors = [{ name = "Stream.io, Inc.", email = "support@getstream.io" }]
+classifiers = [
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: Implementation :: CPython",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+]
+
+[project.urls]
+Homepage = "https://getstream.io/video/"
+Repository = "https://github.com/GetStream/stream-video-rust"
+
+[tool.maturin]
+features = ["pyo3/extension-module"]
+python-source = "python"
+module-name = "getstream_rtc_core._native"
+manifest-path = "Cargo.toml"

@@ -1,0 +1,22 @@
+[package]
+name = "getstream-rtc-core"
+version = "0.1.0-preview.2"
+edition = "2024"
+rust-version = "1.88"
+authors = ["Stream.io, Inc. <support@getstream.io>"]
+license-file = "../../LICENSE"
+description = "Python bindings for the Stream Video Rust RTC stack."
+repository = "https://github.com/GetStream/stream-video-rust"
+homepage = "https://getstream.io/video/"
+publish = false
+
+[lib]
+name = "getstream_rtc_core"
+crate-type = ["cdylib"]
+
+[dependencies]
+getstream = { path = "../.." }
+pyo3 = { version = "0.25", features = ["abi3-py310"] }
+pyo3-async-runtimes = { version = "0.25", features = ["tokio-runtime"] }
+serde_json = "1.0.151"
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "sync", "time"] }

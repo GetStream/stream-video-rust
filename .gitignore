@@ -23,3 +23,12 @@
 /.cursor
 /.claude/skills
 /skills-lock.json
+
+# Python bindings (maturin / venv artifacts)
+**/__pycache__/
+*.so
+*.pyd
+.venv
+bindings/python/dist
+bindings/python/*.egg-info
+bindings/python/.venv
