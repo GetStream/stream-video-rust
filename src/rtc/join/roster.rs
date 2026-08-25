@@ -79,6 +79,7 @@ impl RtcCore {
         // Unknown publisher: fall back to the msid prefix as a stable id.
         RemoteParticipant {
             session_id: prefix.to_owned(),
+            track_lookup_prefix: prefix.to_owned(),
             ..Default::default()
         }
     }

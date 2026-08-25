@@ -32,11 +32,14 @@ fn participant_json(participant: &Participant) -> Value {
         "session_id": participant.session_id,
         "name": participant.name,
         "image": participant.image,
+        "track_lookup_prefix": participant.track_lookup_prefix,
         "is_speaking": participant.is_speaking,
         "is_dominant_speaker": participant.is_dominant_speaker,
         "audio_level": participant.audio_level,
+        "connection_quality": participant.connection_quality,
         "roles": participant.roles,
         "published_tracks": participant.published_tracks,
+        "source": participant.source,
     })
 }
 

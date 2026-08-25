@@ -154,6 +154,11 @@ impl PyRemoteTrack {
     }
 
     #[getter]
+    fn track_lookup_prefix(&self) -> &str {
+        &self.inner.participant().track_lookup_prefix
+    }
+
+    #[getter]
     fn track_type(&self) -> &'static str {
         track_type_name(self.inner.track_type())
     }

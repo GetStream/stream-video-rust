@@ -61,6 +61,8 @@ pub struct RemoteParticipant {
     pub user_id: String,
     /// The publisher's SFU session id.
     pub session_id: String,
+    /// SFU media-stream prefix used to correlate inbound tracks (`msid`).
+    pub track_lookup_prefix: String,
     /// Track kinds the participant currently publishes.
     pub published_tracks: Vec<TrackType>,
     /// Time the participant joined the SFU session.
@@ -95,6 +97,7 @@ impl RemoteParticipant {
         Self {
             user_id: participant.user_id.clone(),
             session_id: participant.session_id.clone(),
+            track_lookup_prefix: participant.track_lookup_prefix.clone(),
             published_tracks: participant
                 .published_tracks
                 .iter()

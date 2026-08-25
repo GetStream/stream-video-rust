@@ -8,7 +8,9 @@ use pyo3_async_runtimes::tokio::future_into_py;
 use tokio::sync::Mutex as TokioMutex;
 use tokio::sync::mpsc;
 
-use getstream::rtc::{JoinCallData, RemoteTrack, RtcCall, RtcClient};
+use getstream::rtc::{
+    JoinCallData, RemoteTrack, RtcCall, RtcClient, SubscriptionConfig, SubscriptionTarget,
+};
 
 use crate::credentials::{PySfuCredentials, PyStatsOptions};
 use crate::error::{crate_err, rtc_err};
@@ -126,6 +128,21 @@ impl PyRtcSession {
         })
     }
 
+    fn publish_screen_share_audio<'py>(
+        &self,
+        py: Python<'py>,
+        track: Bound<'py, PyLocalAudioTrack>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let call = self.call.clone();
+        let track = track.borrow().inner.clone();
+        future_into_py(py, async move {
+            call.publish_screen_share_audio(track)
+                .await
+                .map_err(rtc_err)?;
+            Ok(())
+        })
+    }
+
     /// Await the next inbound [`RemoteTrack`](PyRemoteTrack), or `None` if the
     /// session is gone.
     fn next_track<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
@@ -189,6 +206,87 @@ impl PyRtcSession {
             call.mute_track(track_type).await.map_err(rtc_err)?;
             Ok(())
         })
+    }
+
+    /// Coarse subscription policy applied to every remote participant.
+    #[pyo3(signature = (audio=true, video=false, screen_share=false, video_width=None, video_height=None))]
+    fn update_subscriptions<'py>(
+        &self,
+        py: Python<'py>,
+        audio: bool,
+        video: bool,
+        screen_share: bool,
+        video_width: Option<u32>,
+        video_height: Option<u32>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let video_dimension = match (video_width, video_height) {
+            (Some(width), Some(height)) => Some((width, height)),
+            _ => None,
+        };
+        let config = SubscriptionConfig {
+            audio,
+            video,
+            screen_share,
+            video_dimension,
+        };
+        let call = self.call.clone();
+        future_into_py(py, async move {
+            call.update_subscriptions(config).await.map_err(rtc_err)?;
+            Ok(())
+        })
+    }
+
+    /// Exact per-session track list. Each item is
+    /// `(session_id, track_type, width, height)` with optional dimensions.
+    fn update_subscription_targets<'py>(
+        &self,
+        py: Python<'py>,
+        targets: Vec<(String, String, Option<u32>, Option<u32>)>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let mut parsed = Vec::with_capacity(targets.len());
+        for (session_id, track_type, width, height) in targets {
+            let mut target = SubscriptionTarget::new(session_id, parse_track_type(&track_type)?);
+            if let (Some(width), Some(height)) = (width, height) {
+                target = target.with_dimension(width, height);
+            }
+            parsed.push(target);
+        }
+        let call = self.call.clone();
+        future_into_py(py, async move {
+            call.update_subscription_targets(parsed)
+                .await
+                .map_err(rtc_err)?;
+            Ok(())
+        })
+    }
+
+    /// Snapshot of known participants (dicts matching SFU event payloads).
+    fn participants(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        let value = serde_json::json!(
+            self.call
+                .participants()
+                .iter()
+                .map(|participant| {
+                    serde_json::json!({
+                        "user_id": participant.user_id,
+                        "session_id": participant.session_id,
+                        "name": participant.name,
+                        "image": participant.image,
+                        "track_lookup_prefix": participant.track_lookup_prefix,
+                        "is_speaking": participant.is_speaking,
+                        "is_dominant_speaker": participant.is_dominant_speaker,
+                        "audio_level": participant.audio_level,
+                        "roles": participant.roles,
+                        "published_tracks": participant
+                            .published_tracks
+                            .iter()
+                            .map(|track_type| *track_type as i32)
+                            .collect::<Vec<_>>(),
+                    })
+                })
+                .collect::<Vec<_>>()
+        );
+        json_to_py(py, &value)
     }
 
     fn unmute_track<'py>(
