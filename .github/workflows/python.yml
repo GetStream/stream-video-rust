@@ -1,0 +1,54 @@
+name: Python
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: python-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_INCREMENTAL: "0"
+  CARGO_TERM_COLOR: always
+
+jobs:
+  wheel:
+    name: Wheel (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-rust
+        with:
+          toolchain: stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+      - name: Clippy bindings crate
+        run: cargo clippy -p getstream-rtc-core --locked --all-targets -- -D warnings
+      - name: Install maturin
+        run: pip install maturin
+      - name: Build abi3 wheel
+        working-directory: bindings/python
+        run: maturin build --release --out dist
+      - name: Import smoke test
+        working-directory: bindings/python
+        run: |
+          pip install dist/*.whl
+          python -c "from getstream_rtc_core import RtcSession, LocalAudioTrack, SfuCredentials, __version__; print(__version__)"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-${{ matrix.os }}
+          path: bindings/python/dist/*.whl
+          if-no-files-found: error
