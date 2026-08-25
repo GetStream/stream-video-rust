@@ -73,6 +73,112 @@ impl RtcCore {
         result
     }
 
+    /// Join using pre-fetched SFU credentials, skipping coordinator REST and WS.
+    ///
+    /// The caller (typically Python) keeps location discovery, coordinator join,
+    /// and coordinator watch. This path validates the participant user token,
+    /// attaches to the given SFU, and still uses that token for later reconnect
+    /// coordinator REST calls (without requiring a coordinator `connection_id`).
+    pub(crate) async fn join_with_credentials(
+        self: &Arc<Self>,
+        token_source: UserTokenSource,
+        data: JoinCallData,
+        injected: InjectedSfuJoin,
+    ) -> Result<()> {
+        ensure_crypto_provider();
+        let generation = self.begin_join()?;
+        {
+            let mut uid = self
+                .unified_session_id
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            *uid = uuid::Uuid::new_v4().to_string();
+        }
+        {
+            let mut jd = self.join_data.lock().unwrap_or_else(|e| e.into_inner());
+            *jd = data.clone();
+        }
+        {
+            let mut source = self.token_source.lock().unwrap_or_else(|e| e.into_inner());
+            *source = Some(token_source);
+        }
+        self.coordinator_events_enabled
+            .store(false, Ordering::SeqCst);
+        {
+            let mut so = self.stats_options.lock().unwrap_or_else(|e| e.into_inner());
+            *so = injected.stats_options;
+        }
+        *self
+            .own_capabilities
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = injected.own_capabilities.into_iter().collect();
+
+        if let Err(error) = self
+            .while_generation(generation, self.reload_user_token())
+            .await
+            .and_then(|result| result)
+        {
+            self.set_state_if_current(generation, CallingState::Idle);
+            return Err(error);
+        }
+
+        if injected.credentials.server.ws_endpoint.is_empty() {
+            self.set_state_if_current(generation, CallingState::Idle);
+            return Err(RtcError::missing_credential("ws_endpoint"));
+        }
+
+        let attach = self
+            .while_generation(
+                generation,
+                self.clone().establish(
+                    &injected.credentials,
+                    0,
+                    ReconnectStrategy::Fast,
+                    None,
+                    generation,
+                    None,
+                ),
+            )
+            .await
+            .and_then(|result| result);
+
+        match attach {
+            Ok(connection) => {
+                let mut guard = self.connection.lock().await;
+                if !self.is_generation_current(generation) {
+                    drop(guard);
+                    connection.teardown().await;
+                    return Err(join_cancelled());
+                }
+                let old = guard.replace(connection);
+                drop(guard);
+                if let Some(old) = old {
+                    old.teardown().await;
+                }
+                self.active_subs
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clear();
+                *self.started.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
+                if !self.set_state_if_current(generation, CallingState::Joined) {
+                    return Err(join_cancelled());
+                }
+                tracing::info!(
+                    cid = %self.cid(),
+                    edge = %injected.credentials.server.edge_name,
+                    "stream.rtc.joined_with_credentials"
+                );
+                Ok(())
+            }
+            Err(error) => {
+                if self.state() == CallingState::Joining {
+                    self.set_state_if_current(generation, CallingState::Idle);
+                }
+                Err(error)
+            }
+        }
+    }
+
     pub(super) async fn reload_user_token(&self) -> Result<String> {
         let _refresh = self.token_refresh.lock().await;
         let source = self
@@ -301,12 +407,16 @@ impl RtcCore {
             return Err((join_cancelled(), None));
         }
         // 1. Coordinator join (user token) → SFU credentials.
-        let query = self.user_request_query().ok_or_else(|| {
-            (
-                RtcError::IllegalState("coordinator connection is not available".to_owned()),
-                None,
-            )
-        })?;
+        let query = if self.coordinator_events_enabled.load(Ordering::SeqCst) {
+            self.user_request_query().ok_or_else(|| {
+                (
+                    RtcError::IllegalState("coordinator connection is not available".to_owned()),
+                    None,
+                )
+            })?
+        } else {
+            self.user_request_query().unwrap_or_default()
+        };
         let join = coordinator::join_call(
             &self.client,
             user_token,
@@ -844,6 +954,9 @@ impl RtcCore {
         generation: u64,
         user_token: &str,
     ) -> Result<()> {
+        if !self.coordinator_events_enabled.load(Ordering::SeqCst) {
+            return Ok(());
+        }
         if self.user_request_query().is_some() {
             return Ok(());
         }

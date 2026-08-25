@@ -10,7 +10,8 @@
 //! machine ([`join::RtcCore`]) with `max_join_retries`, Stream's reconnect
 //! strategies, and typed [`join::CallEvent`]s. [`crate::Call::join`] and
 //! [`crate::Call::leave`] are the high-level entry points; [`RtcClient`] is the
-//! lower-level user-token client.
+//! lower-level user-token client, including [`RtcClient::join_with_credentials`]
+//! for callers that already ran coordinator join.
 //!
 //! # Stability
 //!
@@ -60,7 +61,9 @@ pub use error::{
     SfuTimeoutError, TwirpError, WsConnectionError, is_join_error_code,
 };
 pub use identity::{CLIENT_TYPE, SDK_TYPE, client_details, client_header};
-pub use join::{CallEvent, CallStateSnapshot, CallingState, JoinCallData, RtcCore};
+pub use join::{
+    CallEvent, CallStateSnapshot, CallingState, InjectedSfuJoin, JoinCallData, RtcCore,
+};
 pub use local_track::{
     LocalAudioTrack, LocalTrack, LocalVideoTrack, LocalVideoTrackConfig, RtpPacket, VideoLayering,
     audio_level_dbov,
@@ -77,7 +80,7 @@ pub use reconnect::{
 pub use remote_track::{Codec, RemoteParticipant, RemoteTrack};
 pub use sfu_ws::{SfuReceiver, SfuSender};
 pub use signal::SignalClient;
-pub use stats::{DEFAULT_REPORTING_INTERVAL_MS, reporting_interval};
+pub use stats::{DEFAULT_REPORTING_INTERVAL_MS, RtcStatsSnapshot, reporting_interval};
 pub use subscriptions::{SubscriptionConfig, SubscriptionTarget};
 pub use tracer::{TraceRecord, Tracer};
 pub use video_frame::VideoFrame;

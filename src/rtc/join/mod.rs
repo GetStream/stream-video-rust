@@ -69,7 +69,7 @@ use super::reconnect::{
 use super::remote_track::{RemoteParticipant, RemoteTrack};
 use super::sfu_ws::{self, SfuReceiver, SfuSender};
 use super::signal::SignalClient;
-use super::stats::{self, StatsReporter, StatsReporterParts};
+use super::stats::{self, RtcStatsSnapshot, StatsReporter, StatsReporterParts};
 use super::subscriptions::{SubscriptionConfig, SubscriptionTarget, TrackKey};
 use super::tracer::Tracer;
 
@@ -156,6 +156,44 @@ impl JoinCallData {
             create: true,
             ..Self::new(user_id)
         }
+    }
+}
+
+/// Pre-fetched coordinator join results used to connect to the SFU without a
+/// second coordinator REST round-trip.
+///
+/// Bindings (and any caller that already ran coordinator join) inject the
+/// credentials, stats options, and capabilities from that response. The
+/// participant user token still comes from [`crate::rtc::RtcClient`].
+#[derive(Clone)]
+pub struct InjectedSfuJoin {
+    /// SFU edge, token, and ICE servers from coordinator join.
+    pub credentials: Credentials,
+    /// Stats cadence cached from coordinator join.
+    pub stats_options: StatsOptions,
+    /// Capabilities granted to this participant (`own_capabilities`).
+    pub own_capabilities: Vec<String>,
+}
+
+impl InjectedSfuJoin {
+    /// Inject only SFU credentials, using default stats options and no
+    /// capability list.
+    pub fn new(credentials: Credentials) -> Self {
+        Self {
+            credentials,
+            stats_options: StatsOptions::default(),
+            own_capabilities: Vec::new(),
+        }
+    }
+}
+
+impl std::fmt::Debug for InjectedSfuJoin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InjectedSfuJoin")
+            .field("credentials", &self.credentials)
+            .field("stats_options", &self.stats_options)
+            .field("own_capabilities", &self.own_capabilities)
+            .finish()
     }
 }
 
@@ -541,6 +579,9 @@ pub struct RtcCore {
     sub_config: StdMutex<SubscriptionConfig>,
     /// Set once the caller opts into subscriptions via `update_subscriptions`.
     subs_active: AtomicBool,
+    /// When false, skip coordinator WS (Python/bindings own it) and allow
+    /// coordinator REST join without a `connection_id`.
+    coordinator_events_enabled: AtomicBool,
     /// Tracks the caller explicitly dropped (unsubscribed); never re-subscribed
     /// until the publisher republishes them.
     manual_unsub: StdMutex<HashSet<TrackKey>>,
@@ -610,6 +651,7 @@ impl RtcCore {
             on_track_cb: StdMutex::new(None),
             sub_config: StdMutex::new(SubscriptionConfig::default()),
             subs_active: AtomicBool::new(false),
+            coordinator_events_enabled: AtomicBool::new(true),
             manual_unsub: StdMutex::new(HashSet::new()),
             manual_subscriptions: StdMutex::new(None),
             roster: StdMutex::new(HashMap::new()),
@@ -775,6 +817,8 @@ impl RtcCore {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clear();
+        self.coordinator_events_enabled
+            .store(true, Ordering::SeqCst);
         Ok(generation)
     }
 
@@ -998,6 +1042,19 @@ impl RtcCore {
             .await
             .as_ref()
             .map(|c| c.session_id.clone())
+    }
+
+    /// A point-in-time publisher/subscriber `getStats` snapshot.
+    ///
+    /// Returns `None` when the call is not connected. Sampling is time-boxed so
+    /// a closing PeerConnection cannot stall the caller.
+    pub async fn stats_snapshot(&self) -> Option<RtcStatsSnapshot> {
+        let (publisher, subscriber) = {
+            let guard = self.connection.lock().await;
+            let conn = guard.as_ref()?;
+            (conn.publisher.clone(), conn.subscriber.clone())
+        };
+        Some(stats::peer_connection_snapshot(&publisher, &subscriber).await)
     }
 }
 

@@ -2,9 +2,10 @@
 
 use super::*;
 use crate::client::ClientConfig;
+use crate::rtc::client::UserTokenSource;
 use crate::rtc::{
-    ClientPublishOptions, LocalAudioTrack, LocalVideoTrack, LocalVideoTrackConfig,
-    PreferredVideoCodec, publish_options::H264_FMTP,
+    ClientPublishOptions, Credentials, LocalAudioTrack, LocalVideoTrack, LocalVideoTrackConfig,
+    PreferredVideoCodec, SfuServer, publish_options::H264_FMTP,
 };
 use std::io::{Read, Write};
 use std::net::TcpListener;
@@ -1040,4 +1041,37 @@ async fn live_forced_media_restore_failure_is_surfaced_and_recovers() {
         CallingState::Joined,
         "reconnect did not recover after a surfaced media-restoration failure"
     );
+}
+
+#[tokio::test]
+async fn stats_snapshot_is_none_before_join() {
+    let core = test_core();
+    assert!(core.stats_snapshot().await.is_none());
+}
+
+#[tokio::test]
+async fn join_with_credentials_rejects_when_already_joining() {
+    let core = test_core();
+    core.begin_join().expect("first generation");
+    let token = crate::token::create_user_token(
+        b"test-secret",
+        "user",
+        &crate::token::TokenOptions::default(),
+    )
+    .expect("test user token");
+    let result = core
+        .join_with_credentials(
+            UserTokenSource::Static(token),
+            JoinCallData::new("user"),
+            InjectedSfuJoin::new(Credentials::new(
+                SfuServer::new("edge", "https://sfu.example/twirp", ""),
+                "sfu-token",
+                Vec::new(),
+            )),
+        )
+        .await;
+    let Err(error) = result else {
+        panic!("already joining");
+    };
+    assert!(matches!(error, RtcError::IllegalState(_)));
 }

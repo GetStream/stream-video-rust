@@ -742,6 +742,12 @@ impl Call {
         self.rtc.call_state()
     }
 
+    /// A point-in-time publisher/subscriber `getStats` snapshot, or `None` if
+    /// the call is not currently connected.
+    pub async fn stats_snapshot(&self) -> Option<crate::rtc::RtcStatsSnapshot> {
+        self.rtc.stats_snapshot().await
+    }
+
     // publish / subscribe (SFU WebRTC)
 
     /// Publish a local audio track (Opus). The track keeps producing media (PCM

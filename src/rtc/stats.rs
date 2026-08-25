@@ -40,6 +40,19 @@ use super::tracer::{TraceRecord, Tracer, now_ms};
 /// (interval-driven, no busy-wait) regardless.
 pub const DEFAULT_REPORTING_INTERVAL_MS: u64 = 2000;
 
+/// A point-in-time sample of publisher and subscriber `getStats` objects.
+///
+/// Each side is the flattened WebRTC stats-report map (an array of stat
+/// objects), matching the JSON the SFU `SendStats` path already produces.
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub struct RtcStatsSnapshot {
+    /// Flattened publisher PeerConnection stats.
+    pub publisher: Value,
+    /// Flattened subscriber PeerConnection stats.
+    pub subscriber: Value,
+}
+
 /// Bound on a single `get_stats()` call so a degraded or closing
 /// PeerConnection cannot block a report or the final flush (JS time-boxes the
 /// flush sampling to 2s).
@@ -281,6 +294,19 @@ async fn collect_stats(pc: &Arc<RTCPeerConnection>) -> (String, Value) {
     };
     let as_string = serde_json::to_string(&flattened).unwrap_or_else(|_| "[]".to_owned());
     (as_string, flattened)
+}
+
+/// Sample both PeerConnections without sending a `SendStats` RPC.
+pub(crate) async fn peer_connection_snapshot(
+    publisher: &Arc<RTCPeerConnection>,
+    subscriber: &Arc<RTCPeerConnection>,
+) -> RtcStatsSnapshot {
+    let (_, publisher) = collect_stats(publisher).await;
+    let (_, subscriber) = collect_stats(subscriber).await;
+    RtcStatsSnapshot {
+        publisher,
+        subscriber,
+    }
 }
 
 #[cfg(test)]

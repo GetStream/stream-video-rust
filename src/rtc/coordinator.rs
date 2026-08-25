@@ -68,6 +68,21 @@ pub struct IceServer {
     pub password: String,
 }
 
+impl IceServer {
+    /// Build an ICE server entry from STUN/TURN URLs and optional credentials.
+    pub fn new(
+        urls: impl Into<Vec<String>>,
+        username: impl Into<String>,
+        password: impl Into<String>,
+    ) -> Self {
+        Self {
+            urls: urls.into(),
+            username: username.into(),
+            password: password.into(),
+        }
+    }
+}
+
 impl std::fmt::Debug for IceServer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("IceServer")
@@ -90,6 +105,21 @@ pub struct SfuServer {
     pub ws_endpoint: String,
 }
 
+impl SfuServer {
+    /// Build an SFU edge descriptor from the coordinator join credentials.
+    pub fn new(
+        edge_name: impl Into<String>,
+        url: impl Into<String>,
+        ws_endpoint: impl Into<String>,
+    ) -> Self {
+        Self {
+            edge_name: edge_name.into(),
+            url: url.into(),
+            ws_endpoint: ws_endpoint.into(),
+        }
+    }
+}
+
 /// The participant credentials returned by the coordinator (`Credentials`).
 #[derive(Clone, Default, Deserialize)]
 #[serde(default)]
@@ -100,6 +130,17 @@ pub struct Credentials {
     pub token: String,
     /// ICE servers for the publisher/subscriber PeerConnections.
     pub ice_servers: Vec<IceServer>,
+}
+
+impl Credentials {
+    /// Build participant SFU credentials from a coordinator join response.
+    pub fn new(server: SfuServer, token: impl Into<String>, ice_servers: Vec<IceServer>) -> Self {
+        Self {
+            server,
+            token: token.into(),
+            ice_servers,
+        }
+    }
 }
 
 impl std::fmt::Debug for Credentials {
@@ -121,6 +162,16 @@ pub struct StatsOptions {
     pub reporting_interval_ms: i32,
     /// Whether RTC stats collection is enabled.
     pub enable_rtc_stats: bool,
+}
+
+impl StatsOptions {
+    /// Build stats options from a coordinator join response.
+    pub fn new(reporting_interval_ms: i32, enable_rtc_stats: bool) -> Self {
+        Self {
+            reporting_interval_ms,
+            enable_rtc_stats,
+        }
+    }
 }
 
 /// The coordinator join response (`JoinCallResponse`).

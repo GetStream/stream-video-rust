@@ -15,7 +15,9 @@ use crate::error::Result as CrateResult;
 use crate::token::{self, TokenOptions};
 
 use super::error::{Result, RtcError};
-use super::join::{CallEvent, CallStateSnapshot, CallingState, JoinCallData, RtcCore};
+use super::join::{
+    CallEvent, CallStateSnapshot, CallingState, InjectedSfuJoin, JoinCallData, RtcCore,
+};
 use super::local_track::{LocalAudioTrack, LocalTrack, LocalVideoTrack};
 use super::proto::models::TrackType;
 use super::remote_track::{RemoteParticipant, RemoteTrack};
@@ -235,6 +237,25 @@ impl RtcClient {
             .await?;
         Ok(RtcCall { core })
     }
+
+    /// Join using pre-fetched SFU credentials.
+    ///
+    /// Skips coordinator REST join and the coordinator WebSocket. Use this when
+    /// another layer (for example Python) already discovered location, joined
+    /// the coordinator, and holds the participant user token.
+    pub async fn join_with_credentials(
+        &self,
+        call_type: impl Into<String>,
+        call_id: impl Into<String>,
+        data: JoinCallData,
+        injected: InjectedSfuJoin,
+    ) -> Result<RtcCall> {
+        let core = RtcCore::new(self.client.clone(), call_type.into(), call_id.into());
+        core.set_disconnection_timeout(self.disconnection_timeout);
+        core.join_with_credentials(self.token_source.clone(), data, injected)
+            .await?;
+        Ok(RtcCall { core })
+    }
 }
 
 /// A joined call handle from [`RtcClient::join`].
@@ -367,6 +388,12 @@ impl RtcCall {
     pub async fn leave(&self) -> Result<()> {
         self.core.leave("user requested leave").await
     }
+
+    /// A point-in-time publisher/subscriber `getStats` snapshot, or `None` if
+    /// the call is not currently connected.
+    pub async fn stats_snapshot(&self) -> Option<super::stats::RtcStatsSnapshot> {
+        self.core.stats_snapshot().await
+    }
 }
 
 #[cfg(test)]
@@ -379,6 +406,7 @@ mod tests {
 
     use super::*;
     use crate::error::TokenError;
+    use crate::rtc::{Credentials, IceServer, SfuServer};
 
     fn inspected_token(claims: serde_json::Value) -> String {
         let header = URL_SAFE_NO_PAD.encode(br#"{"alg":"HS256","typ":"JWT"}"#);
@@ -473,5 +501,40 @@ mod tests {
             claims.exp.zip(claims.iat).map(|(exp, iat)| exp - iat),
             Some(600)
         );
+    }
+
+    #[test]
+    fn injected_sfu_join_debug_redacts_tokens() {
+        let injected = InjectedSfuJoin::new(Credentials::new(
+            SfuServer::new("edge", "https://sfu.example/twirp", "wss://sfu.example/ws"),
+            "sfu-token-must-not-leak",
+            vec![IceServer::new(
+                vec!["turn:turn.example".to_owned()],
+                "turn-user",
+                "turn-password-must-not-leak",
+            )],
+        ));
+        let debug = format!("{injected:?}");
+        assert!(!debug.contains("sfu-token-must-not-leak"));
+        assert!(!debug.contains("turn-password-must-not-leak"));
+        assert!(debug.contains("<redacted>"));
+    }
+
+    #[tokio::test]
+    async fn join_with_credentials_rejects_missing_ws_endpoint() {
+        let token = inspected_token(json!({"user_id": "user"}));
+        let client = RtcClient::new("key", token).expect("participant client");
+        let injected = InjectedSfuJoin::new(Credentials::new(
+            SfuServer::new("edge", "https://sfu.example/twirp", ""),
+            "sfu-token",
+            Vec::new(),
+        ));
+        let result = client
+            .join_with_credentials("default", "call", JoinCallData::new("user"), injected)
+            .await;
+        let Err(error) = result else {
+            panic!("missing ws_endpoint");
+        };
+        assert!(matches!(error, RtcError::Coordinator(message) if message.contains("ws_endpoint")));
     }
 }
