@@ -140,6 +140,7 @@ impl PySfuCredentials {
         &self,
         stats_options: Option<&PyStatsOptions>,
         own_capabilities: Vec<String>,
+        opus_dtx_enabled: bool,
     ) -> InjectedSfuJoin {
         InjectedSfuJoin {
             credentials: Credentials::new(
@@ -155,6 +156,7 @@ impl PySfuCredentials {
                 .map(PyStatsOptions::to_sdk)
                 .unwrap_or_default(),
             own_capabilities,
+            opus_dtx_enabled,
         }
     }
 }

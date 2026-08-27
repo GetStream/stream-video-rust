@@ -173,6 +173,8 @@ pub struct InjectedSfuJoin {
     pub stats_options: StatsOptions,
     /// Capabilities granted to this participant (`own_capabilities`).
     pub own_capabilities: Vec<String>,
+    /// Opus DTX from coordinator call settings (`audio.opus_dtx_enabled`).
+    pub opus_dtx_enabled: bool,
 }
 
 impl InjectedSfuJoin {
@@ -183,6 +185,7 @@ impl InjectedSfuJoin {
             credentials,
             stats_options: StatsOptions::default(),
             own_capabilities: Vec::new(),
+            opus_dtx_enabled: false,
         }
     }
 }
@@ -193,6 +196,7 @@ impl std::fmt::Debug for InjectedSfuJoin {
             .field("credentials", &self.credentials)
             .field("stats_options", &self.stats_options)
             .field("own_capabilities", &self.own_capabilities)
+            .field("opus_dtx_enabled", &self.opus_dtx_enabled)
             .finish()
     }
 }
@@ -582,6 +586,8 @@ pub struct RtcCore {
     /// When false, skip coordinator WS (Python/bindings own it) and allow
     /// coordinator REST join without a `connection_id`.
     coordinator_events_enabled: AtomicBool,
+    /// Coordinator `audio.opus_dtx_enabled`; applied to published Opus tracks.
+    opus_dtx_enabled: AtomicBool,
     /// Tracks the caller explicitly dropped (unsubscribed); never re-subscribed
     /// until the publisher republishes them.
     manual_unsub: StdMutex<HashSet<TrackKey>>,
@@ -652,6 +658,7 @@ impl RtcCore {
             sub_config: StdMutex::new(SubscriptionConfig::default()),
             subs_active: AtomicBool::new(false),
             coordinator_events_enabled: AtomicBool::new(true),
+            opus_dtx_enabled: AtomicBool::new(false),
             manual_unsub: StdMutex::new(HashSet::new()),
             manual_subscriptions: StdMutex::new(None),
             roster: StdMutex::new(HashMap::new()),

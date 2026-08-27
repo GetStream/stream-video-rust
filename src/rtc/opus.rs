@@ -109,6 +109,45 @@ impl Encoder {
         }
         Ok(written as usize)
     }
+
+    /// Enable or disable RFC 6716 discontinuous transmission (DTX).
+    ///
+    /// When on, libopus emits a smaller SID packet for silent frames instead of
+    /// a full speech frame. This is independent of RED, which stays off.
+    ///
+    /// # Errors
+    ///
+    /// Returns the libopus status string if the control request fails.
+    pub fn set_dtx(&mut self, enabled: bool) -> Result<(), String> {
+        let status = unsafe {
+            sys::opus_encoder_ctl(
+                self.raw,
+                sys::OPUS_SET_DTX_REQUEST,
+                c_int::from(enabled),
+            )
+        };
+        if status != sys::OPUS_OK {
+            return Err(format!("opus set dtx: {}", opus_strerror(status)));
+        }
+        Ok(())
+    }
+
+    /// Whether DTX is currently enabled on this encoder.
+    ///
+    /// # Errors
+    ///
+    /// Returns the libopus status string if the control request fails.
+    #[cfg(test)]
+    pub fn dtx(&self) -> Result<bool, String> {
+        let mut value: c_int = 0;
+        let status = unsafe {
+            sys::opus_encoder_ctl(self.raw, sys::OPUS_GET_DTX_REQUEST, &raw mut value)
+        };
+        if status != sys::OPUS_OK {
+            return Err(format!("opus get dtx: {}", opus_strerror(status)));
+        }
+        Ok(value != 0)
+    }
 }
 
 impl Drop for Encoder {
@@ -229,5 +268,15 @@ mod tests {
             .encode(&vec![0i16; 137], &mut packet)
             .expect_err("bogus frame size must be rejected");
         assert!(err.contains("opus encode"), "error was: {err}");
+    }
+
+    #[test]
+    fn dtx_defaults_off_and_can_be_enabled() {
+        let mut encoder = Encoder::new_voip_mono().expect("encoder");
+        assert!(!encoder.dtx().expect("get dtx"), "DTX must default off");
+        encoder.set_dtx(true).expect("enable dtx");
+        assert!(encoder.dtx().expect("get dtx"), "DTX should be on");
+        encoder.set_dtx(false).expect("disable dtx");
+        assert!(!encoder.dtx().expect("get dtx"), "DTX should be off");
     }
 }

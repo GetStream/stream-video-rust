@@ -276,7 +276,7 @@ pub(crate) async fn build_track_infos(
             track_id: bound.id().to_owned(),
             track_type: track_type as i32,
             mid: transceiver.mid().map(|m| m.to_string()).unwrap_or_default(),
-            dtx: false,
+            dtx: local.opus_dtx(),
             stereo: false,
             red: false,
             muted: false,

@@ -20,6 +20,7 @@ impl RtcCore {
         {
             return Err(RtcError::PermissionDenied { capability });
         }
+        track.apply_opus_dtx(self.opus_dtx_enabled.load(Ordering::SeqCst))?;
         let mut media = self.media.lock().await;
         let track_id = track.track_id();
         let status = media

@@ -25,6 +25,10 @@ impl RtcCore {
             return Ok(());
         }
         let tracks = media.active_tracks();
+        let dtx = self.opus_dtx_enabled.load(Ordering::SeqCst);
+        for track in &tracks {
+            track.apply_opus_dtx(dtx)?;
+        }
         let Some((publisher, signal, session_id, publish_options)) = self.publisher_handles().await
         else {
             return Err(RtcError::IllegalState(

@@ -28,7 +28,6 @@ use webrtc::rtp_transceiver::rtp_codec::{
 use webrtc::rtp_transceiver::rtp_transceiver_direction::RTCRtpTransceiverDirection;
 use webrtc::sdp::extmap::{
     AUDIO_LEVEL_URI, SDES_MID_URI, SDES_REPAIR_RTP_STREAM_ID_URI, SDES_RTP_STREAM_ID_URI,
-    TRANSPORT_CC_URI,
 };
 
 use super::coordinator::IceServer;
@@ -272,6 +271,7 @@ async fn build_generic_offer(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use webrtc::sdp::extmap::TRANSPORT_CC_URI;
 
     #[test]
     fn ice_servers_filter_empty_and_map_credential() {

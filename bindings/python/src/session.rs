@@ -53,6 +53,7 @@ impl PyRtcSession {
         credentials,
         stats_options=None,
         own_capabilities=None,
+        opus_dtx_enabled=false,
     ))]
     fn join<'py>(
         _cls: &Bound<'py, PyType>,
@@ -65,11 +66,14 @@ impl PyRtcSession {
         credentials: Bound<'py, PySfuCredentials>,
         stats_options: Option<Bound<'py, PyStatsOptions>>,
         own_capabilities: Option<Vec<String>>,
+        opus_dtx_enabled: bool,
     ) -> PyResult<Bound<'py, PyAny>> {
         let stats = stats_options.as_ref().map(|opts| opts.borrow().clone());
-        let injected = credentials
-            .borrow()
-            .to_injected(stats.as_ref(), own_capabilities.unwrap_or_default());
+        let injected = credentials.borrow().to_injected(
+            stats.as_ref(),
+            own_capabilities.unwrap_or_default(),
+            opus_dtx_enabled,
+        );
         future_into_py(py, async move {
             let client = RtcClient::new(api_key, user_token).map_err(crate_err)?;
             let call = client

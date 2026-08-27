@@ -325,6 +325,7 @@ struct AudioInner {
     pacer: StdMutex<Option<JoinHandle<()>>>,
     pacer_started: AtomicBool,
     pcm_pacing: AtomicBool,
+    dtx: AtomicBool,
     write_guard: tokio::sync::Mutex<()>,
 }
 
@@ -360,9 +361,27 @@ impl LocalAudioTrack {
                 pacer: StdMutex::new(None),
                 pacer_started: AtomicBool::new(false),
                 pcm_pacing: AtomicBool::new(true),
+                dtx: AtomicBool::new(false),
                 write_guard: tokio::sync::Mutex::new(()),
             }),
         })
+    }
+
+    /// Apply RFC 6716 DTX on the Opus encoder. Call settings drive this via
+    /// [`RtcCore`](crate::rtc::join::RtcCore) at publish time.
+    pub(crate) fn set_dtx(&self, enabled: bool) -> Result<()> {
+        self.inner
+            .encoder
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .set_dtx(enabled)
+            .map_err(RtcError::Media)?;
+        self.inner.dtx.store(enabled, Ordering::SeqCst);
+        Ok(())
+    }
+
+    pub(crate) fn dtx_enabled(&self) -> bool {
+        self.inner.dtx.load(Ordering::SeqCst)
     }
 
     /// Queue a PCM frame for the paced 20 ms Opus encoder.
@@ -1894,6 +1913,22 @@ impl LocalTrack {
         }
     }
 
+    pub(crate) fn apply_opus_dtx(&self, enabled: bool) -> Result<()> {
+        match self {
+            LocalTrack::Audio(track) | LocalTrack::ScreenShareAudio(track) => {
+                track.set_dtx(enabled)
+            }
+            LocalTrack::Video { .. } => Ok(()),
+        }
+    }
+
+    pub(crate) fn opus_dtx(&self) -> bool {
+        match self {
+            LocalTrack::Audio(track) | LocalTrack::ScreenShareAudio(track) => track.dtx_enabled(),
+            LocalTrack::Video { .. } => false,
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn is_video_layer_paused(&self, rid: &str) -> Option<bool> {
         match self {
@@ -1924,6 +1959,20 @@ mod tests {
             .write_sample(&silence, Duration::from_millis(20))
             .await
             .expect("write_sample");
+    }
+
+    #[test]
+    fn opus_dtx_defaults_off_and_follows_set_dtx() {
+        let track = LocalAudioTrack::opus().expect("opus track");
+        assert!(!track.dtx_enabled(), "DTX must default off");
+        track.set_dtx(true).expect("enable dtx");
+        assert!(track.dtx_enabled());
+        assert!(
+            LocalTrack::Audio(track.clone()).opus_dtx(),
+            "TrackInfo plumbing reads the same flag"
+        );
+        track.set_dtx(false).expect("disable dtx");
+        assert!(!track.dtx_enabled());
     }
 
     #[tokio::test]

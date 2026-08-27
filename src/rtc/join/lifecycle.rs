@@ -104,6 +104,8 @@ impl RtcCore {
         }
         self.coordinator_events_enabled
             .store(false, Ordering::SeqCst);
+        self.opus_dtx_enabled
+            .store(injected.opus_dtx_enabled, Ordering::SeqCst);
         {
             let mut so = self.stats_options.lock().unwrap_or_else(|e| e.into_inner());
             *so = injected.stats_options;
@@ -435,6 +437,13 @@ impl RtcCore {
             let mut so = self.stats_options.lock().unwrap_or_else(|e| e.into_inner());
             *so = join.stats_options.clone();
         }
+        self.opus_dtx_enabled.store(
+            join.call
+                .settings
+                .as_ref()
+                .is_some_and(|settings| settings.audio.opus_dtx_enabled),
+            Ordering::SeqCst,
+        );
 
         if credentials.server.ws_endpoint.is_empty() {
             return Err((RtcError::missing_credential("ws_endpoint"), Some(edge_name)));
@@ -771,6 +780,7 @@ impl RtcCore {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clear();
+        self.opus_dtx_enabled.store(false, Ordering::SeqCst);
         *self
             .call_state
             .lock()
