@@ -575,18 +575,17 @@ impl RtcCore {
         peer::trace_peer_events(&subscriber, subscriber_tracer.clone());
         peer::trace_peer_events(&publisher, publisher_tracer.clone());
 
-        let (mut sender, mut receiver) =
-            match ws_result {
-                Ok(pair) => pair,
-                Err(e) => {
-                    signal.trace("signal.close", json!(e.to_string()));
-                    let _ = subscriber.close().await;
-                    let _ = publisher.close().await;
-                    return Err(RtcError::WsConnection(
-                        super::super::error::WsConnectionError::transport(e.to_string()),
-                    ));
-                }
-            };
+        let (mut sender, mut receiver) = match ws_result {
+            Ok(pair) => pair,
+            Err(e) => {
+                signal.trace("signal.close", json!(e.to_string()));
+                let _ = subscriber.close().await;
+                let _ = publisher.close().await;
+                return Err(RtcError::WsConnection(
+                    super::super::error::WsConnectionError::transport(e.to_string()),
+                ));
+            }
+        };
         signal.trace("signal.ws.open", json!(credentials.server.edge_name));
 
         // Build + send the JoinRequest. `fast_reconnect` is deprecated upstream;

@@ -737,7 +737,10 @@ mod tests {
         }
         assert_eq!(ready.len(), MAX_READY_VIDEO_FRAMES);
         assert_eq!(
-            ready.iter().map(|frame| frame.rtp_timestamp).collect::<Vec<_>>(),
+            ready
+                .iter()
+                .map(|frame| frame.rtp_timestamp)
+                .collect::<Vec<_>>(),
             vec![5, 6, 7]
         );
     }

@@ -304,15 +304,11 @@ pub(crate) async fn create_join_peers(ice: &[IceServer]) -> Result<JoinPeers> {
         },
         {
             let api = Arc::clone(&api);
-            async move {
-                generic_sdp_with_api(&api, RTCRtpTransceiverDirection::Recvonly).await
-            }
+            async move { generic_sdp_with_api(&api, RTCRtpTransceiverDirection::Recvonly).await }
         },
         {
             let api = Arc::clone(&api);
-            async move {
-                generic_sdp_with_api(&api, RTCRtpTransceiverDirection::Sendonly).await
-            }
+            async move { generic_sdp_with_api(&api, RTCRtpTransceiverDirection::Sendonly).await }
         },
     )?;
     Ok(JoinPeers {

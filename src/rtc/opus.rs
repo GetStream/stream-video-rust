@@ -120,11 +120,7 @@ impl Encoder {
     /// Returns the libopus status string if the control request fails.
     pub fn set_dtx(&mut self, enabled: bool) -> Result<(), String> {
         let status = unsafe {
-            sys::opus_encoder_ctl(
-                self.raw,
-                sys::OPUS_SET_DTX_REQUEST,
-                c_int::from(enabled),
-            )
+            sys::opus_encoder_ctl(self.raw, sys::OPUS_SET_DTX_REQUEST, c_int::from(enabled))
         };
         if status != sys::OPUS_OK {
             return Err(format!("opus set dtx: {}", opus_strerror(status)));
@@ -140,9 +136,8 @@ impl Encoder {
     #[cfg(test)]
     pub fn dtx(&self) -> Result<bool, String> {
         let mut value: c_int = 0;
-        let status = unsafe {
-            sys::opus_encoder_ctl(self.raw, sys::OPUS_GET_DTX_REQUEST, &raw mut value)
-        };
+        let status =
+            unsafe { sys::opus_encoder_ctl(self.raw, sys::OPUS_GET_DTX_REQUEST, &raw mut value) };
         if status != sys::OPUS_OK {
             return Err(format!("opus get dtx: {}", opus_strerror(status)));
         }
