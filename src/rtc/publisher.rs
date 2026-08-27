@@ -14,6 +14,10 @@ use webrtc::peer_connection::RTCPeerConnection;
 use webrtc::peer_connection::sdp::sdp_type::RTCSdpType;
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
 use webrtc::peer_connection::signaling_state::RTCSignalingState;
+use webrtc::rtcp::packet::Packet as RtcpPacket;
+use webrtc::rtcp::payload_feedbacks::full_intra_request::FullIntraRequest;
+use webrtc::rtcp::payload_feedbacks::picture_loss_indication::PictureLossIndication;
+use webrtc::rtp_transceiver::rtp_sender::RTCRtpSender;
 
 use super::error::{NegotiationError, Result, RtcError};
 use super::local_track::LocalTrack;
@@ -205,32 +209,27 @@ pub(crate) async fn add_transceiver_for_track(
     Ok(tasks)
 }
 
+fn rtcp_requests_keyframe(packets: &[Box<dyn RtcpPacket + Send + Sync>]) -> bool {
+    packets.iter().any(|packet| {
+        packet.as_any().is::<PictureLossIndication>() || packet.as_any().is::<FullIntraRequest>()
+    })
+}
+
 fn spawn_rtcp_reader(
-    sender: Arc<webrtc::rtp_transceiver::rtp_sender::RTCRtpSender>,
+    sender: Arc<RTCRtpSender>,
     rid: Option<String>,
     track: LocalTrack,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         loop {
             let result = match rid.as_deref() {
-                Some(rid) => {
-                    let mut buffer = vec![0_u8; 1_500];
-                    sender.read_simulcast(&mut buffer, rid).await
-                }
+                Some(rid) => sender.read_rtcp_simulcast(rid).await,
                 None => sender.read_rtcp().await,
             };
             let Ok((packets, _attributes)) = result else {
                 break;
             };
-            let keyframe_requested = packets.iter().any(|packet| {
-                packet
-                    .as_any()
-                    .is::<webrtc::rtcp::payload_feedbacks::picture_loss_indication::PictureLossIndication>()
-                    || packet
-                        .as_any()
-                        .is::<webrtc::rtcp::payload_feedbacks::full_intra_request::FullIntraRequest>()
-            });
-            if keyframe_requested {
+            if rtcp_requests_keyframe(&packets) {
                 track.force_video_keyframe();
             }
         }
@@ -311,6 +310,18 @@ mod tests {
             }),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn rtcp_pli_and_fir_request_a_keyframe() {
+        let pli: Box<dyn RtcpPacket + Send + Sync> = Box::new(PictureLossIndication::default());
+        let fir: Box<dyn RtcpPacket + Send + Sync> = Box::new(FullIntraRequest::default());
+        let report: Box<dyn RtcpPacket + Send + Sync> =
+            Box::new(webrtc::rtcp::receiver_report::ReceiverReport::default());
+        assert!(rtcp_requests_keyframe(std::slice::from_ref(&pli)));
+        assert!(rtcp_requests_keyframe(std::slice::from_ref(&fir)));
+        assert!(!rtcp_requests_keyframe(std::slice::from_ref(&report)));
+        assert!(!rtcp_requests_keyframe(&[]));
     }
 
     #[test]
