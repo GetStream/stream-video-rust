@@ -4,10 +4,9 @@
 //! I420 frames into encoded VP8/VP9 for the SFU. The `vpx-encode` crate is too
 //! restrictive for realtime streaming — it hardcodes the encoder config, so it
 //! cannot set `g_lag_in_frames = 0` (VP9 otherwise buffers frames and emits
-//! nothing per call) or force keyframes (the backend publisher can't answer a
-//! subscriber's PLI, so a static image would only ever produce one keyframe
-//! that late subscribers miss). This module binds `libvpx` directly (via
-//! `env-libvpx-sys`, exposed as `vpx_sys`) with the correct realtime config.
+//! nothing per call) or force keyframes on PLI/FIR. This module binds `libvpx`
+//! directly (via `env-libvpx-sys`, exposed as `vpx_sys`) with the correct
+//! realtime config.
 //!
 //! The libvpx C API is inherently unsafe; every FFI call is wrapped here and the
 //! module surface is safe. libvpx encoder contexts are single-threaded but not
@@ -19,8 +18,9 @@ use std::os::raw::{c_int, c_uint, c_ulong, c_void};
 use std::ptr;
 
 use vpx_sys::vp8e_enc_control_id::{
-    VP8E_SET_CPUUSED, VP9E_GET_SVC_LAYER_ID, VP9E_REGISTER_CX_CALLBACK, VP9E_SET_ROW_MT,
-    VP9E_SET_SVC, VP9E_SET_SVC_INTER_LAYER_PRED, VP9E_SET_SVC_PARAMETERS,
+    VP8E_SET_CPUUSED, VP8E_SET_STATIC_THRESHOLD, VP9E_GET_SVC_LAYER_ID, VP9E_REGISTER_CX_CALLBACK,
+    VP9E_SET_AQ_MODE, VP9E_SET_ROW_MT, VP9E_SET_SVC, VP9E_SET_SVC_INTER_LAYER_PRED,
+    VP9E_SET_SVC_PARAMETERS,
 };
 use vpx_sys::vp9e_temporal_layering_mode::{
     VP9E_TEMPORAL_LAYERING_MODE_0101, VP9E_TEMPORAL_LAYERING_MODE_0212,
@@ -184,6 +184,31 @@ pub(super) fn check(res: vpx_codec_err_t, what: &str) -> Result<()> {
     }
 }
 
+/// libwebrtc realtime speed: 8 below 720p, 9 at or above 720p.
+fn realtime_cpu_used(width: u32, height: u32) -> c_int {
+    if height >= 720 || width.saturating_mul(height) >= 1_280 * 720 {
+        9
+    } else {
+        8
+    }
+}
+
+/// libwebrtc realtime VP9: cyclic-refresh AQ and skip-static-blocks.
+fn apply_vp9_realtime_controls(ctx: &mut vpx_codec_ctx_t) -> Result<()> {
+    // SAFETY: the caller owns a live encoder context and has exclusive access
+    // for these synchronous libvpx control calls.
+    unsafe {
+        check(
+            vpx_codec_control_(ctx, VP9E_SET_AQ_MODE as c_int, 3_u32),
+            "set_aq_mode",
+        )?;
+        check(
+            vpx_codec_control_(ctx, VP8E_SET_STATIC_THRESHOLD as c_int, 1_u32),
+            "set_static_threshold",
+        )
+    }
+}
+
 impl VpxEncoder {
     /// Create an encoder for `width`x`height` (both must be even) at
     /// `bitrate_kbps`, configured for realtime, low-latency, per-frame output.
@@ -241,15 +266,18 @@ impl VpxEncoder {
             )?;
             let mut ctx = ctx.assume_init();
 
-            // Fastest realtime speed setting (CPUUSED is 0..=9 for VP9, higher is
-            // faster / lower quality — fine for a solid backend frame).
             check(
-                vpx_codec_control_(&mut ctx, VP8E_SET_CPUUSED as c_int, 8 as c_int),
+                vpx_codec_control_(
+                    &mut ctx,
+                    VP8E_SET_CPUUSED as c_int,
+                    realtime_cpu_used(width, height),
+                ),
                 "set_cpuused",
             )?;
             if codec == VpxCodec::Vp9 {
                 // Row-based multithreading; ignore errors on builds without it.
                 let _ = vpx_codec_control_(&mut ctx, VP9E_SET_ROW_MT as c_int, 1 as c_int);
+                apply_vp9_realtime_controls(&mut ctx)?;
             }
 
             Ok(Self { ctx, width, height })
@@ -458,11 +486,13 @@ impl VpxSvcEncoder {
                 mode,
                 callback,
             };
+            let cpu_used = realtime_cpu_used(width, height);
             check(
-                vpx_codec_control_(&mut encoder.ctx, VP8E_SET_CPUUSED as c_int, 8 as c_int),
+                vpx_codec_control_(&mut encoder.ctx, VP8E_SET_CPUUSED as c_int, cpu_used),
                 "SVC set_cpuused",
             )?;
             let _ = vpx_codec_control_(&mut encoder.ctx, VP9E_SET_ROW_MT as c_int, 1 as c_int);
+            apply_vp9_realtime_controls(&mut encoder.ctx)?;
             check(
                 vpx_codec_control_(&mut encoder.ctx, VP9E_SET_SVC as c_int, 1 as c_int),
                 "enable SVC",
@@ -473,7 +503,7 @@ impl VpxSvcEncoder {
                 min_quantizers: [2; 12],
                 scaling_factor_num: [1; 12],
                 scaling_factor_den: [1; 12],
-                speed_per_layer: [8; 12],
+                speed_per_layer: [cpu_used; 12],
                 temporal_layering_mode: temporal_mode as c_int,
                 loopfilter_ctrl: [0; 12],
             };
@@ -745,5 +775,23 @@ mod tests {
         temporal_ids.push(key[0].temporal_id);
 
         assert_eq!(temporal_ids, [0, 2, 1, 2, 0, 0]);
+    }
+
+    #[test]
+    fn realtime_cpu_used_is_faster_at_720p() {
+        assert_eq!(realtime_cpu_used(640, 480), 8);
+        assert_eq!(realtime_cpu_used(320, 240), 8);
+        assert_eq!(realtime_cpu_used(1_280, 720), 9);
+        assert_eq!(realtime_cpu_used(720, 1_280), 9);
+        assert_eq!(realtime_cpu_used(1_920, 1_080), 9);
+        assert_eq!(realtime_cpu_used(1_279, 719), 8);
+        assert_eq!(realtime_cpu_used(2_000, 461), 9);
+    }
+
+    #[test]
+    fn vp9_720p_realtime_controls_are_accepted() {
+        drop(VpxEncoder::new(VpxCodec::Vp9, 1_280, 720, 1_200).expect("720p VP9 encoder"));
+        let mode = Vp9SvcMode::new(1, 1).expect("L1T1 mode");
+        drop(VpxSvcEncoder::new(1_280, 720, 1_200, mode).expect("720p VP9 SVC encoder"));
     }
 }
