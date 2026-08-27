@@ -72,13 +72,10 @@ const MAX_LOCAL_VIDEO_PIXELS: u64 = 3_840 * 2_160;
 const MAX_LOCAL_VIDEO_I420_BYTES: usize = 3_840 * 2_160 * 3 / 2;
 const PCM_QUEUE_CAPACITY_SAMPLES: usize = FRAME_SAMPLES_20MS * 10;
 const MAX_OPUS_PACKET_BYTES: usize = 1_500;
-/// Force a fresh keyframe at least this often. The backend publisher does not
-/// answer receiver PLI/FIR (webrtc-rs has no publisher keyframe-request hook),
-/// and libvpx only emits a keyframe on the first frame or a scene change — so a
-/// static image would produce a single keyframe that late subscribers miss. We
-/// re-init the encoder on this interval so a new subscriber always gets a
-/// decodable keyframe quickly.
-const KEYFRAME_INTERVAL_MS: i64 = 1_000;
+/// Fallback keyframe cadence when no PLI/FIR arrives. Publisher RTCP readers
+/// force a keyframe on PLI/FIR; this interval covers late subscribers if a
+/// request is missed.
+const KEYFRAME_INTERVAL_MS: i64 = 4_000;
 
 /// Sentinel for "no audio level for this write". RFC 6464 levels occupy
 /// `0..=127`, so any value above that is free.
@@ -2542,6 +2539,53 @@ mod tests {
                 .await
                 .expect("write_i420 blue frame");
         }
+    }
+
+    fn gray_i420(width: u32, height: u32) -> Vec<u8> {
+        vec![128; (width as usize) * (height as usize) * 3 / 2]
+    }
+
+    fn vp9_rtp_is_keyframe(packet: &RtpPacket) -> bool {
+        packet.payload.first().is_some_and(|b0| b0 & 0x40 == 0)
+    }
+
+    #[test]
+    fn periodic_keyframe_fallback_is_four_seconds() {
+        let track = LocalVideoTrack::vp9().expect("vp9 track");
+        let frame = gray_i420(320, 240);
+        let mut keyed = Vec::new();
+        for _ in 0..=4 {
+            let layers = encode_i420_layers(&track.inner, &frame, 320, 240, 1_000, 90_000)
+                .expect("encode");
+            let packet = &layers[0].1[0];
+            keyed.push(vp9_rtp_is_keyframe(packet));
+        }
+        assert_eq!(
+            keyed,
+            [true, false, false, false, true],
+            "keyframes at 0s and {KEYFRAME_INTERVAL_MS}ms, not every second"
+        );
+    }
+
+    #[test]
+    fn pli_force_keyframe_emits_key_before_fallback_interval() {
+        let track = LocalVideoTrack::vp9().expect("vp9 track");
+        let frame = gray_i420(320, 240);
+        let first =
+            encode_i420_layers(&track.inner, &frame, 320, 240, 1_000, 90_000).expect("first");
+        assert!(vp9_rtp_is_keyframe(&first[0].1[0]));
+        let delta =
+            encode_i420_layers(&track.inner, &frame, 320, 240, 1_000, 90_000).expect("delta");
+        assert!(
+            !vp9_rtp_is_keyframe(&delta[0].1[0]),
+            "static content must not key every second"
+        );
+        track.force_keyframe();
+        let pli = encode_i420_layers(&track.inner, &frame, 320, 240, 1_000, 90_000).expect("pli");
+        assert!(
+            vp9_rtp_is_keyframe(&pli[0].1[0]),
+            "PLI/FIR must force a keyframe before the fallback interval"
+        );
     }
 
     #[tokio::test]
