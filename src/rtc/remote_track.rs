@@ -52,6 +52,9 @@ const VIDEO_CLOCK_RATE: u32 = 90_000;
 /// one is in flight for at least a round trip, so asking faster only wastes
 /// uplink.
 const KEYFRAME_REQUEST_INTERVAL: Duration = Duration::from_secs(1);
+/// Decoded I420 frames waiting for [`RemoteTrack::next_video_frame`]. A slow
+/// consumer must not grow RSS without limit; keep the newest frames.
+const MAX_READY_VIDEO_FRAMES: usize = 3;
 
 /// The publishing participant a [`RemoteTrack`] belongs to.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -555,7 +558,7 @@ impl VideoDecode {
                             );
                             self.last_resolution = Some(resolution);
                         }
-                        self.ready.push_back(frame);
+                        push_ready_video_frame(&mut self.ready, frame);
                     }
                 }
                 Err(e) => {
@@ -593,6 +596,14 @@ impl Drop for RemoteTrack {
             f();
         }
     }
+}
+
+fn push_ready_video_frame(ready: &mut VecDeque<VideoFrame>, frame: VideoFrame) {
+    while ready.len() >= MAX_READY_VIDEO_FRAMES {
+        ready.pop_front();
+        tracing::debug!("stream.rtc.remote.video_frame_queue_overflow");
+    }
+    ready.push_back(frame);
 }
 
 fn is_audio(track_type: TrackType) -> bool {
@@ -708,5 +719,26 @@ mod tests {
         assert_eq!(snapshot.published_tracks.len(), 2);
         assert_eq!(snapshot.paused_tracks, vec![TrackType::Video]);
         assert_eq!(snapshot.source, models::ParticipantSource::Sip);
+    }
+
+    #[test]
+    fn decoded_video_queue_keeps_the_newest_frames() {
+        let mut ready = VecDeque::new();
+        for rtp_timestamp in 0..8 {
+            push_ready_video_frame(
+                &mut ready,
+                VideoFrame {
+                    width: 2,
+                    height: 2,
+                    data: vec![rtp_timestamp as u8],
+                    rtp_timestamp,
+                },
+            );
+        }
+        assert_eq!(ready.len(), MAX_READY_VIDEO_FRAMES);
+        assert_eq!(
+            ready.iter().map(|frame| frame.rtp_timestamp).collect::<Vec<_>>(),
+            vec![5, 6, 7]
+        );
     }
 }

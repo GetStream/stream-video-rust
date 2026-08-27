@@ -1,6 +1,7 @@
 //! [`RtcSession`] — SFU participant session bound to pre-fetched credentials.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyType};
@@ -24,17 +25,30 @@ const TRACK_QUEUE_CAP: usize = 32;
 pub struct PyRtcSession {
     call: RtcCall,
     tracks: Arc<TokioMutex<mpsc::Receiver<RemoteTrack>>>,
+    dropped_remote_tracks: Arc<AtomicU64>,
 }
 
 impl PyRtcSession {
     fn from_call(call: RtcCall) -> Self {
         let (tx, rx) = mpsc::channel(TRACK_QUEUE_CAP);
+        let dropped_remote_tracks = Arc::new(AtomicU64::new(0));
+        let overflow = dropped_remote_tracks.clone();
         call.on_track(move |track| {
-            let _ = tx.try_send(track);
+            if let Err(error) = tx.try_send(track) {
+                let dropped = overflow.fetch_add(1, Ordering::Relaxed) + 1;
+                tracing::warn!(
+                    dropped,
+                    capacity = TRACK_QUEUE_CAP,
+                    full = matches!(error, mpsc::error::TrySendError::Full(_)),
+                    closed = matches!(error, mpsc::error::TrySendError::Closed(_)),
+                    "stream.rtc.python.remote_track_queue_overflow"
+                );
+            }
         });
         Self {
             call,
             tracks: Arc::new(TokioMutex::new(rx)),
+            dropped_remote_tracks,
         }
     }
 }
@@ -201,6 +215,13 @@ impl PyRtcSession {
     #[getter]
     fn calling_state(&self) -> &'static str {
         calling_state_str(self.call.calling_state())
+    }
+
+    /// Inbound tracks dropped because [`next_track`](Self::next_track) lagged
+    /// behind the `on_track` callback. Zero when the queue never overflowed.
+    #[getter]
+    fn dropped_remote_tracks(&self) -> u64 {
+        self.dropped_remote_tracks.load(Ordering::Relaxed)
     }
 
     fn mute_track<'py>(&self, py: Python<'py>, track_type: String) -> PyResult<Bound<'py, PyAny>> {
