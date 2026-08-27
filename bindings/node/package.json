@@ -1,0 +1,30 @@
+{
+  "name": "@stream-io/node-rtc",
+  "version": "0.1.0-preview.2",
+  "private": true,
+  "description": "Local native RTC core for the Stream Node SDK",
+  "license": "UNLICENSED",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/GetStream/stream-video-rust.git",
+    "directory": "bindings/node"
+  },
+  "main": "index.js",
+  "types": "index.d.ts",
+  "files": [
+    "index.js",
+    "index.d.ts",
+    "stream-node-rtc.node"
+  ],
+  "scripts": {
+    "build:local": "node ./scripts/build-local.mjs",
+    "smoke": "node ./scripts/smoke.mjs"
+  },
+  "devDependencies": {
+    "@napi-rs/cli": "^3.8.6"
+  },
+  "engines": {
+    "node": ">=22.12.0"
+  },
+  "packageManager": "npm@11.11.1"
+}

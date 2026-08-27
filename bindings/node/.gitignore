@@ -1,0 +1,8 @@
+# npm's lockfile remains tracked; installed dependencies and native build
+# products do not.
+/node_modules/
+/*.node
+/*.dylib
+/*.dll
+/*.so
+/npm-debug.log*

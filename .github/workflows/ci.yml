@@ -61,6 +61,39 @@ jobs:
       - run: cargo test --locked --no-run
       - run: cargo build --locked --examples
 
+  node-binding:
+    name: Node binding (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-rust
+        with:
+          toolchain: stable
+          components: clippy
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: bindings/node/package-lock.json
+      - name: Install Node binding dependencies
+        working-directory: bindings/node
+        run: npm ci --ignore-scripts
+      - name: Clippy
+        run: cargo clippy --locked -p getstream-node-rtc --all-targets -- -D warnings
+      - name: Unit tests
+        run: cargo test --locked -p getstream-node-rtc
+      - name: Build local addon and verify static libvpx
+        working-directory: bindings/node
+        run: npm run build:local
+      - name: Smoke test
+        working-directory: bindings/node
+        run: npm run smoke
+
   msrv:
     name: MSRV
     runs-on: ubuntu-latest
