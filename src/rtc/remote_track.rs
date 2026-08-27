@@ -15,7 +15,8 @@
 //!
 //! Read operations on one track are serialized. Do not mix raw and decoded
 //! reads concurrently: each RTP packet is consumed by whichever read operation
-//! acquires the track first. Switching sequentially from [`drain_rtp`] to a
+//! acquires the track first. Switching sequentially from
+//! [`RemoteTrack::drain_rtp`] to a
 //! decoded path is supported — drain drops decode state so the next decode
 //! starts clean and asks for a keyframe.
 //!
@@ -351,7 +352,7 @@ impl RemoteTrack {
     /// Discard inbound RTP without reassembly or decode.
     ///
     /// Reads packets until one has the RTP marker bit (typically the last
-    /// packet of a video frame) or [`DRAIN_MAX_PACKETS`] have been dropped.
+    /// packet of a video frame) or `DRAIN_MAX_PACKETS` have been dropped.
     /// Returns `false` once the track ends. Serialized with the other read
     /// paths. If this track was previously decoded, pending samples and
     /// decoded frames are dropped so a later [`next_video_frame`](Self::next_video_frame)

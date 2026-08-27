@@ -673,6 +673,7 @@ struct VideoEncoding {
     core: TrackCore,
     encoder: StdMutex<Option<VideoEncoder>>,
     target_bitrate_kbps: AtomicU32,
+    allow_frame_skipping: bool,
     scale_resolution_bits: AtomicU32,
     max_framerate: AtomicU32,
     force_keyframe: AtomicBool,
@@ -727,6 +728,8 @@ pub enum VideoLayering {
 pub struct LocalVideoTrackConfig {
     /// Target encoder bitrate in bits per second.
     pub target_bitrate_bps: u32,
+    /// Allow the encoder to drop frames to maintain its target bitrate.
+    pub allow_frame_skipping: bool,
     /// Spatial/temporal layering policy. Defaults to [`VideoLayering::Single`].
     pub layering: VideoLayering,
 }
@@ -735,6 +738,7 @@ impl Default for LocalVideoTrackConfig {
     fn default() -> Self {
         Self {
             target_bitrate_bps: VIDEO_BITRATE_KBPS * 1_000,
+            allow_frame_skipping: true,
             layering: VideoLayering::Single,
         }
     }
@@ -889,6 +893,7 @@ impl LocalVideoTrack {
                 )?,
                 encoder: StdMutex::new(None),
                 target_bitrate_kbps: AtomicU32::new(bitrate_kbps),
+                allow_frame_skipping: config.allow_frame_skipping,
                 scale_resolution_bits: AtomicU32::new(1.0_f32.to_bits()),
                 max_framerate: AtomicU32::new(0),
                 force_keyframe: AtomicBool::new(true),
@@ -1569,7 +1574,10 @@ fn encode_layer_packets(
                 packetizer: VpxRtpPacketizer::new(codec),
             },
             (VideoCodec::H264, None) => VideoCodecState::H264 {
-                encoder: Box::new(H264Encoder::new(bitrate_kbps.saturating_mul(1_000))?),
+                encoder: Box::new(H264Encoder::new(
+                    bitrate_kbps.saturating_mul(1_000),
+                    encoding.allow_frame_skipping,
+                )?),
                 packetizer: H264RtpPacketizer::default(),
                 encoded: Vec::new(),
             },
@@ -2526,6 +2534,17 @@ mod tests {
         );
     }
 
+    #[test]
+    fn video_config_retains_frame_skipping_policy() {
+        let track = LocalVideoTrack::h264_with_config(LocalVideoTrackConfig {
+            allow_frame_skipping: false,
+            ..LocalVideoTrackConfig::default()
+        })
+        .expect("configured H264 track");
+
+        assert!(!track.inner.encodings[0].allow_frame_skipping);
+    }
+
     #[tokio::test]
     async fn vp9_write_i420_encodes_blue_frame() {
         let track = LocalVideoTrack::vp9().expect("vp9 track");
@@ -2555,8 +2574,8 @@ mod tests {
         let frame = gray_i420(320, 240);
         let mut keyed = Vec::new();
         for _ in 0..=4 {
-            let layers = encode_i420_layers(&track.inner, &frame, 320, 240, 1_000, 90_000)
-                .expect("encode");
+            let layers =
+                encode_i420_layers(&track.inner, &frame, 320, 240, 1_000, 90_000).expect("encode");
             let packet = &layers[0].1[0];
             keyed.push(vp9_rtp_is_keyframe(packet));
         }

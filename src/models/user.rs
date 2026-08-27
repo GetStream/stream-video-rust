@@ -5,7 +5,8 @@ use serde::{Deserialize, Serialize};
 use super::shared::{CustomData, SortParamRequest, Timestamp};
 
 /// A user to upsert (`UserRequest`). Only `id` is required.
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct UserRequest {
     /// Unique user ID.
     pub id: String,

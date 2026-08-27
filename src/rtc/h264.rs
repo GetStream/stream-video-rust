@@ -178,12 +178,12 @@ pub(crate) struct H264Encoder {
 }
 
 impl H264Encoder {
-    pub(crate) fn new(bitrate_bps: u32) -> Result<Self> {
+    pub(crate) fn new(bitrate_bps: u32, allow_frame_skipping: bool) -> Result<Self> {
         let config = EncoderConfig::new()
             .bitrate(BitRate::from_bps(bitrate_bps))
             .max_frame_rate(FrameRate::from_hz(30.0))
             .rate_control_mode(RateControlMode::Bitrate)
-            .skip_frames(true)
+            .skip_frames(allow_frame_skipping)
             .usage_type(UsageType::CameraVideoRealTime)
             .sps_pps_strategy(SpsPpsStrategy::ConstantId)
             .profile(Profile::Baseline)
@@ -375,14 +375,14 @@ mod tests {
 
     #[test]
     fn h264_round_trips_packed_i420() {
-        let mut encoder = H264Encoder::new(1_000_000).expect("encoder");
+        let mut encoder = H264Encoder::new(1_000_000, true).expect("encoder");
         let mut decoder = H264Decoder::new().expect("decoder");
         round_trip(&mut encoder, &mut decoder, 320, 240, 90_000);
     }
 
     #[test]
     fn h264_resolution_change_reinitializes_cleanly() {
-        let mut encoder = H264Encoder::new(1_000_000).expect("encoder");
+        let mut encoder = H264Encoder::new(1_000_000, true).expect("encoder");
         let mut decoder = H264Decoder::new().expect("decoder");
         round_trip(&mut encoder, &mut decoder, 320, 240, 90_000);
         round_trip(&mut encoder, &mut decoder, 640, 360, 180_000);
@@ -399,7 +399,7 @@ mod tests {
     #[test]
     fn h264_decoder_restarts_after_malformed_input() {
         let source = ramp_i420(320, 240);
-        let mut encoder = H264Encoder::new(1_000_000).expect("encoder");
+        let mut encoder = H264Encoder::new(1_000_000, true).expect("encoder");
         let mut encoded = Vec::new();
         encoder
             .encode_into(&source, 320, 240, true, &mut encoded)
@@ -421,7 +421,7 @@ mod tests {
 
     #[test]
     fn invalid_i420_dimensions_and_lengths_are_rejected() {
-        let mut encoder = H264Encoder::new(1_000_000).expect("encoder");
+        let mut encoder = H264Encoder::new(1_000_000, true).expect("encoder");
         let mut output = Vec::new();
         assert!(
             encoder
@@ -437,7 +437,7 @@ mod tests {
 
     #[test]
     fn level_3_1_encoder_rejects_frames_beyond_max_fs() {
-        let mut encoder = H264Encoder::new(1_000_000).expect("encoder");
+        let mut encoder = H264Encoder::new(1_000_000, true).expect("encoder");
         let mut output = Vec::new();
         let error = encoder
             .encode_into(&[], 1_920, 1_080, true, &mut output)

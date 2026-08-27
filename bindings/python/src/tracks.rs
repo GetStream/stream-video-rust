@@ -8,7 +8,7 @@ use pyo3::types::PyAny;
 use pyo3_async_runtimes::tokio::future_into_py;
 
 use getstream::rtc::proto::models::TrackType;
-use getstream::rtc::{LocalAudioTrack, LocalVideoTrack, RemoteTrack};
+use getstream::rtc::{LocalAudioTrack, LocalVideoTrack, LocalVideoTrackConfig, RemoteTrack};
 
 use crate::error::rtc_err;
 use crate::frames::{PyPcmFrame, PyVideoFrame, duration_from_ms, read_bytes, read_i16_samples};
@@ -73,28 +73,53 @@ pub struct PyLocalVideoTrack {
     codec: &'static str,
 }
 
+fn video_track_config(
+    target_bitrate_bps: Option<u32>,
+    allow_frame_skipping: bool,
+) -> LocalVideoTrackConfig {
+    let mut config =
+        target_bitrate_bps.map_or_else(LocalVideoTrackConfig::default, LocalVideoTrackConfig::new);
+    config.allow_frame_skipping = allow_frame_skipping;
+    config
+}
+
 #[pymethods]
 impl PyLocalVideoTrack {
     #[staticmethod]
-    fn vp8() -> PyResult<Self> {
+    #[pyo3(signature = (target_bitrate_bps=None, allow_frame_skipping=true))]
+    fn vp8(target_bitrate_bps: Option<u32>, allow_frame_skipping: bool) -> PyResult<Self> {
         Ok(Self {
-            inner: LocalVideoTrack::vp8().map_err(rtc_err)?,
+            inner: LocalVideoTrack::vp8_with_config(video_track_config(
+                target_bitrate_bps,
+                allow_frame_skipping,
+            ))
+            .map_err(rtc_err)?,
             codec: "vp8",
         })
     }
 
     #[staticmethod]
-    fn vp9() -> PyResult<Self> {
+    #[pyo3(signature = (target_bitrate_bps=None, allow_frame_skipping=true))]
+    fn vp9(target_bitrate_bps: Option<u32>, allow_frame_skipping: bool) -> PyResult<Self> {
         Ok(Self {
-            inner: LocalVideoTrack::vp9().map_err(rtc_err)?,
+            inner: LocalVideoTrack::vp9_with_config(video_track_config(
+                target_bitrate_bps,
+                allow_frame_skipping,
+            ))
+            .map_err(rtc_err)?,
             codec: "vp9",
         })
     }
 
     #[staticmethod]
-    fn h264() -> PyResult<Self> {
+    #[pyo3(signature = (target_bitrate_bps=None, allow_frame_skipping=true))]
+    fn h264(target_bitrate_bps: Option<u32>, allow_frame_skipping: bool) -> PyResult<Self> {
         Ok(Self {
-            inner: LocalVideoTrack::h264().map_err(rtc_err)?,
+            inner: LocalVideoTrack::h264_with_config(video_track_config(
+                target_bitrate_bps,
+                allow_frame_skipping,
+            ))
+            .map_err(rtc_err)?,
             codec: "h264",
         })
     }

@@ -749,6 +749,64 @@ fn permission_update_only_applies_to_the_local_user() {
     assert!(own_capabilities_from_event(&event, "bob").is_none());
 }
 
+#[test]
+fn publish_gate_prefers_current_grants_and_falls_back_to_capabilities() {
+    let core = test_core();
+    core.own_capabilities
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .insert("send-audio".to_owned());
+
+    core.ensure_publish_allowed(TrackType::Audio)
+        .expect("capability permits publishing before a grant update");
+    core.update_call_grants(Some(models::CallGrants {
+        can_publish_audio: false,
+        can_publish_video: true,
+        can_screenshare: true,
+    }));
+    assert!(matches!(
+        core.ensure_publish_allowed(TrackType::Audio),
+        Err(RtcError::PermissionDenied {
+            capability: "send-audio"
+        })
+    ));
+
+    core.update_call_grants(Some(models::CallGrants {
+        can_publish_audio: true,
+        can_publish_video: true,
+        can_screenshare: true,
+    }));
+    core.own_capabilities
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .clear();
+    core.ensure_publish_allowed(TrackType::Audio)
+        .expect("the latest SFU grant is authoritative");
+
+    core.update_call_grants(None);
+    assert!(matches!(
+        core.ensure_publish_allowed(TrackType::Audio),
+        Err(RtcError::PermissionDenied {
+            capability: "send-audio"
+        })
+    ));
+}
+
+#[test]
+fn screen_share_audio_uses_the_screen_share_grant() {
+    let grants = models::CallGrants {
+        can_publish_audio: false,
+        can_publish_video: false,
+        can_screenshare: true,
+    };
+    assert!(grants_allow(&grants, TrackType::ScreenShare));
+    assert!(grants_allow(&grants, TrackType::ScreenShareAudio));
+    assert_eq!(
+        required_publish_capability(TrackType::ScreenShareAudio),
+        "screenshare"
+    );
+}
+
 #[tokio::test]
 async fn permission_revocation_stops_an_active_track() {
     let core = test_core();

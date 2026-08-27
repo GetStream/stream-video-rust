@@ -201,12 +201,6 @@ impl RtcCore {
         }
         let stream_id = track.stream_id();
         let (prefix, msid_type) = parse_msid(&stream_id);
-        let track_type = msid_type
-            .and_then(|n| TrackType::try_from(n).ok())
-            .unwrap_or_else(|| match track.kind() {
-                RTPCodecType::Audio => TrackType::Audio,
-                _ => TrackType::Video,
-            });
 
         let cb = self
             .on_track_cb
@@ -219,6 +213,9 @@ impl RtcCore {
         };
 
         let participant = self.lookup_participant(&prefix);
+        let track_type = msid_type
+            .and_then(|n| TrackType::try_from(n).ok())
+            .unwrap_or_else(|| infer_track_type(track.kind(), &participant.published_tracks));
         tracing::debug!(
             %stream_id,
             ?track_type,
@@ -267,5 +264,70 @@ impl RtcCore {
         if let Err(e) = self.recompute_subscriptions().await {
             tracing::debug!(error = %e, "stream.rtc.unsubscribe_on_drop_failed");
         }
+    }
+}
+
+/// Resolve a track kind when the msid carried no track type.
+///
+/// The SFU does not always tag the msid, and falling back to the codec kind
+/// alone reports every inbound video stream as camera `Video` — a screen share
+/// then becomes indistinguishable from a webcam. The participant roster already
+/// tells us what they publish, so when exactly one video kind is in play it is
+/// unambiguous. With both published we keep the historical `Video` default
+/// rather than guess.
+fn infer_track_type(kind: RTPCodecType, published: &[TrackType]) -> TrackType {
+    if kind == RTPCodecType::Audio {
+        return if published.contains(&TrackType::ScreenShareAudio)
+            && !published.contains(&TrackType::Audio)
+        {
+            TrackType::ScreenShareAudio
+        } else {
+            TrackType::Audio
+        };
+    }
+
+    if published.contains(&TrackType::ScreenShare) && !published.contains(&TrackType::Video) {
+        TrackType::ScreenShare
+    } else {
+        TrackType::Video
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn missing_msid_type_infers_unambiguous_screen_share_tracks() {
+        assert_eq!(
+            infer_track_type(RTPCodecType::Video, &[TrackType::ScreenShare]),
+            TrackType::ScreenShare
+        );
+        assert_eq!(
+            infer_track_type(
+                RTPCodecType::Audio,
+                &[TrackType::ScreenShare, TrackType::ScreenShareAudio],
+            ),
+            TrackType::ScreenShareAudio
+        );
+    }
+
+    #[test]
+    fn missing_msid_type_keeps_camera_defaults_when_track_kind_is_ambiguous() {
+        assert_eq!(
+            infer_track_type(
+                RTPCodecType::Video,
+                &[TrackType::Video, TrackType::ScreenShare],
+            ),
+            TrackType::Video
+        );
+        assert_eq!(
+            infer_track_type(
+                RTPCodecType::Audio,
+                &[TrackType::Audio, TrackType::ScreenShareAudio],
+            ),
+            TrackType::Audio
+        );
+        assert_eq!(infer_track_type(RTPCodecType::Video, &[]), TrackType::Video);
     }
 }

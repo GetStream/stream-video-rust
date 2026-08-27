@@ -11,17 +11,10 @@ impl RtcCore {
         else {
             return Err(RtcError::IllegalState("publish() before join()".to_owned()));
         };
-        let capability = required_publish_capability(track.track_type());
-        if !self
-            .own_capabilities
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .contains(capability)
-        {
-            return Err(RtcError::PermissionDenied { capability });
-        }
+        self.ensure_publish_allowed(track.track_type())?;
         track.apply_opus_dtx(self.opus_dtx_enabled.load(Ordering::SeqCst))?;
         let mut media = self.media.lock().await;
+        self.ensure_publish_allowed(track.track_type())?;
         let track_id = track.track_id();
         let status = media
             .position(&track_id)
@@ -209,32 +202,14 @@ impl RtcCore {
         muted: bool,
     ) -> Result<()> {
         if !muted {
-            let capability = required_publish_capability(track_type);
-            if !self
-                .own_capabilities
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .contains(capability)
-            {
-                return Err(RtcError::PermissionDenied { capability });
-            }
-            let grants = self
-                .call_state
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .current_grants;
-            if grants
-                .as_ref()
-                .is_some_and(|grants| !grants_allow(grants, track_type))
-            {
-                return Err(RtcError::PermissionDenied { capability });
-            }
+            self.ensure_publish_allowed(track_type)?;
         }
 
-        let tracks = self
-            .media
-            .lock()
-            .await
+        let media = self.media.lock().await;
+        if !muted {
+            self.ensure_publish_allowed(track_type)?;
+        }
+        let tracks = media
             .active_tracks()
             .into_iter()
             .filter(|track| track.track_type() == track_type)
@@ -277,6 +252,33 @@ impl RtcCore {
                 .user_id
                 .clone();
             self.roster_add_track(&user_id, &session_id, track_type as i32, None);
+        }
+        Ok(())
+    }
+
+    pub(super) fn ensure_publish_allowed(&self, track_type: TrackType) -> Result<()> {
+        let capability = required_publish_capability(track_type);
+        if let Some(grants) = self
+            .call_state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .current_grants
+            .as_ref()
+        {
+            return if grants_allow(grants, track_type) {
+                Ok(())
+            } else {
+                Err(RtcError::PermissionDenied { capability })
+            };
+        }
+
+        if !self
+            .own_capabilities
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .contains(capability)
+        {
+            return Err(RtcError::PermissionDenied { capability });
         }
         Ok(())
     }

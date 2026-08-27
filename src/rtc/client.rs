@@ -20,6 +20,7 @@ use super::join::{
 };
 use super::local_track::{LocalAudioTrack, LocalTrack, LocalVideoTrack};
 use super::proto::models::TrackType;
+use super::publish_options::ClientPublishOptions;
 use super::remote_track::{RemoteParticipant, RemoteTrack};
 use super::subscriptions::{SubscriptionConfig, SubscriptionTarget};
 
@@ -127,6 +128,7 @@ pub struct RtcClient {
     client: Arc<Client>,
     token_source: UserTokenSource,
     disconnection_timeout: Duration,
+    publish_options: ClientPublishOptions,
 }
 
 impl std::fmt::Debug for RtcClient {
@@ -135,6 +137,7 @@ impl std::fmt::Debug for RtcClient {
             .field("client", &self.client)
             .field("token_source", &self.token_source)
             .field("disconnection_timeout", &self.disconnection_timeout)
+            .field("publish_options", &self.publish_options)
             .finish()
     }
 }
@@ -161,6 +164,7 @@ impl RtcClient {
             client: Arc::new(client),
             token_source: UserTokenSource::Static(user_token.into()),
             disconnection_timeout: Duration::ZERO,
+            publish_options: ClientPublishOptions::default(),
         })
     }
 
@@ -177,6 +181,7 @@ impl RtcClient {
             client: Arc::new(client),
             token_source: UserTokenSource::Static(user_token.into()),
             disconnection_timeout: Duration::ZERO,
+            publish_options: ClientPublishOptions::default(),
         })
     }
 
@@ -214,6 +219,7 @@ impl RtcClient {
             client: Arc::new(client),
             token_source: UserTokenSource::Provider(Arc::new(token_provider)),
             disconnection_timeout: Duration::ZERO,
+            publish_options: ClientPublishOptions::default(),
         })
     }
 
@@ -221,6 +227,13 @@ impl RtcClient {
     #[must_use]
     pub fn with_disconnection_timeout(mut self, timeout: Duration) -> Self {
         self.disconnection_timeout = timeout;
+        self
+    }
+
+    /// Configure publishing preferences applied before each join.
+    #[must_use]
+    pub fn with_publish_options(mut self, options: ClientPublishOptions) -> Self {
+        self.publish_options = options;
         self
     }
 
@@ -233,6 +246,7 @@ impl RtcClient {
     ) -> Result<RtcCall> {
         let core = RtcCore::new(self.client.clone(), call_type.into(), call_id.into());
         core.set_disconnection_timeout(self.disconnection_timeout);
+        core.update_publish_options(self.publish_options);
         core.join_with_token_source(self.token_source.clone(), data)
             .await?;
         Ok(RtcCall { core })
@@ -252,6 +266,7 @@ impl RtcClient {
     ) -> Result<RtcCall> {
         let core = RtcCore::new(self.client.clone(), call_type.into(), call_id.into());
         core.set_disconnection_timeout(self.disconnection_timeout);
+        core.update_publish_options(self.publish_options);
         core.join_with_credentials(self.token_source.clone(), data, injected)
             .await?;
         Ok(RtcCall { core })
@@ -518,6 +533,17 @@ mod tests {
         assert!(!debug.contains("sfu-token-must-not-leak"));
         assert!(!debug.contains("turn-password-must-not-leak"));
         assert!(debug.contains("<redacted>"));
+    }
+
+    #[test]
+    fn publish_options_are_retained_for_join() {
+        let token = inspected_token(json!({"user_id": "user"}));
+        let options = ClientPublishOptions::new(crate::rtc::PreferredVideoCodec::H264);
+        let client = RtcClient::new("key", token)
+            .expect("participant client")
+            .with_publish_options(options);
+
+        assert_eq!(client.publish_options, options);
     }
 
     #[tokio::test]

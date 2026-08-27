@@ -9,7 +9,8 @@ use super::user::{UserRequest, UserResponse};
 // Members
 
 /// A call member to add/update (`MemberRequest`).
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct MemberRequest {
     pub user_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -44,7 +45,8 @@ pub struct MemberResponse {
 // Call core
 
 /// Call creation/update payload (`CallRequest`).
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct CallRequest {
     /// Server-side creator user ID.
     #[serde(skip_serializing_if = "Option::is_none")]
