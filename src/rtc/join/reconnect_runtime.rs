@@ -797,8 +797,21 @@ impl RtcCore {
                 String::new(),
             )
             .await?;
-        let subscriber_sdp = peer::generic_sdp(RTCRtpTransceiverDirection::Recvonly).await?;
-        let publisher_sdp = peer::generic_sdp(RTCRtpTransceiverDirection::Sendonly).await?;
+        let api = Arc::new(peer::build_api()?);
+        let (subscriber_sdp, publisher_sdp) = tokio::try_join!(
+            {
+                let api = Arc::clone(&api);
+                async move {
+                    peer::generic_sdp_with_api(&api, RTCRtpTransceiverDirection::Recvonly).await
+                }
+            },
+            {
+                let api = Arc::clone(&api);
+                async move {
+                    peer::generic_sdp_with_api(&api, RTCRtpTransceiverDirection::Sendonly).await
+                }
+            },
+        )?;
         let ws_url = build_sfu_ws_url(
             &credentials.server.ws_endpoint,
             &self.api_key,

@@ -111,7 +111,7 @@ fn register_supported_codecs(media_engine: &mut MediaEngine) -> Result<()> {
 /// 0.17.2 has no GCC/BWE estimator, and `availableOutgoingBitrate` stays 0.
 /// RTX (`enable_sender_rtx` / `video/rtx`) is still blocked on webrtc-rs #295.
 /// The NACK responder is already wired by [`register_default_interceptors`].
-fn build_api() -> Result<API> {
+pub(crate) fn build_api() -> Result<API> {
     let mut media_engine = MediaEngine::default();
     register_supported_codecs(&mut media_engine)?;
     let registry = register_default_interceptors(Registry::new(), &mut media_engine)?;
@@ -168,7 +168,13 @@ pub fn to_rtc_ice_servers(servers: &[IceServer]) -> Vec<RTCIceServer> {
 
 /// Create a fresh PeerConnection wired with the join credentials' ICE servers.
 pub async fn new_peer_connection(ice: &[IceServer]) -> Result<Arc<RTCPeerConnection>> {
-    let api = build_api()?;
+    new_peer_connection_with_api(&build_api()?, ice).await
+}
+
+pub(crate) async fn new_peer_connection_with_api(
+    api: &API,
+    ice: &[IceServer],
+) -> Result<Arc<RTCPeerConnection>> {
     let config = RTCConfiguration {
         ice_servers: to_rtc_ice_servers(ice),
         ..Default::default()
@@ -232,11 +238,15 @@ pub fn trace_peer_events(pc: &Arc<RTCPeerConnection>, tracer: Arc<Tracer>) {
 ///
 /// `sendonly` produces the publisher SDP; `recvonly` produces the subscriber SDP.
 pub async fn generic_sdp(direction: RTCRtpTransceiverDirection) -> Result<String> {
-    let api = build_api()?;
-    let pc = api.new_peer_connection(RTCConfiguration::default()).await?;
+    generic_sdp_with_api(&build_api()?, direction).await
+}
 
+pub(crate) async fn generic_sdp_with_api(
+    api: &API,
+    direction: RTCRtpTransceiverDirection,
+) -> Result<String> {
+    let pc = api.new_peer_connection(RTCConfiguration::default()).await?;
     let result = build_generic_offer(&pc, direction).await;
-    // Always tear the temp PC down, even if offer creation failed.
     let _ = pc.close().await;
     result
 }
@@ -266,6 +276,51 @@ async fn build_generic_offer(
 
     let offer = pc.create_offer(None).await?;
     Ok(offer.sdp)
+}
+
+/// Publisher and subscriber PeerConnections plus throwaway capability SDPs,
+/// all built from one shared [`API`] / MediaEngine.
+pub(crate) struct JoinPeers {
+    pub subscriber: Arc<RTCPeerConnection>,
+    pub publisher: Arc<RTCPeerConnection>,
+    pub subscriber_sdp: String,
+    pub publisher_sdp: String,
+}
+
+/// Create both join PeerConnections and both generic SDPs concurrently.
+pub(crate) async fn create_join_peers(ice: &[IceServer]) -> Result<JoinPeers> {
+    let api = Arc::new(build_api()?);
+    let ice = ice.to_vec();
+    let (subscriber, publisher, subscriber_sdp, publisher_sdp) = tokio::try_join!(
+        {
+            let api = Arc::clone(&api);
+            let ice = ice.clone();
+            async move { new_peer_connection_with_api(&api, &ice).await }
+        },
+        {
+            let api = Arc::clone(&api);
+            let ice = ice.clone();
+            async move { new_peer_connection_with_api(&api, &ice).await }
+        },
+        {
+            let api = Arc::clone(&api);
+            async move {
+                generic_sdp_with_api(&api, RTCRtpTransceiverDirection::Recvonly).await
+            }
+        },
+        {
+            let api = Arc::clone(&api);
+            async move {
+                generic_sdp_with_api(&api, RTCRtpTransceiverDirection::Sendonly).await
+            }
+        },
+    )?;
+    Ok(JoinPeers {
+        subscriber,
+        publisher,
+        subscriber_sdp,
+        publisher_sdp,
+    })
 }
 
 #[cfg(test)]

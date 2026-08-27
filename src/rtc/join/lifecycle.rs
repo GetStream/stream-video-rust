@@ -534,36 +534,20 @@ impl RtcCore {
         let publisher_tracer = Arc::new(Tracer::new(Some("publisher".to_owned())));
         let subscriber_tracer = Arc::new(Tracer::new(Some("subscriber".to_owned())));
 
-        // PeerConnections wired with the credential ICE servers.
-        let subscriber = peer::new_peer_connection(&credentials.ice_servers).await?;
-        let publisher = peer::new_peer_connection(&credentials.ice_servers).await?;
-
-        // Trace PC lifecycle (signaling / ICE gathering / ICE connection /
-        // negotiation / data channel) — the `onicecandidate`, `ontrack`, and
-        // `connectionstatechange` tags come from the dedicated handlers below.
-        peer::trace_peer_events(&subscriber, subscriber_tracer.clone());
-        peer::trace_peer_events(&publisher, publisher_tracer.clone());
-
-        // Throwaway generic SDPs so the SFU can learn our codecs.
-        let subscriber_sdp =
-            peer::generic_sdp(webrtc::rtp_transceiver::rtp_transceiver_direction::RTCRtpTransceiverDirection::Recvonly)
-                .await?;
-        let publisher_sdp =
-            peer::generic_sdp(webrtc::rtp_transceiver::rtp_transceiver_direction::RTCRtpTransceiverDirection::Sendonly)
-                .await?;
-
-        // Signal client (Twirp) for SendAnswer / IceTrickle, tracing each RPC
-        // into the call-level tracer for the `rtc_stats` rollup.
+        // Signal client is cheap (no network). PeerConnections, throwaway SDPs,
+        // and the SFU WebSocket overlap: coordinator REST still dominates join
+        // latency, so this is about cutting serial webrtc-rs setup, not a
+        // claimed e2e win.
+        let data_rpc_timeout = data.rpc_request_timeout;
         let signal = SignalClient::with_http(
             self.client.http().clone(),
             &credentials.server.url,
             credentials.token.clone(),
         )?
-        .with_timeout(data.rpc_request_timeout)
+        .with_timeout(data_rpc_timeout)
         .with_max_response_body_bytes(self.client.max_response_body_bytes())
         .with_tracer(signal_tracer.clone());
 
-        // Open the SFU WebSocket with the JS-style query string.
         let ws_url = build_sfu_ws_url(
             &credentials.server.ws_endpoint,
             &self.api_key,
@@ -572,13 +556,32 @@ impl RtcCore {
             &self.cid(),
             attempt,
         )?;
+        let max_ws_bytes = self.client.max_websocket_message_bytes();
+        let ice = credentials.ice_servers.clone();
+        let (peers, ws_result) = tokio::join!(
+            peer::create_join_peers(&ice),
+            sfu_ws::connect_with_limit(&ws_url, max_ws_bytes)
+        );
+        let peer::JoinPeers {
+            subscriber,
+            publisher,
+            subscriber_sdp,
+            publisher_sdp,
+        } = match peers {
+            Ok(peers) => peers,
+            Err(error) => return Err(error),
+        };
+
+        peer::trace_peer_events(&subscriber, subscriber_tracer.clone());
+        peer::trace_peer_events(&publisher, publisher_tracer.clone());
+
         let (mut sender, mut receiver) =
-            match sfu_ws::connect_with_limit(&ws_url, self.client.max_websocket_message_bytes())
-                .await
-            {
+            match ws_result {
                 Ok(pair) => pair,
                 Err(e) => {
                     signal.trace("signal.close", json!(e.to_string()));
+                    let _ = subscriber.close().await;
+                    let _ = publisher.close().await;
                     return Err(RtcError::WsConnection(
                         super::super::error::WsConnectionError::transport(e.to_string()),
                     ));
