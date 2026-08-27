@@ -10,7 +10,9 @@
 use std::sync::Arc;
 
 use serde_json::json;
-use webrtc::api::interceptor_registry::register_default_interceptors;
+use webrtc::api::interceptor_registry::{
+    configure_twcc_sender_only, register_default_interceptors,
+};
 use webrtc::api::media_engine::{
     MIME_TYPE_H264, MIME_TYPE_OPUS, MIME_TYPE_VP8, MIME_TYPE_VP9, MediaEngine,
 };
@@ -26,6 +28,7 @@ use webrtc::rtp_transceiver::rtp_codec::{
 use webrtc::rtp_transceiver::rtp_transceiver_direction::RTCRtpTransceiverDirection;
 use webrtc::sdp::extmap::{
     AUDIO_LEVEL_URI, SDES_MID_URI, SDES_REPAIR_RTP_STREAM_ID_URI, SDES_RTP_STREAM_ID_URI,
+    TRANSPORT_CC_URI,
 };
 
 use super::coordinator::IceServer;
@@ -102,18 +105,21 @@ fn register_supported_codecs(media_engine: &mut MediaEngine) -> Result<()> {
 }
 
 /// Build a webrtc-rs [`API`] with the supported codecs and default interceptors
-/// (NACK, RTCP reports, receiver-side TWCC).
+/// (NACK, RTCP reports, receiver-side TWCC) plus the TWCC *sender* interceptor.
 ///
-/// Known gap versus Pion/videosdk: webrtc-rs ships no publisher-side congestion
-/// controller (TWCC *sender* estimator / GCC) and no RTX/NACK retransmission
-/// sender. Opus audio is unaffected — low bitrate, loss-tolerant, single layer —
-/// but high-bitrate video publishing runs without bandwidth estimation or
-/// retransmission. The default interceptor set below is wired as-is rather than
-/// worked around.
+/// `configure_twcc_sender_only` stamps `transport-cc` on outbound RTP so the
+/// remote can generate TWCC feedback. It adds **no rate control**: webrtc-rs
+/// 0.17.2 has no GCC/BWE estimator, and `availableOutgoingBitrate` stays 0.
+/// RTX (`enable_sender_rtx` / `video/rtx`) is still blocked on webrtc-rs #295.
+/// The NACK responder is already wired by [`register_default_interceptors`].
 fn build_api() -> Result<API> {
     let mut media_engine = MediaEngine::default();
     register_supported_codecs(&mut media_engine)?;
     let registry = register_default_interceptors(Registry::new(), &mut media_engine)?;
+    // Receiver-only TWCC is part of the default set. Adding the sender
+    // interceptor reuses the already-registered transport-cc URI and does not
+    // install a congestion controller.
+    let registry = configure_twcc_sender_only(registry, &mut media_engine)?;
     // RFC 6464 audio levels (videosdk `media_engine.go`). Registered *after* the
     // default interceptors so TWCC keeps its usual id and this takes the next
     // free one. Audio + send-only scopes it to our publisher's audio m-lines:
@@ -378,6 +384,23 @@ mod tests {
         assert!(
             !sdp.contains(AUDIO_LEVEL_URI),
             "recvonly SDP must not offer {AUDIO_LEVEL_URI}:\n{sdp}"
+        );
+    }
+
+    #[tokio::test]
+    async fn generic_sdp_advertises_transport_cc_on_audio_and_video() {
+        let sdp = generic_sdp(RTCRtpTransceiverDirection::Sendonly)
+            .await
+            .expect("generic sdp");
+        let audio = media_section(&sdp, "audio");
+        let video = media_section(&sdp, "video");
+        assert!(
+            audio.contains(TRANSPORT_CC_URI),
+            "publisher audio m-line must offer transport-cc:\n{audio}"
+        );
+        assert!(
+            video.contains(TRANSPORT_CC_URI),
+            "publisher video m-line must offer transport-cc:\n{video}"
         );
     }
 }
