@@ -1075,3 +1075,70 @@ async fn join_with_credentials_rejects_when_already_joining() {
     };
     assert!(matches!(error, RtcError::IllegalState(_)));
 }
+
+#[test]
+fn unsubscribe_on_drop_is_a_noop_after_leave() {
+    let runtime = tokio::runtime::Runtime::new().expect("runtime");
+    let handle = runtime.handle().clone();
+    let core = test_core();
+    let generation = runtime.block_on(async {
+        let generation = core.begin_join().expect("join generation");
+        core.leave("drop after leave").await.expect("leave");
+        generation
+    });
+    let spawned_before = core.runtime_tasks.spawned.load(Ordering::SeqCst);
+    spawn_unsubscribe_on_drop(
+        &handle,
+        Arc::downgrade(&core),
+        generation,
+        1,
+        TrackKey::new("session", TrackType::Audio),
+    );
+    assert_eq!(
+        core.runtime_tasks.spawned.load(Ordering::SeqCst),
+        spawned_before,
+        "stale generation must not spawn an unsubscribe task"
+    );
+}
+
+#[tokio::test]
+async fn unsubscribe_on_drop_spawns_from_a_non_worker_thread() {
+    let core = test_core();
+    let generation = prepare_joined_core(&core, "user");
+    let handle = tokio::runtime::Handle::current();
+    let spawned_before = core.runtime_tasks.spawned.load(Ordering::SeqCst);
+    let drop_core = core.clone();
+    std::thread::spawn(move || {
+        spawn_unsubscribe_on_drop(
+            &handle,
+            Arc::downgrade(&drop_core),
+            generation,
+            1,
+            TrackKey::new("session", TrackType::Audio),
+        );
+    })
+    .join()
+    .expect("drop thread");
+    assert_eq!(
+        core.runtime_tasks.spawned.load(Ordering::SeqCst),
+        spawned_before + 1
+    );
+}
+
+#[tokio::test]
+async fn unsubscribe_on_drop_spawns_while_the_generation_is_current() {
+    let core = test_core();
+    let generation = prepare_joined_core(&core, "user");
+    let spawned_before = core.runtime_tasks.spawned.load(Ordering::SeqCst);
+    spawn_unsubscribe_on_drop(
+        &tokio::runtime::Handle::current(),
+        Arc::downgrade(&core),
+        generation,
+        1,
+        TrackKey::new("session", TrackType::Audio),
+    );
+    assert_eq!(
+        core.runtime_tasks.spawned.load(Ordering::SeqCst),
+        spawned_before + 1
+    );
+}

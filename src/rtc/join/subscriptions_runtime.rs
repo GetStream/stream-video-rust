@@ -231,15 +231,9 @@ impl RtcCore {
         }
         let key = TrackKey::new(participant.session_id.clone(), track_type);
         let weak = Arc::downgrade(&self);
+        let handle = tokio::runtime::Handle::current();
         let on_drop = Box::new(move || {
-            if let Some(core) = weak.upgrade() {
-                let task_core = core.clone();
-                std::mem::drop(core.spawn_runtime_task(async move {
-                    task_core
-                        .on_remote_track_dropped(generation, connection_epoch, key)
-                        .await;
-                }));
-            }
+            spawn_unsubscribe_on_drop(&handle, weak, generation, connection_epoch, key);
         });
         let remote = RemoteTrack::new(track, participant, track_type, subscriber, on_drop);
         cb(remote);

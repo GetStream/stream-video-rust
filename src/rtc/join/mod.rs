@@ -1058,6 +1058,35 @@ impl RtcCore {
     }
 }
 
+/// Unsubscribe a dropped [`RemoteTrack`] without panicking from a sync `Drop`.
+///
+/// Python GC runs off the Tokio worker set, so a bare `tokio::spawn` from
+/// `Drop` panics (`there is no reactor running`) and was spinning soak CPU.
+/// `Handle::spawn` is safe from any thread while the runtime is alive; skip
+/// once `leave()` has invalidated the join generation.
+fn spawn_unsubscribe_on_drop(
+    handle: &tokio::runtime::Handle,
+    weak: Weak<RtcCore>,
+    generation: u64,
+    connection_epoch: u64,
+    key: TrackKey,
+) {
+    let Some(core) = weak.upgrade() else {
+        return;
+    };
+    if !core.is_generation_current(generation) {
+        return;
+    }
+    let task_core = core.clone();
+    let guard = core.runtime_tasks.start();
+    handle.spawn(async move {
+        let _guard = guard;
+        task_core
+            .on_remote_track_dropped(generation, connection_epoch, key)
+            .await;
+    });
+}
+
 fn required_publish_capability(track_type: TrackType) -> &'static str {
     match track_type {
         TrackType::Audio => "send-audio",
