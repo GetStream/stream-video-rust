@@ -66,7 +66,7 @@ fn encoded_keyframe(codec: VpxCodec, width: u32, height: u32) -> Vec<u8> {
 
 fn encoded_h264_keyframe(width: u32, height: u32) -> Vec<u8> {
     let source = i420_fixture(width, height);
-    let mut encoder = H264Encoder::new(1_000_000).expect("create fixture H264 encoder");
+    let mut encoder = H264Encoder::new(1_000_000, true).expect("create fixture H264 encoder");
     let mut encoded = Vec::new();
     let keyframe = encoder
         .encode_into(&source, width, height, true, &mut encoded)
@@ -229,7 +229,7 @@ fn bench_h264_encode(criterion: &mut Criterion) {
     let mut group = criterion.benchmark_group("h264_encode");
     for (width, height) in [(640, 360), (1_280, 720)] {
         let mut source = i420_fixture(width, height);
-        let mut encoder = H264Encoder::new(1_000_000).expect("create H264 encoder");
+        let mut encoder = H264Encoder::new(1_000_000, true).expect("create H264 encoder");
         let mut encoded = Vec::new();
         encoder
             .encode_into(&source, width, height, true, &mut encoded)
