@@ -184,6 +184,16 @@ impl PyRemoteTrack {
         })
     }
 
+    /// Discard inbound RTP without reassembly or decode.
+    ///
+    /// Returns `True` after dropping packets through the next marker bit (or a
+    /// packet cap), or `False` once the track ends. Use this when nobody is
+    /// consuming decoded frames so webrtc-rs buffers do not fill.
+    fn drain_rtp<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let track = self.inner.clone();
+        future_into_py(py, async move { Ok(track.drain_rtp().await) })
+    }
+
     fn __repr__(&self) -> String {
         format!(
             "RemoteTrack(user_id={:?}, track_type={})",

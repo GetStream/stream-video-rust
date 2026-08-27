@@ -6,14 +6,18 @@
 //! [`TrackType`], the negotiated [`Codec`], and three read paths:
 //!
 //! - [`RemoteTrack::read_rtp`] — the raw inbound RTP packet (RTP-forward path).
+//! - [`RemoteTrack::drain_rtp`] — discard inbound RTP without reassembly or
+//!   decode (keep webrtc-rs buffers from filling when nobody is watching).
 //! - [`RemoteTrack::next_pcm`] — decoded 48 kHz mono [`PcmFrame`] (audio only;
 //!   Opus decode, for the PCM bridge / bots).
 //! - [`RemoteTrack::next_video_frame`] — decoded packed-I420 [`VideoFrame`]
 //!   (VP8/VP9/H264 video, for bots that need to *see* the call).
 //!
 //! Read operations on one track are serialized. Do not mix raw and decoded
-//! reads: each RTP packet is consumed by whichever read operation acquires the
-//! track first, so splitting one stream between paths makes both incomplete.
+//! reads concurrently: each RTP packet is consumed by whichever read operation
+//! acquires the track first. Switching sequentially from [`drain_rtp`] to a
+//! decoded path is supported — drain drops decode state so the next decode
+//! starts clean and asks for a keyframe.
 //!
 //! Dropping a `RemoteTrack` unsubscribes it from the SFU (best-effort) so the
 //! server stops forwarding a stream the caller no longer reads.
@@ -46,6 +50,10 @@ use super::vpx_decode::VpxDecoder;
 /// to be filled (by NACK/RTX or a reordered arrival) before giving up on a
 /// frame. ~1 s of 30 fps video fragmented at MTU.
 const VIDEO_MAX_LATE: u16 = 200;
+/// Cap for one [`RemoteTrack::drain_rtp`] call so a stream that never sets the
+/// RTP marker bit cannot hold the read gate forever. A 720p keyframe is well
+/// under this even at MTU-sized packets.
+const DRAIN_MAX_PACKETS: usize = 256;
 /// The RTP clock for all WebRTC video.
 const VIDEO_CLOCK_RATE: u32 = 90_000;
 /// Floor between automatic PLIs. A keyframe is expensive for the publisher, and
@@ -340,6 +348,34 @@ impl RemoteTrack {
         self.read_rtp_inner().await
     }
 
+    /// Discard inbound RTP without reassembly or decode.
+    ///
+    /// Reads packets until one has the RTP marker bit (typically the last
+    /// packet of a video frame) or [`DRAIN_MAX_PACKETS`] have been dropped.
+    /// Returns `false` once the track ends. Serialized with the other read
+    /// paths. If this track was previously decoded, pending samples and
+    /// decoded frames are dropped so a later [`next_video_frame`](Self::next_video_frame)
+    /// starts clean.
+    pub async fn drain_rtp(&self) -> bool {
+        let _read_guard = self.read_gate.lock().await;
+        if let Decode::Video(state) = &self.decode {
+            state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .abandon_decoded_state();
+        }
+        let mut packets_read = 0;
+        loop {
+            let Some(pkt) = self.read_rtp_inner().await else {
+                return false;
+            };
+            packets_read += 1;
+            if drain_rtp_batch_complete(pkt.header.marker, packets_read) {
+                return true;
+            }
+        }
+    }
+
     async fn read_rtp_inner(&self) -> Option<RtpPacket> {
         match self.track.read_rtp().await {
             Ok((pkt, _attr)) => Some(pkt),
@@ -399,6 +435,14 @@ impl RemoteTrack {
             return None;
         };
         let _read_guard = self.read_gate.lock().await;
+        let needs_opening_keyframe = state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .last_resolution
+            .is_none();
+        if needs_opening_keyframe {
+            self.request_keyframe_throttled().await;
+        }
         loop {
             if let Some(frame) = state
                 .lock()
@@ -505,6 +549,31 @@ impl RemoteTrack {
 }
 
 impl VideoDecode {
+    fn codec(&self) -> VideoCodec {
+        match &self.samples {
+            VideoSamples::Vp8(_) => VideoCodec::Vp8,
+            VideoSamples::Vp9(_) => VideoCodec::Vp9,
+            VideoSamples::H264(_) => VideoCodec::H264,
+        }
+    }
+
+    /// Drop reassembly and decoded-frame state after switching to
+    /// [`RemoteTrack::drain_rtp`]. No-op when decode was never used.
+    fn abandon_decoded_state(&mut self) {
+        if self.ready.is_empty() && self.last_resolution.is_none() {
+            return;
+        }
+        let codec = self.codec();
+        self.samples = VideoSamples::new(codec);
+        self.ready.clear();
+        self.last_resolution = None;
+        if codec == VideoCodec::H264 {
+            self.restart_h264_after_discontinuity();
+        } else {
+            self.awaiting_h264_idr = false;
+        }
+    }
+
     /// Feed one RTP packet into the reassembler and return every sample it
     /// completes. This path performs no native decode work.
     fn push_packet(&mut self, packet: RtpPacket) -> Vec<webrtc::media::Sample> {
@@ -596,6 +665,10 @@ impl Drop for RemoteTrack {
             f();
         }
     }
+}
+
+fn drain_rtp_batch_complete(marker: bool, packets_read: usize) -> bool {
+    marker || packets_read >= DRAIN_MAX_PACKETS
 }
 
 fn push_ready_video_frame(ready: &mut VecDeque<VideoFrame>, frame: VideoFrame) {
@@ -743,5 +816,56 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![5, 6, 7]
         );
+    }
+
+    #[test]
+    fn drain_stops_on_marker_or_packet_cap() {
+        assert!(drain_rtp_batch_complete(true, 1));
+        assert!(!drain_rtp_batch_complete(false, 1));
+        assert!(drain_rtp_batch_complete(false, DRAIN_MAX_PACKETS));
+    }
+
+    #[test]
+    fn abandon_decoded_state_is_a_no_op_before_any_decode() {
+        let mut state = VideoDecode {
+            samples: VideoSamples::new(VideoCodec::Vp8),
+            decoder: VideoDecoder::Vpx(
+                super::super::vpx_decode::VpxDecoder::new(super::super::vpx::VpxCodec::Vp8)
+                    .expect("vp8 decoder"),
+            ),
+            ready: VecDeque::new(),
+            last_resolution: None,
+            awaiting_h264_idr: false,
+        };
+        state.abandon_decoded_state();
+        assert!(state.ready.is_empty());
+        assert_eq!(state.last_resolution, None);
+    }
+
+    #[test]
+    fn abandon_decoded_state_clears_ready_frames_and_resolution() {
+        let mut state = VideoDecode {
+            samples: VideoSamples::new(VideoCodec::Vp8),
+            decoder: VideoDecoder::Vpx(
+                super::super::vpx_decode::VpxDecoder::new(super::super::vpx::VpxCodec::Vp8)
+                    .expect("vp8 decoder"),
+            ),
+            ready: VecDeque::new(),
+            last_resolution: Some((1280, 720)),
+            awaiting_h264_idr: false,
+        };
+        push_ready_video_frame(
+            &mut state.ready,
+            VideoFrame {
+                width: 2,
+                height: 2,
+                data: vec![1],
+                rtp_timestamp: 1,
+            },
+        );
+        state.abandon_decoded_state();
+        assert!(state.ready.is_empty());
+        assert_eq!(state.last_resolution, None);
+        assert!(!state.awaiting_h264_idr);
     }
 }
