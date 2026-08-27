@@ -12,6 +12,7 @@ use pyo3::types::{PyAny, PyByteArray, PyBytes};
 #[pyclass(name = "PcmFrame", frozen)]
 pub struct PyPcmFrame {
     samples: Vec<i16>,
+    sample_bytes: Vec<u8>,
     #[pyo3(get)]
     sample_rate: u32,
     #[pyo3(get)]
@@ -20,8 +21,10 @@ pub struct PyPcmFrame {
 
 impl PyPcmFrame {
     pub(crate) fn from_sdk(frame: getstream::rtc::PcmFrame) -> Self {
+        let sample_bytes = i16_to_le_bytes(&frame.samples);
         Self {
             samples: frame.samples,
+            sample_bytes,
             sample_rate: frame.sample_rate,
             channels: frame.channels,
         }
@@ -33,28 +36,34 @@ impl PyPcmFrame {
     #[new]
     #[pyo3(signature = (samples, sample_rate, channels=1))]
     fn new(samples: Bound<'_, PyAny>, sample_rate: u32, channels: u16) -> PyResult<Self> {
+        let samples = read_i16_samples(&samples)?;
+        let sample_bytes = i16_to_le_bytes(&samples);
         Ok(Self {
-            samples: read_i16_samples(&samples)?,
+            samples,
             sample_rate,
             channels: channels.max(1),
+            sample_bytes,
         })
     }
 
     /// Packed little-endian int16 sample bytes. `bytes` implements the buffer
     /// protocol, so callers can pass this to NumPy as `dtype='<i2'`.
     #[getter]
-    fn samples<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
-        PyBytes::new(py, &i16_to_le_bytes(&self.samples))
+    fn samples<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
+        copy_to_pybytes(py, &self.sample_bytes)
     }
 
     #[getter]
     fn duration_ms(&self) -> f64 {
-        getstream::rtc::PcmFrame::new(self.samples.clone(), self.sample_rate, self.channels)
-            .duration_ms()
+        if self.sample_rate == 0 || self.channels == 0 {
+            return 0.0;
+        }
+        let frames = self.samples.len() as f64 / f64::from(self.channels);
+        frames / f64::from(self.sample_rate) * 1000.0
     }
 
-    fn __bytes__<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
-        PyBytes::new(py, &i16_to_le_bytes(&self.samples))
+    fn __bytes__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
+        copy_to_pybytes(py, &self.sample_bytes)
     }
 
     fn __len__(&self) -> usize {
@@ -98,12 +107,12 @@ impl PyVideoFrame {
 impl PyVideoFrame {
     /// Packed I420 bytes (Y then U then V).
     #[getter]
-    fn data<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
-        PyBytes::new(py, &self.data)
+    fn data<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
+        copy_to_pybytes(py, &self.data)
     }
 
-    fn __bytes__<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
-        PyBytes::new(py, &self.data)
+    fn __bytes__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
+        copy_to_pybytes(py, &self.data)
     }
 
     fn __len__(&self) -> usize {
@@ -128,6 +137,13 @@ fn i16_to_le_bytes(samples: &[i16]) -> Vec<u8> {
     out
 }
 
+fn copy_to_pybytes<'py>(py: Python<'py>, src: &[u8]) -> PyResult<Bound<'py, PyBytes>> {
+    PyBytes::new_with(py, src.len(), |dest| {
+        py.allow_threads(|| dest.copy_from_slice(src));
+        Ok(())
+    })
+}
+
 pub(crate) fn read_i16_samples(obj: &Bound<'_, PyAny>) -> PyResult<Vec<i16>> {
     let bytes = read_bytes(obj)?;
     if !bytes.len().is_multiple_of(2) {
@@ -135,16 +151,19 @@ pub(crate) fn read_i16_samples(obj: &Bound<'_, PyAny>) -> PyResult<Vec<i16>> {
             "pcm sample buffer length must be a multiple of 2",
         ));
     }
-    let mut samples = Vec::with_capacity(bytes.len() / 2);
-    for chunk in bytes.chunks_exact(2) {
-        samples.push(i16::from_le_bytes([chunk[0], chunk[1]]));
-    }
-    Ok(samples)
+    Ok(obj.py().allow_threads(|| {
+        let mut samples = Vec::with_capacity(bytes.len() / 2);
+        for chunk in bytes.chunks_exact(2) {
+            samples.push(i16::from_le_bytes([chunk[0], chunk[1]]));
+        }
+        samples
+    }))
 }
 
 pub(crate) fn read_bytes(obj: &Bound<'_, PyAny>) -> PyResult<Vec<u8>> {
     if let Ok(bytes) = obj.downcast::<PyBytes>() {
-        return Ok(bytes.as_bytes().to_vec());
+        let slice = bytes.as_bytes();
+        return Ok(obj.py().allow_threads(|| slice.to_vec()));
     }
     if let Ok(array) = obj.downcast::<PyByteArray>() {
         return Ok(array.to_vec());
@@ -155,7 +174,8 @@ pub(crate) fn read_bytes(obj: &Bound<'_, PyAny>) -> PyResult<Vec<u8>> {
         .getattr("bytes")?
         .call1((obj,))?;
     let bytes = converted.downcast::<PyBytes>()?;
-    Ok(bytes.as_bytes().to_vec())
+    let slice = bytes.as_bytes();
+    Ok(obj.py().allow_threads(|| slice.to_vec()))
 }
 
 pub(crate) fn duration_from_ms(duration_ms: f64) -> PyResult<Duration> {

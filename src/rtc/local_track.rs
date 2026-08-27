@@ -933,6 +933,38 @@ impl LocalVideoTrack {
         height: u32,
         duration: Duration,
     ) -> Result<()> {
+        let Some(expected) = self.i420_write_expected(width, height, duration, data.len())? else {
+            return Ok(());
+        };
+        self.encode_i420_frame(data[..expected].to_vec(), width, height, duration)
+            .await
+    }
+
+    /// Encode a packed I420 frame from an owned buffer.
+    ///
+    /// Bindings that already hold a `Vec<u8>` use this to avoid a second copy of
+    /// the frame before `spawn_blocking`.
+    pub async fn write_i420_vec(
+        &self,
+        mut data: Vec<u8>,
+        width: u32,
+        height: u32,
+        duration: Duration,
+    ) -> Result<()> {
+        let Some(expected) = self.i420_write_expected(width, height, duration, data.len())? else {
+            return Ok(());
+        };
+        data.truncate(expected);
+        self.encode_i420_frame(data, width, height, duration).await
+    }
+
+    fn i420_write_expected(
+        &self,
+        width: u32,
+        height: u32,
+        duration: Duration,
+        data_len: usize,
+    ) -> Result<Option<usize>> {
         if self.inner.encodings[0].core.stopped.load(Ordering::SeqCst) {
             return Err(RtcError::IllegalState(
                 "write to a stopped track".to_owned(),
@@ -947,7 +979,7 @@ impl LocalVideoTrack {
             ))
             .all(|encoding| encoding.core.is_output_paused())
         {
-            return Ok(());
+            return Ok(None);
         }
         if width == 0 || height == 0 || !width.is_multiple_of(2) || !height.is_multiple_of(2) {
             return Err(RtcError::Media(format!(
@@ -998,13 +1030,21 @@ impl LocalVideoTrack {
                  (need {expected})"
             )));
         }
-        if data.len() < expected {
+        if data_len < expected {
             return Err(RtcError::Media(format!(
-                "i420 buffer too small: {} bytes for {width}x{height} (need {expected})",
-                data.len()
+                "i420 buffer too small: {data_len} bytes for {width}x{height} (need {expected})"
             )));
         }
+        Ok(Some(expected))
+    }
 
+    async fn encode_i420_frame(
+        &self,
+        frame: Vec<u8>,
+        width: u32,
+        height: u32,
+        duration: Duration,
+    ) -> Result<()> {
         let dur_ms = i64::try_from(duration.as_millis().max(1)).unwrap_or(i64::MAX);
         let samples =
             (duration.as_secs_f64() * f64::from(self.inner.encodings[0].core.clock_rate)) as u32;
@@ -1017,7 +1057,6 @@ impl LocalVideoTrack {
             .await
             .map_err(|_| RtcError::IllegalState("video encoder stopped".to_owned()))?;
         let inner = self.inner.clone();
-        let frame = data[..expected].to_vec();
         let encoded_layers = tokio::task::spawn_blocking(move || {
             let _permit = permit;
             encode_i420_layers(&inner, &frame, width, height, dur_ms, samples)

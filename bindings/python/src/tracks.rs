@@ -115,7 +115,7 @@ impl PyLocalVideoTrack {
         let track = self.inner.clone();
         future_into_py(py, async move {
             track
-                .write_i420(&data, width, height, duration)
+                .write_i420_vec(data, width, height, duration)
                 .await
                 .map_err(rtc_err)?;
             Ok(())
