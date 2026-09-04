@@ -2,14 +2,6 @@
 
 ## New Features
 
-### Video REST: SIP telephony
-
-SIP inbound trunk CRUD (`create_sip_trunk`, `list_sip_trunks`,
-`update_sip_trunk`, `delete_sip_trunk`) and SIP inbound routing rule CRUD
-(`create_sip_inbound_routing_rule`, `list_sip_inbound_routing_rules`,
-`update_sip_inbound_routing_rule`, `delete_sip_inbound_routing_rule`) on
-`VideoClient`, with typed request/response models.
-
 ### Video REST: advanced call statistics and reporting
 
 Application-level stats on `VideoClient` (`get_active_calls_status`,
