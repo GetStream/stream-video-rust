@@ -8,10 +8,8 @@ use crate::error::Result;
 use crate::models::{
     CreateSipInboundRoutingRuleRequest, CreateSipInboundRoutingRuleResponse, CreateSipTrunkRequest,
     CreateSipTrunkResponse, DeleteSipInboundRoutingRuleResponse, DeleteSipTrunkResponse,
-    ListSipInboundRoutingRuleResponse, ListSipTrunksResponse, ResolveSipAuthRequest,
-    ResolveSipAuthResponse, ResolveSipInboundRequest, ResolveSipInboundResponse,
-    UpdateSipInboundRoutingRuleRequest, UpdateSipInboundRoutingRuleResponse, UpdateSipTrunkRequest,
-    UpdateSipTrunkResponse,
+    ListSipInboundRoutingRuleResponse, ListSipTrunksResponse, UpdateSipInboundRoutingRuleRequest,
+    UpdateSipInboundRoutingRuleResponse, UpdateSipTrunkRequest, UpdateSipTrunkResponse,
 };
 
 const TRUNKS: &str = "/api/v2/video/sip/inbound_trunks";
@@ -104,34 +102,6 @@ impl VideoClient {
         let path = Client::build_path(RULE_BY_ID, &[("id", id)]);
         self.client
             .request::<(), _>(Method::DELETE, &path, &[], None)
-            .await
-    }
-
-    // SIP auth / resolve
-
-    /// Resolve SIP authentication requirements for an inbound call
-    /// (`POST /api/v2/video/sip/auth`).
-    pub async fn resolve_sip_auth(
-        &self,
-        request: ResolveSipAuthRequest,
-    ) -> Result<ResolveSipAuthResponse> {
-        self.client
-            .request(Method::POST, "/api/v2/video/sip/auth", &[], Some(&request))
-            .await
-    }
-
-    /// Resolve SIP inbound routing (`POST /api/v2/video/sip/resolve`).
-    pub async fn resolve_sip_inbound(
-        &self,
-        request: ResolveSipInboundRequest,
-    ) -> Result<ResolveSipInboundResponse> {
-        self.client
-            .request(
-                Method::POST,
-                "/api/v2/video/sip/resolve",
-                &[],
-                Some(&request),
-            )
             .await
     }
 }

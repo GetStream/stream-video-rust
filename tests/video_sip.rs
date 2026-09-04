@@ -11,8 +11,8 @@ use std::time::Duration;
 use anyhow::{Context, Result, ensure};
 use getstream::Stream;
 use getstream::models::{
-    CreateSipInboundRoutingRuleRequest, CreateSipTrunkRequest, ResolveSipAuthRequest,
-    SipCallerConfigsRequest, SipDirectRoutingRuleCallConfigsRequest, UpdateSipTrunkRequest,
+    CreateSipInboundRoutingRuleRequest, CreateSipTrunkRequest, SipCallerConfigsRequest,
+    SipDirectRoutingRuleCallConfigsRequest, UpdateSipTrunkRequest,
 };
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(60);
@@ -94,37 +94,6 @@ async fn exercise_trunk(client: &Stream, trunk_id: &str, name: &str, number: &st
             .map(|t| t.name == updated_name)
             .unwrap_or(false),
         "update did not return the new trunk name"
-    );
-
-    // A created trunk with a password authenticates by digest: resolving its
-    // number returns the trunk id, while an unknown number finds no trunk.
-    let resolved = video
-        .resolve_sip_auth(ResolveSipAuthRequest {
-            sip_caller_number: unique_number(),
-            sip_trunk_number: number.to_owned(),
-            ..Default::default()
-        })
-        .await
-        .context("resolve_sip_auth for known trunk")?;
-    if resolved.auth_result == "password" {
-        ensure!(
-            resolved.trunk_id.as_deref() == Some(trunk_id),
-            "resolve_sip_auth matched a different trunk"
-        );
-    }
-
-    let unknown = video
-        .resolve_sip_auth(ResolveSipAuthRequest {
-            sip_caller_number: unique_number(),
-            sip_trunk_number: unique_number(),
-            ..Default::default()
-        })
-        .await
-        .context("resolve_sip_auth for unknown trunk")?;
-    ensure!(
-        unknown.auth_result == "no_trunk_found",
-        "unknown trunk number should not resolve to a trunk, got {:?}",
-        unknown.auth_result
     );
 
     video

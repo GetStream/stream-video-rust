@@ -5,11 +5,10 @@
 ### Video REST: SIP telephony
 
 SIP inbound trunk CRUD (`create_sip_trunk`, `list_sip_trunks`,
-`update_sip_trunk`, `delete_sip_trunk`), SIP inbound routing rule CRUD
+`update_sip_trunk`, `delete_sip_trunk`) and SIP inbound routing rule CRUD
 (`create_sip_inbound_routing_rule`, `list_sip_inbound_routing_rules`,
-`update_sip_inbound_routing_rule`, `delete_sip_inbound_routing_rule`), and SIP
-resolution (`resolve_sip_auth`, `resolve_sip_inbound`) on `VideoClient`, with
-typed request/response models.
+`update_sip_inbound_routing_rule`, `delete_sip_inbound_routing_rule`) on
+`VideoClient`, with typed request/response models.
 
 ### Video REST: advanced call statistics and reporting
 

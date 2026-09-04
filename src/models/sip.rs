@@ -4,8 +4,6 @@
 //! can replace these transparently. Response types derive `Default` +
 //! `#[serde(default)]` so partial payloads deserialize cleanly.
 
-use std::collections::HashMap;
-
 use serde::{Deserialize, Serialize};
 
 use super::shared::{CustomData, Timestamp};
@@ -306,104 +304,6 @@ pub struct DeleteSipInboundRoutingRuleResponse {
 pub struct ListSipInboundRoutingRuleResponse {
     pub duration: String,
     pub sip_inbound_routing_rules: Vec<SipInboundRoutingRuleResponse>,
-}
-
-// SIP auth / resolve
-
-/// `resolve_sip_auth` request (`ResolveSipAuthRequest`).
-#[derive(Debug, Clone, Default, Serialize)]
-pub struct ResolveSipAuthRequest {
-    pub sip_caller_number: String,
-    pub sip_trunk_number: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub from_host: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub source_ip: Option<String>,
-}
-
-/// `resolve_sip_auth` response (`ResolveSipAuthResponse`).
-#[derive(Debug, Clone, Default, Deserialize)]
-#[serde(default)]
-pub struct ResolveSipAuthResponse {
-    /// Authentication result: `password`, `accept`, or `no_trunk_found`.
-    pub auth_result: String,
-    pub duration: String,
-    pub password: Option<String>,
-    pub trunk_id: Option<String>,
-    pub username: Option<String>,
-}
-
-/// SIP digest challenge authentication data (`SIPChallengeRequest`).
-#[derive(Debug, Clone, Default, Serialize)]
-pub struct SipChallengeRequest {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub algorithm: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub charset: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub cnonce: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub method: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub nc: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub nonce: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub opaque: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub realm: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub response: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub stale: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub uri: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub userhash: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub username: Option<String>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub domain: Vec<String>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub qop: Vec<String>,
-}
-
-/// `resolve_sip_inbound` request (`ResolveSipInboundRequest`).
-#[derive(Debug, Clone, Default, Serialize)]
-pub struct ResolveSipInboundRequest {
-    pub sip_caller_number: String,
-    pub sip_trunk_number: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub routing_number: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub trunk_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub challenge: Option<SipChallengeRequest>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub sip_headers: Option<HashMap<String, String>>,
-}
-
-/// Credentials for SIP inbound call authentication (`SipInboundCredentials`).
-#[derive(Debug, Clone, Default, Deserialize)]
-#[serde(default)]
-pub struct SipInboundCredentials {
-    pub api_key: String,
-    pub call_id: String,
-    pub call_type: String,
-    pub token: String,
-    pub user_id: String,
-    pub call_custom_data: CustomData,
-    pub user_custom_data: CustomData,
-}
-
-/// `resolve_sip_inbound` response (`ResolveSipInboundResponse`).
-#[derive(Debug, Clone, Default, Deserialize)]
-#[serde(default)]
-pub struct ResolveSipInboundResponse {
-    pub duration: String,
-    pub credentials: SipInboundCredentials,
-    pub sip_routing_rule: Option<SipInboundRoutingRuleResponse>,
-    pub sip_trunk: Option<SipTrunkResponse>,
 }
 
 #[cfg(test)]
