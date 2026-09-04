@@ -663,6 +663,173 @@ impl Call {
             .await
     }
 
+    /// Retrieve per-participant session metrics for one participant session.
+    ///
+    /// `GET .../call/{type}/{id}/session/{session}/participant/{user}/{user_session}/details/track`
+    pub async fn get_call_participant_session_metrics(
+        &self,
+        session: &str,
+        user: &str,
+        user_session: &str,
+        request: GetCallParticipantSessionMetricsRequest,
+    ) -> Result<GetCallParticipantSessionMetricsResponse> {
+        let mut query = Vec::new();
+        if let Some(value) = request.since.as_ref() {
+            query.push(("since".to_owned(), timestamp_query(value)));
+        }
+        if let Some(value) = request.until.as_ref() {
+            query.push(("until".to_owned(), timestamp_query(value)));
+        }
+        let path = self.path(
+            "/session/{session}/participant/{user}/{user_session}/details/track",
+            &[
+                ("session", session),
+                ("user", user),
+                ("user_session", user_session),
+            ],
+        );
+        self.client
+            .request::<(), _>(Method::GET, &path, &query, None)
+            .await
+    }
+
+    /// List participant sessions for one call session.
+    ///
+    /// `GET .../call/{type}/{id}/session/{session}/participant_sessions`
+    pub async fn query_call_participant_sessions(
+        &self,
+        session: &str,
+        request: QueryCallParticipantSessionsRequest,
+    ) -> Result<QueryCallParticipantSessionsResponse> {
+        let mut query = Vec::new();
+        if let Some(limit) = request.limit {
+            query.push(("limit".to_owned(), limit.to_string()));
+        }
+        if let Some(prev) = request.prev {
+            query.push(("prev".to_owned(), prev));
+        }
+        if let Some(next) = request.next {
+            query.push(("next".to_owned(), next));
+        }
+        if let Some(encoded) = filter_conditions_query(&request.filter_conditions)? {
+            query.push(("filter_conditions".to_owned(), encoded));
+        }
+        let path = self.path(
+            "/session/{session}/participant_sessions",
+            &[("session", session)],
+        );
+        self.client
+            .request::<(), _>(Method::GET, &path, &query, None)
+            .await
+    }
+
+    /// Retrieve detailed participant stats time series for one participant session.
+    ///
+    /// `GET .../call_stats/{type}/{id}/{session}/participant/{user}/{user_session}/details`
+    pub async fn get_call_session_participant_stats_details(
+        &self,
+        session: &str,
+        user: &str,
+        user_session: &str,
+        request: GetCallSessionParticipantStatsDetailsRequest,
+    ) -> Result<GetCallSessionParticipantStatsDetailsResponse> {
+        let mut query = Vec::new();
+        if let Some(since) = request.since {
+            query.push(("since".to_owned(), since));
+        }
+        if let Some(until) = request.until {
+            query.push(("until".to_owned(), until));
+        }
+        if let Some(max_points) = request.max_points {
+            query.push(("max_points".to_owned(), max_points.to_string()));
+        }
+        let path = Client::build_path(
+            "/api/v2/video/call_stats/{type}/{id}/{session}/participant/{user}/{user_session}/details",
+            &[
+                ("type", &self.call_type),
+                ("id", &self.call_id),
+                ("session", session),
+                ("user", user),
+                ("user_session", user_session),
+            ],
+        );
+        self.client
+            .request::<(), _>(Method::GET, &path, &query, None)
+            .await
+    }
+
+    /// Query participant stats for one call session.
+    ///
+    /// `GET .../call_stats/{type}/{id}/{session}/participants`
+    pub async fn query_call_session_participant_stats(
+        &self,
+        session: &str,
+        request: QueryCallSessionParticipantStatsRequest,
+    ) -> Result<QueryCallSessionParticipantStatsResponse> {
+        let mut query = Vec::new();
+        if let Some(limit) = request.limit {
+            query.push(("limit".to_owned(), limit.to_string()));
+        }
+        if let Some(prev) = request.prev {
+            query.push(("prev".to_owned(), prev));
+        }
+        if let Some(next) = request.next {
+            query.push(("next".to_owned(), next));
+        }
+        if let Some(encoded) = sort_query(&request.sort)? {
+            query.push(("sort".to_owned(), encoded));
+        }
+        if let Some(encoded) = filter_conditions_query(&request.filter_conditions)? {
+            query.push(("filter_conditions".to_owned(), encoded));
+        }
+        let path = Client::build_path(
+            "/api/v2/video/call_stats/{type}/{id}/{session}/participants",
+            &[
+                ("type", &self.call_type),
+                ("id", &self.call_id),
+                ("session", session),
+            ],
+        );
+        self.client
+            .request::<(), _>(Method::GET, &path, &query, None)
+            .await
+    }
+
+    /// Retrieve the participant stats timeline for one participant session.
+    ///
+    /// `GET .../call_stats/{type}/{id}/{session}/participants/{user}/{user_session}/timeline`
+    pub async fn get_call_session_participant_stats_timeline(
+        &self,
+        session: &str,
+        user: &str,
+        user_session: &str,
+        request: GetCallSessionParticipantStatsTimelineRequest,
+    ) -> Result<QueryCallSessionParticipantStatsTimelineResponse> {
+        let mut query = Vec::new();
+        if let Some(start_time) = request.start_time {
+            query.push(("start_time".to_owned(), start_time));
+        }
+        if let Some(end_time) = request.end_time {
+            query.push(("end_time".to_owned(), end_time));
+        }
+        if !request.severity.is_empty() {
+            query.push(("severity".to_owned(), request.severity.join(",")));
+        }
+        let path = Client::build_path(
+            "/api/v2/video/call_stats/{type}/{id}/{session}/participants/{user}/{user_session}/timeline",
+            &[
+                ("type", &self.call_type),
+                ("id", &self.call_id),
+                ("session", session),
+                ("user", user),
+                ("user_session", user_session),
+            ],
+        );
+        self.client
+            .request::<(), _>(Method::GET, &path, &query, None)
+            .await
+    }
+
     // participant path (SFU WebRTC)
 
     /// Set the maximum reconnect duration. Zero keeps reconnecting indefinitely.
@@ -878,4 +1045,72 @@ fn timestamp_query(value: &Timestamp) -> String {
         .as_str()
         .map(str::to_owned)
         .unwrap_or_else(|| value.to_string())
+}
+
+/// JSON-encode a `filter_conditions` map for a query parameter, or `None` when
+/// empty. Matches the getstream-go query encoding for map-valued params.
+fn filter_conditions_query(filter: &CustomData) -> Result<Option<String>> {
+    if filter.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(serde_json::to_string(filter)?))
+}
+
+/// Encode a `sort` list for a query parameter, or `None` when empty. Matches the
+/// getstream-go query encoding: each entry is JSON-encoded and comma-joined.
+fn sort_query(sort: &[SortParamRequest]) -> Result<Option<String>> {
+    if sort.is_empty() {
+        return Ok(None);
+    }
+    let parts = sort
+        .iter()
+        .map(serde_json::to_string)
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(Some(parts.join(",")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_stats_query_params_are_omitted() {
+        assert!(
+            filter_conditions_query(&CustomData::new())
+                .expect("ok")
+                .is_none()
+        );
+        assert!(sort_query(&[]).expect("ok").is_none());
+    }
+
+    #[test]
+    fn sort_query_matches_go_comma_joined_json_encoding() {
+        let sort = vec![
+            SortParamRequest {
+                field: Some("quality_score".to_owned()),
+                direction: Some(-1),
+            },
+            SortParamRequest {
+                field: Some("user_id".to_owned()),
+                direction: Some(1),
+            },
+        ];
+        assert_eq!(
+            sort_query(&sort).expect("ok"),
+            Some(
+                "{\"direction\":-1,\"field\":\"quality_score\"},{\"direction\":1,\"field\":\"user_id\"}"
+                    .to_owned()
+            )
+        );
+    }
+
+    #[test]
+    fn filter_conditions_query_json_encodes_map() {
+        let mut filter = CustomData::new();
+        filter.insert("call_cid".to_owned(), serde_json::json!("default:c1"));
+        assert_eq!(
+            filter_conditions_query(&filter).expect("ok"),
+            Some("{\"call_cid\":\"default:c1\"}".to_owned())
+        );
+    }
 }

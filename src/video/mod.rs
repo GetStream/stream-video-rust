@@ -2,6 +2,7 @@
 
 mod call;
 mod sip;
+mod stats;
 
 pub use call::Call;
 
