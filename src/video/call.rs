@@ -10,6 +10,7 @@ use crate::error::{Error, Result};
 use crate::models::*;
 
 const CALL_BASE: &str = "/api/v2/video/call/{type}/{id}";
+const CALL_STATS_BASE: &str = "/api/v2/video/call_stats/{type}/{id}";
 const INTERNAL_RTC_TOKEN_LIFETIME: Duration = Duration::from_secs(10 * 60);
 
 /// A handle to a specific call (`<type>:<id>`). Cheap to construct; no request is
@@ -52,7 +53,16 @@ impl Call {
     }
 
     fn path(&self, suffix: &str, extra: &[(&str, &str)]) -> String {
-        let template = format!("{CALL_BASE}{suffix}");
+        self.path_from(CALL_BASE, suffix, extra)
+    }
+
+    /// Same substitution as [`Self::path`] against the `call_stats` base.
+    fn stats_path(&self, suffix: &str, extra: &[(&str, &str)]) -> String {
+        self.path_from(CALL_STATS_BASE, suffix, extra)
+    }
+
+    fn path_from(&self, base: &str, suffix: &str, extra: &[(&str, &str)]) -> String {
+        let template = format!("{base}{suffix}");
         let mut params: Vec<(&str, &str)> = vec![("type", &self.call_type), ("id", &self.call_id)];
         params.extend_from_slice(extra);
         Client::build_path(&template, &params)
@@ -650,14 +660,7 @@ impl Call {
         if let Some(value) = request.exclude_sfus {
             query.push(("exclude_sfus".to_owned(), value.to_string()));
         }
-        let path = Client::build_path(
-            "/api/v2/video/call_stats/{type}/{id}/{session_id}/map",
-            &[
-                ("type", &self.call_type),
-                ("id", &self.call_id),
-                ("session_id", session_id),
-            ],
-        );
+        let path = self.stats_path("/{session_id}/map", &[("session_id", session_id)]);
         self.client
             .request::<(), _>(Method::GET, &path, &query, None)
             .await
@@ -674,12 +677,16 @@ impl Call {
         request: GetCallParticipantSessionMetricsRequest,
     ) -> Result<GetCallParticipantSessionMetricsResponse> {
         let mut query = Vec::new();
-        if let Some(value) = request.since.as_ref() {
-            query.push(("since".to_owned(), timestamp_query(value)));
-        }
-        if let Some(value) = request.until.as_ref() {
-            query.push(("until".to_owned(), timestamp_query(value)));
-        }
+        push_opt(
+            &mut query,
+            "since",
+            request.since.as_ref().map(timestamp_query),
+        );
+        push_opt(
+            &mut query,
+            "until",
+            request.until.as_ref().map(timestamp_query),
+        );
         let path = self.path(
             "/session/{session}/participant/{user}/{user_session}/details/track",
             &[
@@ -702,15 +709,9 @@ impl Call {
         request: QueryCallParticipantSessionsRequest,
     ) -> Result<QueryCallParticipantSessionsResponse> {
         let mut query = Vec::new();
-        if let Some(limit) = request.limit {
-            query.push(("limit".to_owned(), limit.to_string()));
-        }
-        if let Some(prev) = request.prev {
-            query.push(("prev".to_owned(), prev));
-        }
-        if let Some(next) = request.next {
-            query.push(("next".to_owned(), next));
-        }
+        push_opt(&mut query, "limit", request.limit);
+        push_opt(&mut query, "prev", request.prev);
+        push_opt(&mut query, "next", request.next);
         if let Some(encoded) = filter_conditions_query(&request.filter_conditions)? {
             query.push(("filter_conditions".to_owned(), encoded));
         }
@@ -734,20 +735,20 @@ impl Call {
         request: GetCallSessionParticipantStatsDetailsRequest,
     ) -> Result<GetCallSessionParticipantStatsDetailsResponse> {
         let mut query = Vec::new();
-        if let Some(since) = request.since {
-            query.push(("since".to_owned(), since));
-        }
-        if let Some(until) = request.until {
-            query.push(("until".to_owned(), until));
-        }
-        if let Some(max_points) = request.max_points {
-            query.push(("max_points".to_owned(), max_points.to_string()));
-        }
-        let path = Client::build_path(
-            "/api/v2/video/call_stats/{type}/{id}/{session}/participant/{user}/{user_session}/details",
+        push_opt(
+            &mut query,
+            "since",
+            request.since.as_ref().map(timestamp_query),
+        );
+        push_opt(
+            &mut query,
+            "until",
+            request.until.as_ref().map(timestamp_query),
+        );
+        push_opt(&mut query, "max_points", request.max_points);
+        let path = self.stats_path(
+            "/{session}/participant/{user}/{user_session}/details",
             &[
-                ("type", &self.call_type),
-                ("id", &self.call_id),
                 ("session", session),
                 ("user", user),
                 ("user_session", user_session),
@@ -767,29 +768,16 @@ impl Call {
         request: QueryCallSessionParticipantStatsRequest,
     ) -> Result<QueryCallSessionParticipantStatsResponse> {
         let mut query = Vec::new();
-        if let Some(limit) = request.limit {
-            query.push(("limit".to_owned(), limit.to_string()));
-        }
-        if let Some(prev) = request.prev {
-            query.push(("prev".to_owned(), prev));
-        }
-        if let Some(next) = request.next {
-            query.push(("next".to_owned(), next));
-        }
+        push_opt(&mut query, "limit", request.limit);
+        push_opt(&mut query, "prev", request.prev);
+        push_opt(&mut query, "next", request.next);
         if let Some(encoded) = sort_query(&request.sort)? {
             query.push(("sort".to_owned(), encoded));
         }
         if let Some(encoded) = filter_conditions_query(&request.filter_conditions)? {
             query.push(("filter_conditions".to_owned(), encoded));
         }
-        let path = Client::build_path(
-            "/api/v2/video/call_stats/{type}/{id}/{session}/participants",
-            &[
-                ("type", &self.call_type),
-                ("id", &self.call_id),
-                ("session", session),
-            ],
-        );
+        let path = self.stats_path("/{session}/participants", &[("session", session)]);
         self.client
             .request::<(), _>(Method::GET, &path, &query, None)
             .await
@@ -806,20 +794,22 @@ impl Call {
         request: GetCallSessionParticipantStatsTimelineRequest,
     ) -> Result<QueryCallSessionParticipantStatsTimelineResponse> {
         let mut query = Vec::new();
-        if let Some(start_time) = request.start_time {
-            query.push(("start_time".to_owned(), start_time));
-        }
-        if let Some(end_time) = request.end_time {
-            query.push(("end_time".to_owned(), end_time));
-        }
+        push_opt(
+            &mut query,
+            "start_time",
+            request.start_time.as_ref().map(timestamp_query),
+        );
+        push_opt(
+            &mut query,
+            "end_time",
+            request.end_time.as_ref().map(timestamp_query),
+        );
         if !request.severity.is_empty() {
             query.push(("severity".to_owned(), request.severity.join(",")));
         }
-        let path = Client::build_path(
-            "/api/v2/video/call_stats/{type}/{id}/{session}/participants/{user}/{user_session}/timeline",
+        let path = self.stats_path(
+            "/{session}/participants/{user}/{user_session}/timeline",
             &[
-                ("type", &self.call_type),
-                ("id", &self.call_id),
                 ("session", session),
                 ("user", user),
                 ("user_session", user_session),
@@ -1047,6 +1037,24 @@ fn timestamp_query(value: &Timestamp) -> String {
         .unwrap_or_else(|| value.to_string())
 }
 
+/// Push `name=value` when the option is set, stringifying the value.
+fn push_opt<T: ToString>(query: &mut Vec<(String, String)>, name: &str, value: Option<T>) {
+    if let Some(value) = value {
+        query.push((name.to_owned(), value.to_string()));
+    }
+}
+
+/// JSON-encode a `sort` list for a query parameter, or `None` when empty.
+///
+/// The coordinator parses this parameter as a JSON array; comma-joining the
+/// encoded entries instead yields `is not a valid JSON for field 'sort'`.
+fn sort_query(sort: &[SortParamRequest]) -> Result<Option<String>> {
+    if sort.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(serde_json::to_string(sort)?))
+}
+
 /// JSON-encode a `filter_conditions` map for a query parameter, or `None` when
 /// empty. Matches the getstream-go query encoding for map-valued params.
 fn filter_conditions_query(filter: &CustomData) -> Result<Option<String>> {
@@ -1054,19 +1062,6 @@ fn filter_conditions_query(filter: &CustomData) -> Result<Option<String>> {
         return Ok(None);
     }
     Ok(Some(serde_json::to_string(filter)?))
-}
-
-/// Encode a `sort` list for a query parameter, or `None` when empty. Matches the
-/// getstream-go query encoding: each entry is JSON-encoded and comma-joined.
-fn sort_query(sort: &[SortParamRequest]) -> Result<Option<String>> {
-    if sort.is_empty() {
-        return Ok(None);
-    }
-    let parts = sort
-        .iter()
-        .map(serde_json::to_string)
-        .collect::<std::result::Result<Vec<_>, _>>()?;
-    Ok(Some(parts.join(",")))
 }
 
 #[cfg(test)]
@@ -1080,11 +1075,12 @@ mod tests {
                 .expect("ok")
                 .is_none()
         );
-        assert!(sort_query(&[]).expect("ok").is_none());
     }
 
     #[test]
-    fn sort_query_matches_go_comma_joined_json_encoding() {
+    fn sort_query_encodes_a_json_array() {
+        assert!(sort_query(&[]).expect("ok").is_none());
+
         let sort = vec![
             SortParamRequest {
                 field: Some("quality_score".to_owned()),
@@ -1095,12 +1091,18 @@ mod tests {
                 direction: Some(1),
             },
         ];
+        let encoded = sort_query(&sort).expect("ok").expect("some");
+
+        // Must parse as a JSON array: the coordinator rejects comma-joined
+        // objects with "is not a valid JSON for field 'sort'".
+        let parsed: serde_json::Value =
+            serde_json::from_str(&encoded).expect("sort query must be valid JSON");
         assert_eq!(
-            sort_query(&sort).expect("ok"),
-            Some(
-                "{\"direction\":-1,\"field\":\"quality_score\"},{\"direction\":1,\"field\":\"user_id\"}"
-                    .to_owned()
-            )
+            parsed,
+            serde_json::json!([
+                {"direction": -1, "field": "quality_score"},
+                {"direction": 1, "field": "user_id"},
+            ])
         );
     }
 

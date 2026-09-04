@@ -96,8 +96,8 @@ pub struct QueryCallSessionStatsResponse {
 /// Query params for `get_call_session_participant_stats_details`.
 #[derive(Debug, Clone, Default)]
 pub struct GetCallSessionParticipantStatsDetailsRequest {
-    pub since: Option<String>,
-    pub until: Option<String>,
+    pub since: Option<Timestamp>,
+    pub until: Option<Timestamp>,
     pub max_points: Option<i32>,
 }
 
@@ -124,6 +124,13 @@ pub struct QueryCallSessionParticipantStatsRequest {
     pub limit: Option<i32>,
     pub prev: Option<String>,
     pub next: Option<String>,
+    /// Sort order for the returned participants.
+    ///
+    /// The coordinator currently answers any non-empty value on this endpoint
+    /// with `custom sorting is not supported`; it is accepted here so callers
+    /// are ready when sorting is enabled server-side. The `sort` on the
+    /// `query_call_session_stats` / `query_user_feedback` request bodies is
+    /// supported today.
     pub sort: Vec<SortParamRequest>,
     pub filter_conditions: CustomData,
 }
@@ -151,8 +158,8 @@ pub struct QueryCallSessionParticipantStatsResponse {
 /// Query params for `get_call_session_participant_stats_timeline`.
 #[derive(Debug, Clone, Default)]
 pub struct GetCallSessionParticipantStatsTimelineRequest {
-    pub start_time: Option<String>,
-    pub end_time: Option<String>,
+    pub start_time: Option<Timestamp>,
+    pub end_time: Option<Timestamp>,
     pub severity: Vec<String>,
 }
 
@@ -211,6 +218,8 @@ pub struct QueryCallParticipantSessionsRequest {
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
 pub struct QueryCallParticipantSessionsResponse {
+    /// Session length in seconds. Unlike the `duration` string other endpoints
+    /// return (`"23.27ms"`), this endpoint returns an integer.
     pub duration: i64,
     pub call_id: String,
     pub call_session_id: String,
@@ -241,7 +250,7 @@ pub struct GetDailyDigestResponse {
     pub date: String,
     /// Readiness status: `ready`, `pending`, `failed`, `future_date`, `expired`.
     pub status: String,
-    pub generated_at: Option<String>,
+    pub generated_at: Option<Timestamp>,
     pub retry_after: Option<i32>,
     pub revision: Option<i32>,
     pub schema_version: Option<String>,
