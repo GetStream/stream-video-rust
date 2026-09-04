@@ -65,7 +65,9 @@ impl PcmFrame {
     /// one byte.
     pub fn from_bytes(bytes: &[u8], sample_rate: u32, channels: u16) -> Self {
         let samples = bytes
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|b| i16::from_le_bytes([b[0], b[1]]))
             .collect();
         Self::new(samples, sample_rate, channels)
