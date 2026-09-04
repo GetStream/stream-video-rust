@@ -1,3 +1,26 @@
+# Unreleased
+
+## New Features
+
+### Video REST: SIP telephony
+
+SIP inbound trunk CRUD (`create_sip_trunk`, `list_sip_trunks`,
+`update_sip_trunk`, `delete_sip_trunk`), SIP inbound routing rule CRUD
+(`create_sip_inbound_routing_rule`, `list_sip_inbound_routing_rules`,
+`update_sip_inbound_routing_rule`, `delete_sip_inbound_routing_rule`), and SIP
+resolution (`resolve_sip_auth`, `resolve_sip_inbound`) on `VideoClient`, with
+typed request/response models.
+
+### Video REST: advanced call statistics and reporting
+
+Application-level stats on `VideoClient` (`get_active_calls_status`,
+`query_aggregate_call_stats`, `query_call_session_stats`, `get_daily_digest`,
+`query_user_feedback`, `report_client_call_event`) and call-session-scoped stats
+on `Call` (`get_call_participant_session_metrics`,
+`query_call_participant_sessions`, `get_call_session_participant_stats_details`,
+`query_call_session_participant_stats`,
+`get_call_session_participant_stats_timeline`).
+
 # v0.1.0-preview.2
 
 docs.rs builds on current nightly. `doc_auto_cfg` was removed in 1.92 and

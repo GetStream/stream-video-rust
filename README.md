@@ -26,6 +26,11 @@ remote audio and video, transform it, and publish media back into the call.
 - Create, query, update, end, and delete video calls.
 - Manage call members, permissions, recording, transcription, captions,
   livestreaming, custom events, and reactions.
+- Configure SIP telephony: inbound trunks, inbound routing rules, and SIP
+  auth/inbound resolution.
+- Query advanced call statistics and reporting: active-calls status, aggregate
+  and per-session stats, participant stats and metrics, daily digest, user
+  feedback, and client call-event reporting.
 - Join a call as a server-side SFU participant with retry, reconnect, and
   migration handling.
 - Subscribe globally or by participant session to remote audio, video, and
