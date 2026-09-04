@@ -7,8 +7,10 @@
 
 mod call;
 mod shared;
+mod sip;
 mod user;
 
 pub use call::*;
 pub use shared::*;
+pub use sip::*;
 pub use user::*;
