@@ -10,6 +10,7 @@ use crate::error::{Error, Result};
 use crate::models::*;
 
 const CALL_BASE: &str = "/api/v2/video/call/{type}/{id}";
+const CALL_STATS_BASE: &str = "/api/v2/video/call_stats/{type}/{id}";
 const INTERNAL_RTC_TOKEN_LIFETIME: Duration = Duration::from_secs(10 * 60);
 
 /// A handle to a specific call (`<type>:<id>`). Cheap to construct; no request is
@@ -52,7 +53,16 @@ impl Call {
     }
 
     fn path(&self, suffix: &str, extra: &[(&str, &str)]) -> String {
-        let template = format!("{CALL_BASE}{suffix}");
+        self.path_from(CALL_BASE, suffix, extra)
+    }
+
+    /// Same substitution as [`Self::path`] against the `call_stats` base.
+    fn stats_path(&self, suffix: &str, extra: &[(&str, &str)]) -> String {
+        self.path_from(CALL_STATS_BASE, suffix, extra)
+    }
+
+    fn path_from(&self, base: &str, suffix: &str, extra: &[(&str, &str)]) -> String {
+        let template = format!("{base}{suffix}");
         let mut params: Vec<(&str, &str)> = vec![("type", &self.call_type), ("id", &self.call_id)];
         params.extend_from_slice(extra);
         Client::build_path(&template, &params)
@@ -650,12 +660,159 @@ impl Call {
         if let Some(value) = request.exclude_sfus {
             query.push(("exclude_sfus".to_owned(), value.to_string()));
         }
-        let path = Client::build_path(
-            "/api/v2/video/call_stats/{type}/{id}/{session_id}/map",
+        let path = self.stats_path("/{session_id}/map", &[("session_id", session_id)]);
+        self.client
+            .request::<(), _>(Method::GET, &path, &query, None)
+            .await
+    }
+
+    /// Retrieve per-participant session metrics for one participant session.
+    ///
+    /// `GET .../call/{type}/{id}/session/{session}/participant/{user}/{user_session}/details/track`
+    pub async fn get_call_participant_session_metrics(
+        &self,
+        session: &str,
+        user: &str,
+        user_session: &str,
+        request: GetCallParticipantSessionMetricsRequest,
+    ) -> Result<GetCallParticipantSessionMetricsResponse> {
+        let mut query = Vec::new();
+        push_opt(
+            &mut query,
+            "since",
+            request.since.as_ref().map(timestamp_query),
+        );
+        push_opt(
+            &mut query,
+            "until",
+            request.until.as_ref().map(timestamp_query),
+        );
+        let path = self.path(
+            "/session/{session}/participant/{user}/{user_session}/details/track",
             &[
-                ("type", &self.call_type),
-                ("id", &self.call_id),
-                ("session_id", session_id),
+                ("session", session),
+                ("user", user),
+                ("user_session", user_session),
+            ],
+        );
+        self.client
+            .request::<(), _>(Method::GET, &path, &query, None)
+            .await
+    }
+
+    /// List participant sessions for one call session.
+    ///
+    /// `GET .../call/{type}/{id}/session/{session}/participant_sessions`
+    pub async fn query_call_participant_sessions(
+        &self,
+        session: &str,
+        request: QueryCallParticipantSessionsRequest,
+    ) -> Result<QueryCallParticipantSessionsResponse> {
+        let mut query = Vec::new();
+        push_opt(&mut query, "limit", request.limit);
+        push_opt(&mut query, "prev", request.prev);
+        push_opt(&mut query, "next", request.next);
+        if let Some(encoded) = filter_conditions_query(&request.filter_conditions)? {
+            query.push(("filter_conditions".to_owned(), encoded));
+        }
+        let path = self.path(
+            "/session/{session}/participant_sessions",
+            &[("session", session)],
+        );
+        self.client
+            .request::<(), _>(Method::GET, &path, &query, None)
+            .await
+    }
+
+    /// Retrieve detailed participant stats time series for one participant session.
+    ///
+    /// `GET .../call_stats/{type}/{id}/{session}/participant/{user}/{user_session}/details`
+    pub async fn get_call_session_participant_stats_details(
+        &self,
+        session: &str,
+        user: &str,
+        user_session: &str,
+        request: GetCallSessionParticipantStatsDetailsRequest,
+    ) -> Result<GetCallSessionParticipantStatsDetailsResponse> {
+        let mut query = Vec::new();
+        push_opt(
+            &mut query,
+            "since",
+            request.since.as_ref().map(timestamp_query),
+        );
+        push_opt(
+            &mut query,
+            "until",
+            request.until.as_ref().map(timestamp_query),
+        );
+        push_opt(&mut query, "max_points", request.max_points);
+        let path = self.stats_path(
+            "/{session}/participant/{user}/{user_session}/details",
+            &[
+                ("session", session),
+                ("user", user),
+                ("user_session", user_session),
+            ],
+        );
+        self.client
+            .request::<(), _>(Method::GET, &path, &query, None)
+            .await
+    }
+
+    /// Query participant stats for one call session.
+    ///
+    /// `GET .../call_stats/{type}/{id}/{session}/participants`
+    pub async fn query_call_session_participant_stats(
+        &self,
+        session: &str,
+        request: QueryCallSessionParticipantStatsRequest,
+    ) -> Result<QueryCallSessionParticipantStatsResponse> {
+        let mut query = Vec::new();
+        push_opt(&mut query, "limit", request.limit);
+        push_opt(&mut query, "prev", request.prev);
+        push_opt(&mut query, "next", request.next);
+        if let Some(encoded) = sort_query(&request.sort)? {
+            query.push(("sort".to_owned(), encoded));
+        }
+        if let Some(encoded) = filter_conditions_query(&request.filter_conditions)? {
+            query.push(("filter_conditions".to_owned(), encoded));
+        }
+        let path = self.stats_path("/{session}/participants", &[("session", session)]);
+        self.client
+            .request::<(), _>(Method::GET, &path, &query, None)
+            .await
+    }
+
+    /// Retrieve the participant stats timeline for one participant session.
+    ///
+    /// `GET .../call_stats/{type}/{id}/{session}/participants/{user}/{user_session}/timeline`
+    pub async fn get_call_session_participant_stats_timeline(
+        &self,
+        session: &str,
+        user: &str,
+        user_session: &str,
+        request: GetCallSessionParticipantStatsTimelineRequest,
+    ) -> Result<QueryCallSessionParticipantStatsTimelineResponse> {
+        let mut query = Vec::new();
+        push_opt(
+            &mut query,
+            "start_time",
+            request.start_time.as_ref().map(timestamp_query),
+        );
+        push_opt(
+            &mut query,
+            "end_time",
+            request.end_time.as_ref().map(timestamp_query),
+        );
+        if !request.severity.is_empty() {
+            query.push(("severity".to_owned(), request.severity.join(",")));
+        }
+        let path = self.stats_path(
+            "/{session}/participants/{user}/{user_session}/timeline",
+            &[
+                ("session", session),
+                ("user", user),
+                ("user_session", user_session),
             ],
         );
         self.client
@@ -878,4 +1035,84 @@ fn timestamp_query(value: &Timestamp) -> String {
         .as_str()
         .map(str::to_owned)
         .unwrap_or_else(|| value.to_string())
+}
+
+/// Push `name=value` when the option is set, stringifying the value.
+fn push_opt<T: ToString>(query: &mut Vec<(String, String)>, name: &str, value: Option<T>) {
+    if let Some(value) = value {
+        query.push((name.to_owned(), value.to_string()));
+    }
+}
+
+/// JSON-encode a `sort` list for a query parameter, or `None` when empty.
+///
+/// The coordinator parses this parameter as a JSON array; comma-joining the
+/// encoded entries instead yields `is not a valid JSON for field 'sort'`.
+fn sort_query(sort: &[SortParamRequest]) -> Result<Option<String>> {
+    if sort.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(serde_json::to_string(sort)?))
+}
+
+/// JSON-encode a `filter_conditions` map for a query parameter, or `None` when
+/// empty. Matches the getstream-go query encoding for map-valued params.
+fn filter_conditions_query(filter: &CustomData) -> Result<Option<String>> {
+    if filter.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(serde_json::to_string(filter)?))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_stats_query_params_are_omitted() {
+        assert!(
+            filter_conditions_query(&CustomData::new())
+                .expect("ok")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn sort_query_encodes_a_json_array() {
+        assert!(sort_query(&[]).expect("ok").is_none());
+
+        let sort = vec![
+            SortParamRequest {
+                field: Some("quality_score".to_owned()),
+                direction: Some(-1),
+            },
+            SortParamRequest {
+                field: Some("user_id".to_owned()),
+                direction: Some(1),
+            },
+        ];
+        let encoded = sort_query(&sort).expect("ok").expect("some");
+
+        // Must parse as a JSON array: the coordinator rejects comma-joined
+        // objects with "is not a valid JSON for field 'sort'".
+        let parsed: serde_json::Value =
+            serde_json::from_str(&encoded).expect("sort query must be valid JSON");
+        assert_eq!(
+            parsed,
+            serde_json::json!([
+                {"direction": -1, "field": "quality_score"},
+                {"direction": 1, "field": "user_id"},
+            ])
+        );
+    }
+
+    #[test]
+    fn filter_conditions_query_json_encodes_map() {
+        let mut filter = CustomData::new();
+        filter.insert("call_cid".to_owned(), serde_json::json!("default:c1"));
+        assert_eq!(
+            filter_conditions_query(&filter).expect("ok"),
+            Some("{\"call_cid\":\"default:c1\"}".to_owned())
+        );
+    }
 }

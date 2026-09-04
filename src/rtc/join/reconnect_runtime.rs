@@ -845,7 +845,7 @@ impl RtcCore {
             {
                 return Err(join_cancelled());
             }
-            connection.signal_tasks.drain(..).collect()
+            std::mem::take(&mut connection.signal_tasks)
         };
         abort_tasks(old_tasks).await;
         {

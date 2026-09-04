@@ -1,3 +1,17 @@
+# Unreleased
+
+## New Features
+
+### Video REST: advanced call statistics and reporting
+
+Application-level stats on `VideoClient` (`get_active_calls_status`,
+`query_aggregate_call_stats`, `query_call_session_stats`, `get_daily_digest`,
+`query_user_feedback`, `report_client_call_event`) and call-session-scoped stats
+on `Call` (`get_call_participant_session_metrics`,
+`query_call_participant_sessions`, `get_call_session_participant_stats_details`,
+`query_call_session_participant_stats`,
+`get_call_session_participant_stats_timeline`).
+
 # v0.1.0-preview.2
 
 docs.rs builds on current nightly. `doc_auto_cfg` was removed in 1.92 and

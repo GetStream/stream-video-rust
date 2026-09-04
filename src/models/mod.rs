@@ -7,8 +7,10 @@
 
 mod call;
 mod shared;
+mod stats;
 mod user;
 
 pub use call::*;
 pub use shared::*;
+pub use stats::*;
 pub use user::*;

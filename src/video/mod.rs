@@ -1,6 +1,7 @@
 //! Video coordinator REST: [`VideoClient`] and [`Call`].
 
 mod call;
+mod stats;
 
 pub use call::Call;
 
