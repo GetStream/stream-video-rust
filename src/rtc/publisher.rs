@@ -81,8 +81,36 @@ pub(crate) async fn restart_ice(
     if tracks.is_empty() {
         return Ok(());
     }
+    // The ICE agent rejects a restart while it is still gathering candidates
+    // (browsers restart implicitly instead). A FAST reconnect that follows a
+    // freshly recreated publisher PeerConnection can race the gatherer, so wait
+    // for gathering to leave the `Gathering` state before restarting.
+    wait_for_ice_gathering_to_settle(publisher, ICE_GATHERING_SETTLE_TIMEOUT).await;
     publisher.restart_ice().await.map_err(neg)?;
     negotiate_publish(publisher, signal, session_id, tracks, publish_options).await
+}
+
+/// Upper bound on how long [`restart_ice`] waits for the publisher's ICE agent
+/// to finish gathering before it attempts the restart anyway.
+const ICE_GATHERING_SETTLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Poll the publisher's ICE gathering state until it is no longer `Gathering`
+/// (i.e. `New` or `Complete`) or `timeout` elapses. Returning while still
+/// gathering leaves the subsequent restart to fail and be retried by the
+/// reconnect driver rather than blocking indefinitely.
+async fn wait_for_ice_gathering_to_settle(
+    publisher: &Arc<RTCPeerConnection>,
+    timeout: std::time::Duration,
+) {
+    use webrtc::ice_transport::ice_gathering_state::RTCIceGatheringState;
+
+    let deadline = tokio::time::Instant::now() + timeout;
+    while publisher.ice_gathering_state() == RTCIceGatheringState::Gathering {
+        if tokio::time::Instant::now() >= deadline {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
 }
 
 fn neg(e: impl std::fmt::Display) -> RtcError {
