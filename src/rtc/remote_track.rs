@@ -46,12 +46,8 @@ use super::vpx_decode::VpxDecoder;
 /// to be filled (by NACK/RTX or a reordered arrival) before giving up on a
 /// frame. ~1 s of 30 fps video fragmented at MTU.
 const VIDEO_MAX_LATE: u16 = 200;
-/// Longest run of missing audio packets this track fills in.
-///
-/// RTP sequence numbers are 16 bit and wrap, so a reordered or very late packet
-/// reads as a gap of almost 65536. Without an upper bound that single packet
-/// would generate thousands of filler frames. A longer gap resets the decode
-/// state instead.
+/// Longest run of missing audio packets this track fills in. A longer gap counts
+/// as a break in the stream and is not filled.
 const AUDIO_MAX_FILLED_PACKETS: u16 = 10;
 /// The longest Opus frame at 48 kHz mono is 120 ms.
 const MAX_OPUS_FRAME_SAMPLES: usize = 5_760;
@@ -534,11 +530,24 @@ impl AudioDecode {
     /// audio: in-band FEC puts a low-quality copy of a frame into the *next*
     /// packet, so anything lost earlier had its copy in a lost packet too.
     fn push_packet(&mut self, sequence_number: u16, payload: &[u8]) {
-        let missing = self
-            .last_seq
-            .map(|last| sequence_number.wrapping_sub(last).wrapping_sub(1))
-            .filter(|missing| *missing <= AUDIO_MAX_FILLED_PACKETS)
-            .unwrap_or(0);
+        let missing = match self.last_seq {
+            None => 0,
+            Some(last) => {
+                let ahead = sequence_number.wrapping_sub(last);
+                // Sequence numbers wrap: a packet behind the mark reads as a
+                // distance over half the range. Its frame already went out,
+                // rebuilt from the packet that overtook it.
+                if ahead == 0 || ahead > u16::MAX / 2 {
+                    return;
+                }
+                let missing = ahead - 1;
+                if missing > AUDIO_MAX_FILLED_PACKETS {
+                    0
+                } else {
+                    missing
+                }
+            }
+        };
         self.last_seq = Some(sequence_number);
 
         for _ in 1..missing {
@@ -859,6 +868,50 @@ mod tests {
         );
     }
 
+    /// Drain the queue and count what came out.
+    fn drain(state: &mut AudioDecode) -> usize {
+        let mut frames = 0;
+        while state.take_frame().is_some() {
+            frames += 1;
+        }
+        frames
+    }
+
+    #[test]
+    fn a_late_packet_is_dropped_instead_of_repeated() {
+        let packets = tone_packets(4, true);
+        let mut state = audio_decode();
+
+        state.push_packet(0, &packets[0]);
+        // Packet 1 is overtaken by 2, so its frame is rebuilt here.
+        state.push_packet(2, &packets[2]);
+        let before_late = drain(&mut state);
+        state.push_packet(1, &packets[1]);
+        let late = drain(&mut state);
+        state.push_packet(3, &packets[3]);
+        let after_late = drain(&mut state);
+
+        assert_eq!(late, 0, "a late packet must not repeat a frame");
+        assert_eq!(
+            before_late + late + after_late,
+            4,
+            "four packets on the wire owe four frames"
+        );
+    }
+
+    #[test]
+    fn a_duplicate_packet_is_dropped() {
+        let packets = tone_packets(1, true);
+        let mut state = audio_decode();
+
+        state.push_packet(7, &packets[0]);
+        let first = drain(&mut state);
+        state.push_packet(7, &packets[0]);
+        let second = drain(&mut state);
+
+        assert_eq!((first, second), (1, 0));
+    }
+
     #[test]
     fn several_lost_packets_each_get_a_frame() {
         let packets = tone_packets(5, true);
@@ -893,20 +946,15 @@ mod tests {
     }
 
     #[test]
-    fn a_reordered_packet_does_not_flood_the_queue() {
+    fn a_backwards_sequence_number_queues_nothing() {
         let packets = tone_packets(3, true);
         let mut state = audio_decode();
 
         state.push_packet(9, &packets[0]);
-        assert!(state.take_frame().is_some());
-        // Arrives late, so the wrapping gap is close to u16::MAX.
+        assert_eq!(drain(&mut state), 1);
         state.push_packet(4, &packets[1]);
 
-        let mut frames = 0;
-        while state.take_frame().is_some() {
-            frames += 1;
-        }
-        assert_eq!(frames, 1, "a backwards sequence number must not fill a gap");
+        assert_eq!(drain(&mut state), 0);
     }
 
     #[test]
