@@ -72,6 +72,10 @@ const MAX_LOCAL_VIDEO_PIXELS: u64 = 3_840 * 2_160;
 const MAX_LOCAL_VIDEO_I420_BYTES: usize = 3_840 * 2_160 * 3 / 2;
 const PCM_QUEUE_CAPACITY_SAMPLES: usize = FRAME_SAMPLES_20MS * 10;
 const MAX_OPUS_PACKET_BYTES: usize = 1_500;
+
+const AUDIO_BITRATE_BPS: u32 = 32_000;
+/// libopus adds no in-band FEC redundancy while the expected loss is 0.
+const EXPECTED_PACKET_LOSS_PCT: u8 = 10;
 /// Force a fresh keyframe at least this often. The backend publisher does not
 /// answer receiver PLI/FIR (webrtc-rs has no publisher keyframe-request hook),
 /// and libvpx only emits a keyframe on the first frame or a scene change — so a
@@ -328,6 +332,65 @@ struct AudioInner {
     write_guard: tokio::sync::Mutex<()>,
 }
 
+/// Encoder settings for a locally encoded Opus track.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct LocalAudioTrackConfig {
+    /// Target encoder bitrate in bits per second.
+    pub target_bitrate_bps: u32,
+    /// In-band forward error correction: carry a low-quality copy of the
+    /// previous frame so a lost packet can be recovered from the next one.
+    pub inband_fec: bool,
+    /// Network loss the encoder should expect, `0..=100`. In-band FEC adds no
+    /// redundancy at 0.
+    pub expected_packet_loss_pct: u8,
+    /// Discontinuous transmission: stop emitting packets during silence.
+    pub dtx: bool,
+}
+
+impl Default for LocalAudioTrackConfig {
+    fn default() -> Self {
+        Self {
+            target_bitrate_bps: AUDIO_BITRATE_BPS,
+            inband_fec: true,
+            expected_packet_loss_pct: EXPECTED_PACKET_LOSS_PCT,
+            dtx: true,
+        }
+    }
+}
+
+impl LocalAudioTrackConfig {
+    /// Configure a local encoder target bitrate in bits per second.
+    #[must_use]
+    pub fn new(target_bitrate_bps: u32) -> Self {
+        Self {
+            target_bitrate_bps,
+            ..Self::default()
+        }
+    }
+
+    /// Enable or disable in-band forward error correction.
+    #[must_use]
+    pub fn with_inband_fec(mut self, inband_fec: bool) -> Self {
+        self.inband_fec = inband_fec;
+        self
+    }
+
+    /// Set the network loss the encoder should expect, `0..=100`.
+    #[must_use]
+    pub fn with_expected_packet_loss_pct(mut self, expected_packet_loss_pct: u8) -> Self {
+        self.expected_packet_loss_pct = expected_packet_loss_pct;
+        self
+    }
+
+    /// Enable or disable discontinuous transmission.
+    #[must_use]
+    pub fn with_dtx(mut self, dtx: bool) -> Self {
+        self.dtx = dtx;
+        self
+    }
+}
+
 /// An outbound Opus audio track.
 ///
 /// Feed it PCM ([`write_pcm`](Self::write_pcm)), pre-encoded Opus
@@ -341,6 +404,11 @@ pub struct LocalAudioTrack {
 impl LocalAudioTrack {
     /// Build a mono Opus track (48 kHz, matching the SFU/webrtc-rs default codec).
     pub fn opus() -> Result<Self> {
+        Self::opus_with_config(LocalAudioTrackConfig::default())
+    }
+
+    /// Build a mono Opus track with explicit local encoder settings.
+    pub fn opus_with_config(config: LocalAudioTrackConfig) -> Result<Self> {
         let codec = RTCRtpCodecCapability {
             mime_type: MIME_TYPE_OPUS.to_owned(),
             clock_rate: OPUS_SAMPLE_RATE,
@@ -350,12 +418,21 @@ impl LocalAudioTrack {
         };
         let track_id = format!("audio-{}", uuid::Uuid::new_v4().simple());
         let core = TrackCore::new(codec, track_id, "stream-rust-audio".to_owned())?;
-        let encoder = opus::Encoder::new(
+        let bitrate = i32::try_from(config.target_bitrate_bps).map_err(|_| {
+            RtcError::Media(format!(
+                "opus bitrate out of range: {} bps",
+                config.target_bitrate_bps
+            ))
+        })?;
+        let mut encoder = opus::Encoder::new(
             OPUS_SAMPLE_RATE,
             opus::Channels::Mono,
             opus::Application::Voip,
-        )
-        .map_err(|error| RtcError::Media(error.to_string()))?;
+        )?;
+        encoder.set_bitrate(opus::Bitrate::Bits(bitrate))?;
+        encoder.set_inband_fec(config.inband_fec)?;
+        encoder.set_packet_loss_perc(i32::from(config.expected_packet_loss_pct))?;
+        encoder.set_dtx(config.dtx)?;
         Ok(Self {
             inner: Arc::new(AudioInner {
                 core,
@@ -607,9 +684,7 @@ fn push_bounded_pcm(queue: &mut VecDeque<i16>, samples: Vec<i16>) -> usize {
 }
 
 fn encode_opus_into(encoder: &mut opus::Encoder, pcm: &[i16], output: &mut [u8]) -> Result<usize> {
-    encoder
-        .encode(pcm, output)
-        .map_err(|error| RtcError::Media(error.to_string()))
+    Ok(encoder.encode(pcm, output)?)
 }
 
 // Video
@@ -1917,6 +1992,86 @@ impl LocalTrack {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// One 20 ms frame of 440 Hz tone: FEC and DTX both key off whether the
+    /// frame carries signal, so silence would not exercise either.
+    fn tone_20ms() -> Vec<i16> {
+        (0..FRAME_SAMPLES_20MS)
+            .map(|index| {
+                let time = index as f64 / f64::from(OPUS_SAMPLE_RATE);
+                (12_000.0 * (std::f64::consts::TAU * 440.0 * time).sin()) as i16
+            })
+            .collect()
+    }
+
+    /// Encode `frames` copies of `pcm` through a configured track's encoder and
+    /// return each packet's byte length.
+    fn encoded_lengths(config: LocalAudioTrackConfig, pcm: &[i16], frames: usize) -> Vec<usize> {
+        let track = LocalAudioTrack::opus_with_config(config).expect("opus track");
+        let mut encoder = track
+            .inner
+            .encoder
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut output = vec![0u8; MAX_OPUS_PACKET_BYTES];
+        (0..frames)
+            .map(|_| encode_opus_into(&mut encoder, pcm, &mut output).expect("encode"))
+            .collect()
+    }
+
+    #[test]
+    fn a_higher_configured_bitrate_produces_bigger_packets() {
+        let pcm = tone_20ms();
+
+        let low = encoded_lengths(LocalAudioTrackConfig::new(16_000), &pcm, 5);
+        let high = encoded_lengths(LocalAudioTrackConfig::new(64_000), &pcm, 5);
+
+        let (low, high) = (low[4], high[4]);
+        assert!(
+            high > low * 2,
+            "64 kbps packet ({high} B) should be far larger than 16 kbps ({low} B)"
+        );
+    }
+
+    #[test]
+    fn dtx_stops_emitting_payload_during_silence() {
+        let silence = vec![0i16; FRAME_SAMPLES_20MS];
+        let without = LocalAudioTrackConfig {
+            dtx: false,
+            ..LocalAudioTrackConfig::default()
+        };
+
+        let with_dtx = encoded_lengths(LocalAudioTrackConfig::default(), &silence, 20);
+        let without_dtx = encoded_lengths(without, &silence, 20);
+
+        let last = with_dtx.last().copied().expect("frames");
+        assert!(last <= 2, "DTX should collapse silence, got {last} B");
+        assert!(
+            without_dtx.last().copied().expect("frames") > 2,
+            "silence without DTX still sends a payload"
+        );
+    }
+
+    #[test]
+    fn inband_fec_adds_redundancy_to_later_packets() {
+        let pcm = tone_20ms();
+        let without = LocalAudioTrackConfig {
+            inband_fec: false,
+            ..LocalAudioTrackConfig::default()
+        };
+
+        let with_fec = encoded_lengths(LocalAudioTrackConfig::default(), &pcm, 5);
+        let without_fec = encoded_lengths(without, &pcm, 5);
+
+        // The first packet has no previous frame to protect; redundancy shows up
+        // from the second onward.
+        assert!(
+            with_fec[4] > without_fec[4],
+            "FEC packet ({} B) should exceed the plain one ({} B)",
+            with_fec[4],
+            without_fec[4]
+        );
+    }
 
     #[test]
     fn encode_opus_into_produces_a_packet_for_a_20ms_mono_frame() {

@@ -61,8 +61,8 @@ pub use error::{
 pub use identity::{CLIENT_TYPE, SDK_TYPE, client_details, client_header};
 pub use join::{CallEvent, CallStateSnapshot, CallingState, JoinCallData, RtcCore};
 pub use local_track::{
-    LocalAudioTrack, LocalTrack, LocalVideoTrack, LocalVideoTrackConfig, RtpPacket, VideoLayering,
-    audio_level_dbov,
+    LocalAudioTrack, LocalAudioTrackConfig, LocalTrack, LocalVideoTrack, LocalVideoTrackConfig,
+    RtpPacket, VideoLayering, audio_level_dbov,
 };
 pub use pcm::chunk::Pad;
 pub use pcm::convert::G711_SAMPLE_RATE;

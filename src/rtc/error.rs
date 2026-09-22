@@ -180,6 +180,12 @@ impl From<tokio_tungstenite::tungstenite::Error> for RtcError {
     }
 }
 
+impl From<opus::Error> for RtcError {
+    fn from(e: opus::Error) -> Self {
+        RtcError::Media(e.to_string())
+    }
+}
+
 impl From<webrtc::error::Error> for RtcError {
     fn from(e: webrtc::error::Error) -> Self {
         RtcError::Webrtc(Box::new(e))

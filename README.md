@@ -41,7 +41,7 @@ remote audio and video, transform it, and publish media back into the call.
   G.711, and slice it into chunks and sliding windows.
 - Transform and republish audio or video through local tracks.
 - Temporarily mute publications, publish screen-share audio, configure local
-  video bitrate, and control SFU-side noise cancellation.
+  audio and video encoder settings, and control SFU-side noise cancellation.
 - Emit structured, secret-redacted diagnostics through `tracing`.
 
 ## Crate map
@@ -258,19 +258,94 @@ temporary `mute_track` / `unmute_track` preserves the same local track and
 sender; `stop_publish` remains terminal for that local track handle. The latest
 SFU view is available synchronously through `Call::call_state`.
 
-Layered publishing is opt-in. `LocalVideoTrack::vp9_svc()` provides camera SVC
-with up to three spatial and temporal layers on one SSRC.
-`LocalVideoTrack::h264_simulcast()` supports camera video and
-`LocalVideoTrack::vp8_simulcast()` supports screen share with a `q`/`h`/`f` RID
-ladder on one m-line. All three follow SFU quality updates. Feed raw I420 at the
-full resolution announced by the SFU publish option; a mismatch is rejected
-instead of advertising dimensions that are not sent. Pre-encoded samples and
-forwarded RTP remain single-layer-only.
-
 Tracks carry 48 kHz signed 16-bit PCM, which is rarely what a model or telephony
 API wants. The [`rtc::pcm`](https://docs.rs/getstream/latest/getstream/rtc/pcm/)
 module converts the rate and channel count, converts to 32-bit float, raw bytes,
 WAV, or G.711, and slices audio into chunks and sliding windows.
+
+## Encoder settings
+
+Local tracks encode with defaults that suit a server-side agent. Both the audio
+and the video defaults are adjustable per track.
+
+`LocalAudioTrack::opus()` publishes mono 48 kHz Opus. Its defaults are 32 kbps,
+in-band FEC for 10% expected packet loss, and DTX. Use `opus_with_config` to
+change them. In-band FEC puts a low-quality copy of the previous frame into each
+packet, and the decoder plays that copy when it loses a packet. FEC uses more
+bitrate, and it adds nothing while the expected packet loss is 0. DTX stops the
+payload during silence.
+
+```rust,no_run
+use getstream::rtc::{LocalAudioTrack, LocalAudioTrackConfig, RtcResult};
+
+fn audio_tracks() -> RtcResult<()> {
+    // Defaults: 32 kbps, FEC for 10% expected packet loss, DTX on.
+    let default_audio = LocalAudioTrack::opus()?;
+
+    // The network loses more packets. Add more redundancy.
+    let lossy_network = LocalAudioTrack::opus_with_config(
+        LocalAudioTrackConfig::default().with_expected_packet_loss_pct(30),
+    )?;
+
+    // The uplink is small. Use a lower bitrate and no redundancy.
+    let low_bandwidth = LocalAudioTrack::opus_with_config(
+        LocalAudioTrackConfig::new(24_000).with_inband_fec(false),
+    )?;
+
+    // The audio is continuous, for example music. Stop DTX.
+    let continuous_audio =
+        LocalAudioTrack::opus_with_config(LocalAudioTrackConfig::new(64_000).with_dtx(false))?;
+    Ok(())
+}
+```
+
+Video encodes at 1 Mbps on one layer. `LocalVideoTrackConfig` sets the target
+bitrate, and every codec has a `_with_config` constructor that takes it.
+
+Layered publishing is opt-in. `LocalVideoTrack::vp9_svc()` provides camera SVC
+with up to three spatial and temporal layers on one SSRC.
+`LocalVideoTrack::h264_simulcast()` supports camera video and
+`LocalVideoTrack::vp8_simulcast()` supports screen share with a `q`/`h`/`f` RID
+ladder on one m-line. Each of the three is a shortcut for the matching
+`_with_config` call on a `server_managed` config. All three follow SFU quality
+updates. To publish fewer layers than the SFU offers, set `VideoLayering`
+directly and cap the counts.
+
+```rust,no_run
+use std::num::NonZeroU8;
+
+use getstream::rtc::{LocalVideoTrack, LocalVideoTrackConfig, RtcResult, VideoLayering};
+
+fn video_tracks() -> RtcResult<()> {
+    // Default: VP9 camera video, 1 Mbps, one layer.
+    let default_video = LocalVideoTrack::vp9()?;
+
+    // The uplink is small. Lower the target bitrate.
+    let low_bitrate = LocalVideoTrack::vp9_with_config(LocalVideoTrackConfig::new(400_000))?;
+
+    // Camera SVC on one SSRC, up to three spatial and three temporal layers.
+    let svc = LocalVideoTrack::vp9_svc()?;
+
+    // The same, but the SDK encodes at most two spatial and two temporal layers.
+    let mut capped = LocalVideoTrackConfig::new(600_000);
+    capped.layering = VideoLayering::ServerManaged {
+        max_spatial_layers: NonZeroU8::new(2),
+        max_temporal_layers: NonZeroU8::new(2),
+    };
+    let capped_svc = LocalVideoTrack::vp9_with_config(capped)?;
+
+    // H264 camera simulcast, and VP8 screen-share simulcast.
+    let h264_camera = LocalVideoTrack::h264_simulcast()?;
+    let screen_share = LocalVideoTrack::vp8_simulcast()?;
+    Ok(())
+}
+```
+
+Feed raw I420 at the full resolution announced by the SFU publish option; a
+mismatch is rejected instead of advertising dimensions that are not sent.
+Pre-encoded samples and forwarded RTP remain single-layer-only. Publish a
+screen-share track with `Call::publish_screen_share` and a camera track with
+`Call::publish_video`.
 
 ## Examples
 
