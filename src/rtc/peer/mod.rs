@@ -7,6 +7,10 @@
 //! SFU inspects to learn our codec capabilities on the `JoinRequest`
 //! (JS `getGenericSdp`, stream-py `create_join_request`).
 
+mod ice;
+pub mod publisher;
+mod subscriber;
+
 use std::sync::Arc;
 
 use serde_json::json;
@@ -32,6 +36,9 @@ use super::coordinator::IceServer;
 use super::error::Result;
 use super::publish_options::H264_FMTP;
 use super::tracer::Tracer;
+
+pub(super) use ice::{PendingIce, register_ice_trickle};
+pub(super) use subscriber::negotiate_subscriber;
 
 const OPUS_PAYLOAD_TYPE: u8 = 111;
 const VP8_PAYLOAD_TYPE: u8 = 96;

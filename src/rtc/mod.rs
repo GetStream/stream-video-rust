@@ -15,7 +15,7 @@
 //! # Stability
 //!
 //! The wire-layer modules — [`proto`], [`peer`], [`sfu_ws`], [`signal`],
-//! [`publisher`], [`tracer`], and [`coordinator_ws`] — mirror Stream's SFU
+//! [`tracer`], and [`coordinator_ws`] — mirror Stream's SFU
 //! protocol and change with it. They are exempt from this crate's compatibility
 //! guarantees at any version bump. Prefer [`crate::Call`], [`RtcClient`], and
 //! the re-exports below, which are covered by the crate's semver policy.
@@ -33,7 +33,6 @@ pub mod pcm;
 pub mod peer;
 pub mod proto;
 mod publish_options;
-pub mod publisher;
 pub mod reconnect;
 pub mod remote_track;
 pub mod sfu_ws;

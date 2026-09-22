@@ -63,53 +63,6 @@ pub(super) async fn await_join_response(
     }
 }
 
-/// Register a subscriber/publisher `on_ice_candidate` handler that trickles
-/// gathered candidates to the SFU over Twirp.
-pub(super) fn register_ice_trickle(
-    pc: &Arc<RTCPeerConnection>,
-    signal: SignalClient,
-    session_id: String,
-    peer_type: PeerType,
-    tracer: Arc<Tracer>,
-) {
-    pc.on_ice_candidate(Box::new(move |candidate: Option<RTCIceCandidate>| {
-        let signal = signal.clone();
-        let session_id = session_id.clone();
-        let tracer = tracer.clone();
-        Box::pin(async move {
-            let Some(candidate) = candidate else { return };
-            let init = match candidate.to_json() {
-                Ok(init) => init,
-                Err(e) => {
-                    tracing::debug!(error = %e, "stream.rtc.ice.to_json_failed");
-                    return;
-                }
-            };
-            // Match JS `onicecandidate`: trace the candidate init object.
-            tracer.trace(
-                "onicecandidate",
-                serde_json::to_value(&init).unwrap_or(serde_json::Value::Null),
-            );
-            let ice_candidate = match serde_json::to_string(&init) {
-                Ok(s) => s,
-                Err(e) => {
-                    tracing::debug!(error = %e, "stream.rtc.ice.serialize_failed");
-                    return;
-                }
-            };
-            let trickle = models::IceTrickle {
-                peer_type: peer_type as i32,
-                ice_candidate,
-                session_id,
-            };
-            match signal.ice_trickle(trickle).await {
-                Ok(_) => tracing::debug!(?peer_type, "stream.rtc.ice.trickle_sent"),
-                Err(e) => tracing::debug!(error = %e, "stream.rtc.ice.trickle_failed"),
-            }
-        })
-    }));
-}
-
 /// Register the subscriber `on_track` handler, delivering each inbound track to
 /// the core's correlation + `on_track` callback path. Also traces `ontrack`
 /// (`<kind>:<track_id> [stream:<id>]`) to match JS.
@@ -279,13 +232,10 @@ pub(super) async fn handle_event(
             .await?;
         }
         E::IceTrickle(trickle) => {
-            add_remote_candidate(
-                &context.subscriber,
-                &context.publisher,
-                trickle,
-                &context.pending_ice,
-            )
-            .await?;
+            context
+                .pending_ice
+                .add_remote(&context.subscriber, &context.publisher, trickle)
+                .await?;
         }
         E::ConnectionQualityChanged(event) => {
             core.update_connection_quality(&event.connection_quality_updates);
@@ -435,73 +385,6 @@ pub(super) async fn handle_event(
         }
     }
     Ok(())
-}
-
-/// Answer an SFU subscriber offer and post the answer over Twirp.
-pub(super) async fn negotiate_subscriber(
-    subscriber: &Arc<RTCPeerConnection>,
-    signal: &SignalClient,
-    session_id: &str,
-    offer: super::super::proto::event::SubscriberOffer,
-    pending_ice: &Arc<PendingIce>,
-) -> Result<()> {
-    let remote = RTCSessionDescription::offer(offer.sdp)
-        .map_err(|e| RtcError::Negotiation(super::super::error::NegotiationError(e.to_string())))?;
-    subscriber
-        .set_remote_description(remote)
-        .await
-        .map_err(|e| RtcError::Negotiation(super::super::error::NegotiationError(e.to_string())))?;
-    // The remote description now exists: release any candidates the SFU trickled
-    // before this offer arrived.
-    flush_candidates(subscriber, &pending_ice.subscriber).await;
-    let answer = subscriber
-        .create_answer(None)
-        .await
-        .map_err(|e| RtcError::Negotiation(super::super::error::NegotiationError(e.to_string())))?;
-    subscriber
-        .set_local_description(answer.clone())
-        .await
-        .map_err(|e| RtcError::Negotiation(super::super::error::NegotiationError(e.to_string())))?;
-
-    signal
-        .send_answer(signal::SendAnswerRequest {
-            peer_type: PeerType::Subscriber as i32,
-            sdp: answer.sdp,
-            session_id: session_id.to_owned(),
-            negotiation_id: offer.negotiation_id,
-        })
-        .await?;
-    tracing::debug!(session_id, "stream.rtc.subscriber.answer_sent");
-    Ok(())
-}
-
-/// Add a remote ICE candidate to the publisher or subscriber PeerConnection,
-/// buffering it if the remote description is not set yet.
-pub(super) async fn add_remote_candidate(
-    subscriber: &Arc<RTCPeerConnection>,
-    publisher: &Arc<RTCPeerConnection>,
-    trickle: models::IceTrickle,
-    pending_ice: &Arc<PendingIce>,
-) -> Result<()> {
-    let init: RTCIceCandidateInit = serde_json::from_str(&trickle.ice_candidate)?;
-    let (target, queue) = if trickle.peer_type == PeerType::Subscriber as i32 {
-        (subscriber, &pending_ice.subscriber)
-    } else {
-        (publisher, &pending_ice.publisher)
-    };
-    for candidate in queue.offer(init) {
-        target.add_ice_candidate(candidate).await?;
-    }
-    Ok(())
-}
-
-/// Release every buffered candidate now that `pc`'s remote description is set.
-pub(super) async fn flush_candidates(pc: &Arc<RTCPeerConnection>, queue: &CandidateQueue) {
-    for candidate in queue.mark_ready() {
-        if let Err(e) = pc.add_ice_candidate(candidate).await {
-            tracing::debug!(error = %e, "stream.rtc.ice.flush_add_failed");
-        }
-    }
 }
 
 /// Health-check ping loop (JS 5s cadence) keeping the SFU session alive.

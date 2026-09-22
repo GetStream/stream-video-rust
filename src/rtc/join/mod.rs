@@ -38,10 +38,8 @@ use std::time::{Duration, Instant};
 use tokio::sync::{Mutex as TokioMutex, Notify, broadcast};
 use tokio::task::JoinHandle;
 use url::Url;
-use webrtc::ice_transport::ice_candidate::{RTCIceCandidate, RTCIceCandidateInit};
 use webrtc::peer_connection::RTCPeerConnection;
 use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
-use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
 use webrtc::rtp_transceiver::RTCRtpTransceiverInit;
 use webrtc::rtp_transceiver::rtp_codec::RTPCodecType;
 use webrtc::rtp_transceiver::rtp_transceiver_direction::RTCRtpTransceiverDirection;
@@ -56,12 +54,11 @@ use super::coordinator_ws::{self, ConnectUserDetails, CoordinatorEvent, WsAuthMe
 use super::error::{Result, RtcError, SfuJoinError, SfuTimeoutError};
 use super::identity;
 use super::local_track::LocalTrack;
-use super::peer;
+use super::peer::{self, PendingIce, negotiate_subscriber, publisher, register_ice_trickle};
 use super::proto::event::{self, JoinRequest, JoinResponse, ReconnectDetails, SfuEvent, sfu_event};
 use super::proto::models::{self, PeerType, TrackType};
 use super::proto::signal;
 use super::publish_options::ClientPublishOptions;
-use super::publisher;
 use super::reconnect::{
     self, FailureCaps, ReconnectStrategy, SlidingWindowRateLimiter, escalate_strategy,
     strategy_after_signal_close,
@@ -84,8 +81,8 @@ mod roster;
 mod subscriptions_runtime;
 
 use connection::{
-    await_join_response, build_sfu_ws_url, event_loop, flush_candidates, ping_loop,
-    register_connection_state, register_ice_trickle, register_on_track,
+    await_join_response, build_sfu_ws_url, event_loop, ping_loop, register_connection_state,
+    register_on_track,
 };
 use publication::{MediaState, PublicationStatus};
 use roster::{CallStateCache, RosterEntry};
@@ -272,61 +269,12 @@ pub struct CallStateSnapshot {
     pub current_grants: Option<models::CallGrants>,
 }
 
-/// Buffers remote ICE candidates that arrive before a PeerConnection's remote
-/// description is set, then releases them once it is.
-///
-/// webrtc-rs rejects `add_ice_candidate` before the remote description exists,
-/// and the SFU trickles its candidates as soon as it receives our offer — often
-/// before our `set_remote_description` runs. Dropping those candidates leaves
-/// the agent with no pairs and ICE fails. The queue serializes "buffer vs add"
-/// under one lock so no candidate is lost to the race (JS `SfuClient` pending
-/// candidate handling).
-#[derive(Default)]
-struct CandidateQueue {
-    inner: StdMutex<CandidateQueueInner>,
-}
-
-#[derive(Default)]
-struct CandidateQueueInner {
-    remote_set: bool,
-    pending: Vec<RTCIceCandidateInit>,
-}
-
 #[derive(Debug)]
 struct Lifecycle {
     state: CallingState,
     generation: u64,
     publish_options: ClientPublishOptions,
     generation_publish_options: ClientPublishOptions,
-}
-
-impl CandidateQueue {
-    /// Offer a freshly-trickled candidate: returns the candidates to add now
-    /// (the new one if the remote description is set, else none — it is buffered).
-    fn offer(&self, init: RTCIceCandidateInit) -> Vec<RTCIceCandidateInit> {
-        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        if g.remote_set {
-            vec![init]
-        } else {
-            g.pending.push(init);
-            Vec::new()
-        }
-    }
-
-    /// Mark the remote description as set and return every buffered candidate to
-    /// be added now. Idempotent across renegotiations.
-    fn mark_ready(&self) -> Vec<RTCIceCandidateInit> {
-        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        g.remote_set = true;
-        std::mem::take(&mut g.pending)
-    }
-}
-
-/// Per-connection ICE candidate buffers for both PeerConnections.
-#[derive(Default)]
-struct PendingIce {
-    publisher: CandidateQueue,
-    subscriber: CandidateQueue,
 }
 
 /// A live SFU connection bundle. Swapped out wholesale on REJOIN/MIGRATE.
