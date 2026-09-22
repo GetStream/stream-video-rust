@@ -35,7 +35,7 @@ use webrtc::track::track_remote::TrackRemote;
 use super::error::{Result, RtcError};
 use super::h264::{H264Decoder, access_unit_has_idr};
 use super::local_track::RtpPacket;
-use super::pcm::{OPUS_SAMPLE_RATE, PcmFrame};
+use super::pcm::{FRAME_SAMPLES_20MS, OPUS_SAMPLE_RATE, PcmFrame};
 use super::proto::models::{self, TrackType};
 use super::rtp_h264::H264Depacketizer;
 use super::video_frame::VideoFrame;
@@ -46,6 +46,11 @@ use super::vpx_decode::VpxDecoder;
 /// to be filled (by NACK/RTX or a reordered arrival) before giving up on a
 /// frame. ~1 s of 30 fps video fragmented at MTU.
 const VIDEO_MAX_LATE: u16 = 200;
+/// Longest run of missing audio packets this track fills in. A longer gap counts
+/// as a break in the stream and is not filled.
+const AUDIO_MAX_FILLED_PACKETS: u16 = 10;
+/// The longest Opus frame at 48 kHz mono is 120 ms.
+const MAX_OPUS_FRAME_SAMPLES: usize = 5_760;
 /// The RTP clock for all WebRTC video.
 const VIDEO_CLOCK_RATE: u32 = 90_000;
 /// Floor between automatic PLIs. A keyframe is expensive for the publisher, and
@@ -205,10 +210,22 @@ struct VideoDecode {
     awaiting_h264_idr: bool,
 }
 
+/// Inbound audio decode state, plus frames already decoded but not yet handed to
+/// the caller (one packet can yield several when it fills in a lost one).
+struct AudioDecode {
+    decoder: opus::Decoder,
+    last_seq: Option<u16>,
+    ready: VecDeque<Vec<i16>>,
+    /// Length of the last frame decoded from a real packet. libopus makes a
+    /// rebuilt frame as long as the output buffer. A lost packet states no
+    /// length, so the stream's own frame size is the best value to use.
+    frame_samples: usize,
+}
+
 /// How this track's payload is turned into something the caller can use.
 enum Decode {
     /// Opus → 48 kHz mono PCM.
-    Audio(StdMutex<opus::Decoder>),
+    Audio(StdMutex<AudioDecode>),
     /// VP8/VP9/H264 RTP → packed I420 frames. Shared with the bounded blocking
     /// decode work; a [`SampleBuilder`] carries a full sequence-number window.
     Video(Arc<StdMutex<VideoDecode>>),
@@ -350,28 +367,22 @@ impl RemoteTrack {
     /// ends. Returns `None` immediately for non-audio tracks. Concurrent reads
     /// on this track are serialized; do not mix decoded and raw reads.
     pub async fn next_pcm(&self) -> Option<PcmFrame> {
-        let Decode::Audio(decoder) = &self.decode else {
+        let Decode::Audio(state) = &self.decode else {
             return None;
         };
         let _read_guard = self.read_gate.lock().await;
         loop {
+            if let Some(samples) = state.lock().unwrap_or_else(|e| e.into_inner()).take_frame() {
+                return Some(PcmFrame::mono(samples, OPUS_SAMPLE_RATE));
+            }
             let pkt = self.read_rtp_inner().await?;
             if pkt.payload.is_empty() {
                 continue;
             }
-            let decoded = {
-                let mut d = decoder.lock().unwrap_or_else(|e| e.into_inner());
-                decode_opus(&mut d, &pkt.payload)
-            };
-            match decoded {
-                Ok(samples) if !samples.is_empty() => {
-                    return Some(PcmFrame::mono(samples, OPUS_SAMPLE_RATE));
-                }
-                Ok(_) => continue,
-                Err(e) => {
-                    tracing::debug!(error = %e, "stream.rtc.remote.opus_decode_failed");
-                    continue;
-                }
+            let mut state = state.lock().unwrap_or_else(|e| e.into_inner());
+            state.push_packet(pkt.header.sequence_number, &pkt.payload);
+            if let Some(samples) = state.take_frame() {
+                return Some(PcmFrame::mono(samples, OPUS_SAMPLE_RATE));
             }
         }
     }
@@ -498,6 +509,92 @@ impl RemoteTrack {
     }
 }
 
+impl AudioDecode {
+    fn new(decoder: opus::Decoder) -> Self {
+        Self {
+            decoder,
+            last_seq: None,
+            ready: VecDeque::new(),
+            frame_samples: FRAME_SAMPLES_20MS,
+        }
+    }
+
+    /// Decode one Opus packet and queue every frame it yields.
+    ///
+    /// A gap in the RTP sequence means packets were lost. libopus never sees
+    /// that — it only gets the buffers we hand it — so without this the lost
+    /// audio drops out of the timeline and the decoder's prediction state
+    /// desyncs for the frames that follow. Each lost packet gets a frame here.
+    ///
+    /// Only the frame directly before `sequence_number` can be rebuilt from real
+    /// audio: in-band FEC puts a low-quality copy of a frame into the *next*
+    /// packet, so anything lost earlier had its copy in a lost packet too.
+    fn push_packet(&mut self, sequence_number: u16, payload: &[u8]) {
+        let missing = match self.last_seq {
+            None => 0,
+            Some(last) => {
+                let ahead = sequence_number.wrapping_sub(last);
+                // Sequence numbers wrap: a packet behind the mark reads as a
+                // distance over half the range. Its frame already went out,
+                // rebuilt from the packet that overtook it.
+                if ahead == 0 || ahead > u16::MAX / 2 {
+                    return;
+                }
+                let missing = ahead - 1;
+                if missing > AUDIO_MAX_FILLED_PACKETS {
+                    0
+                } else {
+                    missing
+                }
+            }
+        };
+        self.last_seq = Some(sequence_number);
+
+        for _ in 1..missing {
+            self.decode_frame(&[], false);
+        }
+        if missing > 0 {
+            self.decode_frame(payload, true);
+        }
+        self.decode_frame(payload, false);
+    }
+
+    /// Decode one frame and queue it. An empty `payload` makes libopus build a
+    /// replacement for a lost frame. `fec` takes the copy of the previous frame
+    /// out of `payload` instead of decoding `payload` itself.
+    fn decode_frame(&mut self, payload: &[u8], fec: bool) {
+        let rebuilt = fec || payload.is_empty();
+        // A real packet states its own length and the buffer is only an upper
+        // bound. For a rebuilt frame the buffer length is the length libopus
+        // produces, so it must match the frame that was lost.
+        let capacity = if rebuilt {
+            self.frame_samples
+        } else {
+            MAX_OPUS_FRAME_SAMPLES
+        };
+        let mut out = vec![0i16; capacity];
+        match self.decoder.decode(payload, &mut out, fec) {
+            Ok(samples) => {
+                out.truncate(samples);
+                if out.is_empty() {
+                    return;
+                }
+                if !rebuilt {
+                    self.frame_samples = samples;
+                }
+                self.ready.push_back(out);
+            }
+            Err(error) => {
+                tracing::debug!(error = %error, "stream.rtc.remote.opus_decode_failed");
+            }
+        }
+    }
+
+    fn take_frame(&mut self) -> Option<Vec<i16>> {
+        self.ready.pop_front()
+    }
+}
+
 impl VideoDecode {
     /// Feed one RTP packet into the reassembler and return every sample it
     /// completes. This path performs no native decode work.
@@ -603,7 +700,7 @@ fn is_audio(track_type: TrackType) -> bool {
 fn build_decoder(track_type: TrackType, codec: &Codec) -> Decode {
     if is_audio(track_type) {
         return match opus::Decoder::new(OPUS_SAMPLE_RATE, opus::Channels::Mono) {
-            Ok(d) => Decode::Audio(StdMutex::new(d)),
+            Ok(decoder) => Decode::Audio(StdMutex::new(AudioDecode::new(decoder))),
             Err(e) => {
                 tracing::warn!(error = %e, "stream.rtc.remote.opus_decoder_init_failed");
                 Decode::None
@@ -654,22 +751,9 @@ fn video_codec_for(mime_type: &str) -> Option<VideoCodec> {
     }
 }
 
-/// Decode a single Opus packet into mono s16 samples (48 kHz).
-fn decode_opus(
-    decoder: &mut opus::Decoder,
-    payload: &[u8],
-) -> std::result::Result<Vec<i16>, opus::Error> {
-    // Max Opus frame at 48 kHz mono is 120 ms = 5760 samples.
-    let mut out = vec![0i16; 5760];
-    let n = decoder.decode(payload, &mut out, false)?;
-    out.truncate(n);
-    Ok(out)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::rtc::pcm::FRAME_SAMPLES_20MS;
 
     #[test]
     fn supported_video_mime_types_map_to_a_decoder() {
@@ -678,39 +762,208 @@ mod tests {
         assert_eq!(video_codec_for("video/H264"), Some(VideoCodec::H264));
     }
 
-    #[test]
-    fn decoded_opus_yields_one_20ms_mono_frame() {
+    /// One 20 ms frame of 440 Hz tone, loud enough that a silent or badly
+    /// rebuilt frame is obvious.
+    fn tone_20ms() -> Vec<i16> {
+        (0..FRAME_SAMPLES_20MS)
+            .map(|index| {
+                let time = index as f64 / f64::from(OPUS_SAMPLE_RATE);
+                (12_000.0 * (std::f64::consts::TAU * 440.0 * time).sin()) as i16
+            })
+            .collect()
+    }
+
+    /// Encode `count` copies of a tone and return one Opus payload per packet.
+    fn tone_packets(count: usize, inband_fec: bool) -> Vec<Vec<u8>> {
         let mut encoder = opus::Encoder::new(
             OPUS_SAMPLE_RATE,
             opus::Channels::Mono,
             opus::Application::Voip,
         )
         .expect("encoder");
-        let pcm: Vec<i16> = (0..FRAME_SAMPLES_20MS)
-            .map(|index| {
-                let time = index as f64 / f64::from(OPUS_SAMPLE_RATE);
-                (12_000.0 * (std::f64::consts::TAU * 440.0 * time).sin()) as i16
+        encoder.set_inband_fec(inband_fec).expect("set fec");
+        encoder.set_packet_loss_perc(20).expect("set loss");
+        let pcm = tone_20ms();
+        (0..count)
+            .map(|_| {
+                let mut packet = vec![0u8; 1_500];
+                let length = encoder.encode(&pcm, &mut packet).expect("encode");
+                packet.truncate(length);
+                packet
             })
-            .collect();
-        let mut packet = vec![0u8; 1_500];
-        let length = encoder.encode(&pcm, &mut packet).expect("encode");
+            .collect()
+    }
 
-        let mut decoder =
-            opus::Decoder::new(OPUS_SAMPLE_RATE, opus::Channels::Mono).expect("decoder");
-        let samples = decode_opus(&mut decoder, &packet[..length]).expect("decode");
+    fn audio_decode() -> AudioDecode {
+        AudioDecode::new(
+            opus::Decoder::new(OPUS_SAMPLE_RATE, opus::Channels::Mono).expect("decoder"),
+        )
+    }
 
-        assert_eq!(samples.len(), FRAME_SAMPLES_20MS);
+    fn peak(frame: &[i16]) -> i16 {
+        frame
+            .iter()
+            .map(|sample| sample.saturating_abs())
+            .max()
+            .unwrap_or(0)
+    }
+
+    #[test]
+    fn an_unbroken_sequence_yields_one_frame_per_packet() {
+        let packets = tone_packets(4, true);
+        let mut state = audio_decode();
+
+        for (index, packet) in packets.iter().enumerate() {
+            state.push_packet(index as u16, packet);
+            assert_eq!(
+                state.take_frame().map(|frame| frame.len()),
+                Some(FRAME_SAMPLES_20MS),
+                "packet {index} should yield exactly one frame"
+            );
+            assert!(
+                state.take_frame().is_none(),
+                "packet {index} queued extra frames"
+            );
+        }
+    }
+
+    #[test]
+    fn a_lost_packet_is_rebuilt_from_the_next_one() {
+        let packets = tone_packets(3, true);
+        let mut state = audio_decode();
+
+        state.push_packet(0, &packets[0]);
+        assert!(state.take_frame().is_some());
+        // Packet 1 never arrives; packet 2 carries a copy of frame 1.
+        state.push_packet(2, &packets[2]);
+
+        let rebuilt = state.take_frame().expect("rebuilt frame");
+        let current = state.take_frame().expect("current frame");
+        assert!(state.take_frame().is_none(), "only two frames are owed");
+        assert_eq!(rebuilt.len(), FRAME_SAMPLES_20MS);
+        assert_eq!(current.len(), FRAME_SAMPLES_20MS);
         assert!(
-            samples.iter().any(|sample| sample.abs() > 1_000),
-            "decoded frame is silent"
+            peak(&rebuilt) > 1_000,
+            "rebuilt frame is silent (peak {})",
+            peak(&rebuilt)
         );
     }
 
     #[test]
-    fn decoding_a_corrupt_payload_is_an_error() {
-        let mut decoder =
-            opus::Decoder::new(OPUS_SAMPLE_RATE, opus::Channels::Mono).expect("decoder");
-        assert!(decode_opus(&mut decoder, &[0xff; 4]).is_err());
+    fn a_sender_without_fec_still_keeps_the_timeline() {
+        let packets = tone_packets(3, false);
+        let mut state = audio_decode();
+
+        state.push_packet(0, &packets[0]);
+        assert!(state.take_frame().is_some());
+        state.push_packet(2, &packets[2]);
+
+        assert_eq!(
+            (
+                state.take_frame().map(|frame| frame.len()),
+                state.take_frame().map(|frame| frame.len())
+            ),
+            (Some(FRAME_SAMPLES_20MS), Some(FRAME_SAMPLES_20MS)),
+            "a lost packet still owes two frames without FEC"
+        );
+    }
+
+    /// Drain the queue and count what came out.
+    fn drain(state: &mut AudioDecode) -> usize {
+        let mut frames = 0;
+        while state.take_frame().is_some() {
+            frames += 1;
+        }
+        frames
+    }
+
+    #[test]
+    fn a_late_packet_is_dropped_instead_of_repeated() {
+        let packets = tone_packets(4, true);
+        let mut state = audio_decode();
+
+        state.push_packet(0, &packets[0]);
+        // Packet 1 is overtaken by 2, so its frame is rebuilt here.
+        state.push_packet(2, &packets[2]);
+        let before_late = drain(&mut state);
+        state.push_packet(1, &packets[1]);
+        let late = drain(&mut state);
+        state.push_packet(3, &packets[3]);
+        let after_late = drain(&mut state);
+
+        assert_eq!(late, 0, "a late packet must not repeat a frame");
+        assert_eq!(
+            before_late + late + after_late,
+            4,
+            "four packets on the wire owe four frames"
+        );
+    }
+
+    #[test]
+    fn a_duplicate_packet_is_dropped() {
+        let packets = tone_packets(1, true);
+        let mut state = audio_decode();
+
+        state.push_packet(7, &packets[0]);
+        let first = drain(&mut state);
+        state.push_packet(7, &packets[0]);
+        let second = drain(&mut state);
+
+        assert_eq!((first, second), (1, 0));
+    }
+
+    #[test]
+    fn several_lost_packets_each_get_a_frame() {
+        let packets = tone_packets(5, true);
+        let mut state = audio_decode();
+
+        state.push_packet(0, &packets[0]);
+        assert!(state.take_frame().is_some());
+        // Packets 1, 2 and 3 are lost.
+        state.push_packet(4, &packets[4]);
+
+        let mut frames = 0;
+        while state.take_frame().is_some() {
+            frames += 1;
+        }
+        assert_eq!(frames, 4, "three lost packets plus the one that arrived");
+    }
+
+    #[test]
+    fn a_gap_beyond_the_limit_yields_only_the_packet_that_arrived() {
+        let packets = tone_packets(2, true);
+        let mut state = audio_decode();
+
+        state.push_packet(0, &packets[0]);
+        assert!(state.take_frame().is_some());
+        state.push_packet(AUDIO_MAX_FILLED_PACKETS + 2, &packets[1]);
+
+        assert!(state.take_frame().is_some(), "the arriving packet decodes");
+        assert!(
+            state.take_frame().is_none(),
+            "a gap beyond the limit must not be filled"
+        );
+    }
+
+    #[test]
+    fn a_backwards_sequence_number_queues_nothing() {
+        let packets = tone_packets(3, true);
+        let mut state = audio_decode();
+
+        state.push_packet(9, &packets[0]);
+        assert_eq!(drain(&mut state), 1);
+        state.push_packet(4, &packets[1]);
+
+        assert_eq!(drain(&mut state), 0);
+    }
+
+    #[test]
+    fn a_corrupt_payload_queues_nothing() {
+        let mut state = audio_decode();
+
+        state.push_packet(0, &[0xff; 4]);
+
+        assert!(state.take_frame().is_none());
     }
 
     #[test]
