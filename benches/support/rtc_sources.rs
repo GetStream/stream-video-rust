@@ -12,8 +12,6 @@ pub(crate) mod error {
 
 #[path = "../../src/rtc/h264.rs"]
 pub(crate) mod h264;
-#[path = "../../src/rtc/opus.rs"]
-pub(crate) mod opus;
 #[path = "../../src/rtc/rtp_h264.rs"]
 pub(crate) mod rtp_h264;
 #[path = "../../src/rtc/rtp_vpx.rs"]

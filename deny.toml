@@ -6,9 +6,7 @@
 # from software licenses.
 
 [advisories]
-# Fail on all security advisories. There are no ignores: the previously
-# unmaintained Opus binding (`audiopus_sys`, RUSTSEC-2026-0150) was replaced by
-# the maintained `opusic-sys`, so no advisory needs suppressing.
+# Fail on all security advisories. There are no ignores.
 
 [licenses]
 # Dependency-license policy. If a new dependency introduces an unreviewed

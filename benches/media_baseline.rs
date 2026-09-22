@@ -93,7 +93,8 @@ fn bench_resampling(criterion: &mut Criterion) {
 
 fn bench_opus(criterion: &mut Criterion) {
     let pcm = tone(48_000, 1, 20).samples;
-    let mut encoder = rtc::opus::Encoder::new_voip_mono().expect("create Opus encoder");
+    let mut encoder = opus::Encoder::new(48_000, opus::Channels::Mono, opus::Application::Voip)
+        .expect("create Opus encoder");
     let mut encoded = vec![0u8; 1_500];
 
     let mut group = criterion.benchmark_group("opus");
@@ -111,7 +112,8 @@ fn bench_opus(criterion: &mut Criterion) {
         .encode(&pcm, &mut encoded)
         .expect("encode Opus decode fixture");
     encoded.truncate(encoded_length);
-    let mut decoder = rtc::opus::Decoder::new_mono().expect("create Opus decoder");
+    let mut decoder =
+        opus::Decoder::new(48_000, opus::Channels::Mono).expect("create Opus decoder");
     let mut decoded = vec![0i16; 5_760];
     group.throughput(Throughput::Bytes(encoded.len() as u64));
     group.bench_function("decode_48k_mono_20ms", |bencher| {
@@ -274,8 +276,11 @@ fn bench_multitrack_load(criterion: &mut Criterion) {
     const VIDEO_H: u32 = 360;
 
     let pcm = tone(48_000, 1, 20).samples;
-    let mut audio_encoders: Vec<rtc::opus::Encoder> = (0..AUDIO_TRACKS)
-        .map(|_| rtc::opus::Encoder::new_voip_mono().expect("create multitrack Opus encoder"))
+    let mut audio_encoders: Vec<opus::Encoder> = (0..AUDIO_TRACKS)
+        .map(|_| {
+            opus::Encoder::new(48_000, opus::Channels::Mono, opus::Application::Voip)
+                .expect("create multitrack Opus encoder")
+        })
         .collect();
     let mut audio_scratch = vec![0u8; 1_500];
 

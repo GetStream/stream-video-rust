@@ -208,7 +208,7 @@ struct VideoDecode {
 /// How this track's payload is turned into something the caller can use.
 enum Decode {
     /// Opus → 48 kHz mono PCM.
-    Audio(StdMutex<super::opus::Decoder>),
+    Audio(StdMutex<opus::Decoder>),
     /// VP8/VP9/H264 RTP → packed I420 frames. Shared with the bounded blocking
     /// decode work; a [`SampleBuilder`] carries a full sequence-number window.
     Video(Arc<StdMutex<VideoDecode>>),
@@ -602,7 +602,7 @@ fn is_audio(track_type: TrackType) -> bool {
 /// returning `None` rather than panicking; `read_rtp` keeps working either way.
 fn build_decoder(track_type: TrackType, codec: &Codec) -> Decode {
     if is_audio(track_type) {
-        return match super::opus::Decoder::new_mono() {
+        return match opus::Decoder::new(OPUS_SAMPLE_RATE, opus::Channels::Mono) {
             Ok(d) => Decode::Audio(StdMutex::new(d)),
             Err(e) => {
                 tracing::warn!(error = %e, "stream.rtc.remote.opus_decoder_init_failed");
@@ -656,9 +656,9 @@ fn video_codec_for(mime_type: &str) -> Option<VideoCodec> {
 
 /// Decode a single Opus packet into mono s16 samples (48 kHz).
 fn decode_opus(
-    decoder: &mut super::opus::Decoder,
+    decoder: &mut opus::Decoder,
     payload: &[u8],
-) -> std::result::Result<Vec<i16>, String> {
+) -> std::result::Result<Vec<i16>, opus::Error> {
     // Max Opus frame at 48 kHz mono is 120 ms = 5760 samples.
     let mut out = vec![0i16; 5760];
     let n = decoder.decode(payload, &mut out, false)?;
@@ -669,12 +669,48 @@ fn decode_opus(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::rtc::pcm::FRAME_SAMPLES_20MS;
 
     #[test]
     fn supported_video_mime_types_map_to_a_decoder() {
         assert_eq!(video_codec_for("video/VP8"), Some(VideoCodec::Vp8));
         assert_eq!(video_codec_for("video/vp9"), Some(VideoCodec::Vp9));
         assert_eq!(video_codec_for("video/H264"), Some(VideoCodec::H264));
+    }
+
+    #[test]
+    fn decoded_opus_yields_one_20ms_mono_frame() {
+        let mut encoder = opus::Encoder::new(
+            OPUS_SAMPLE_RATE,
+            opus::Channels::Mono,
+            opus::Application::Voip,
+        )
+        .expect("encoder");
+        let pcm: Vec<i16> = (0..FRAME_SAMPLES_20MS)
+            .map(|index| {
+                let time = index as f64 / f64::from(OPUS_SAMPLE_RATE);
+                (12_000.0 * (std::f64::consts::TAU * 440.0 * time).sin()) as i16
+            })
+            .collect();
+        let mut packet = vec![0u8; 1_500];
+        let length = encoder.encode(&pcm, &mut packet).expect("encode");
+
+        let mut decoder =
+            opus::Decoder::new(OPUS_SAMPLE_RATE, opus::Channels::Mono).expect("decoder");
+        let samples = decode_opus(&mut decoder, &packet[..length]).expect("decode");
+
+        assert_eq!(samples.len(), FRAME_SAMPLES_20MS);
+        assert!(
+            samples.iter().any(|sample| sample.abs() > 1_000),
+            "decoded frame is silent"
+        );
+    }
+
+    #[test]
+    fn decoding_a_corrupt_payload_is_an_error() {
+        let mut decoder =
+            opus::Decoder::new(OPUS_SAMPLE_RATE, opus::Channels::Mono).expect("decoder");
+        assert!(decode_opus(&mut decoder, &[0xff; 4]).is_err());
     }
 
     #[test]
