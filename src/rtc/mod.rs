@@ -21,10 +21,10 @@
 //! the re-exports below, which are covered by the crate's semver policy.
 
 pub mod client;
+mod codecs;
 pub mod coordinator;
 pub mod coordinator_ws;
 pub mod error;
-mod h264;
 pub mod identity;
 pub mod join;
 mod layers;
@@ -36,16 +36,12 @@ mod publish_options;
 pub mod publisher;
 pub mod reconnect;
 pub mod remote_track;
-mod rtp_h264;
-mod rtp_vpx;
 pub mod sfu_ws;
 pub mod signal;
 pub mod stats;
 pub mod subscriptions;
 pub mod tracer;
 pub mod video_frame;
-mod vpx;
-mod vpx_decode;
 
 pub use client::{RtcCall, RtcClient, TokenFuture, TokenProvider};
 pub use coordinator::{

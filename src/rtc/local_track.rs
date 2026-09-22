@@ -43,15 +43,15 @@ use webrtc::track::track_local::TrackLocal;
 use webrtc::track::track_local::TrackLocalWriter;
 use webrtc::track::track_local::track_local_static_rtp::TrackLocalStaticRTP;
 
+use super::codecs::h264::{H264Encoder, validate_h264_encode_request};
+use super::codecs::rtp_h264::H264RtpPacketizer;
+use super::codecs::rtp_vpx::VpxRtpPacketizer;
+use super::codecs::vpx::{Vp9SvcMode, VpxCodec, VpxEncoder, VpxSvcEncoder};
 use super::error::{Result, RtcError};
-use super::h264::{H264Encoder, validate_h264_encode_request};
 use super::layers::{PlannedVideoLayer, simulcast_layers, single_layer};
 use super::pcm::{FRAME_SAMPLES_20MS, OPUS_SAMPLE_RATE, PcmFrame, StreamResampler, rms_i16};
 use super::proto::event::VideoLayerSetting;
 use super::proto::models::{PublishOption, TrackType, VideoLayer};
-use super::rtp_h264::H264RtpPacketizer;
-use super::rtp_vpx::VpxRtpPacketizer;
-use super::vpx::{Vp9SvcMode, VpxCodec, VpxEncoder, VpxSvcEncoder};
 
 /// A raw RTP packet (`webrtc::rtp::packet::Packet`), used by the RTP-forward
 /// republish path.
