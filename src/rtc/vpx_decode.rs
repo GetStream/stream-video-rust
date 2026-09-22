@@ -266,6 +266,55 @@ mod tests {
         round_trip(VpxCodec::Vp9, 322, 178);
     }
 
+    /// `copy_i420` documents that libvpx planes die at the next `decode` call,
+    /// so a frame handed out earlier must own its pixels.
+    #[test]
+    fn decoded_frames_survive_the_next_decode_call() {
+        let mut enc = VpxEncoder::new(VpxCodec::Vp9, 320, 240, 1_000).expect("encoder");
+        let mut dec = VpxDecoder::new(VpxCodec::Vp9).expect("decoder");
+        let source = ramp_i420(320, 240);
+
+        let mut held = Vec::new();
+        for packet in &enc.encode(&source, 0, 33, true).expect("encode key") {
+            held.extend(dec.decode(&packet.data, 1).expect("decode key"));
+        }
+        assert!(!held.is_empty(), "keyframe produced no frame");
+
+        for packet in &enc.encode(&source, 33, 33, false).expect("encode delta") {
+            dec.decode(&packet.data, 2).expect("decode delta");
+        }
+
+        let frame = &held[0];
+        let w = 320;
+        let y = &frame.data[..w * 240];
+        assert_eq!(frame.rtp_timestamp, 1);
+        assert!(
+            y[0] < 40 && y[w - 1] > 215,
+            "the held frame lost its ramp after a later decode"
+        );
+    }
+
+    /// `copy_i420` reads the dimensions off each image, so one decoder must
+    /// follow a stream whose resolution changes.
+    #[test]
+    fn decoder_follows_a_resolution_change() {
+        let mut dec = VpxDecoder::new(VpxCodec::Vp9).expect("decoder");
+        let mut sizes = Vec::new();
+
+        for (width, height) in [(320u32, 240u32), (160, 120)] {
+            let mut enc = VpxEncoder::new(VpxCodec::Vp9, width, height, 800).expect("encoder");
+            let source = ramp_i420(width, height);
+            for packet in &enc.encode(&source, 0, 33, true).expect("encode") {
+                for frame in dec.decode(&packet.data, 0).expect("decode") {
+                    assert_eq!(frame.data.len(), i420_len(frame.width, frame.height));
+                    sizes.push((frame.width, frame.height));
+                }
+            }
+        }
+
+        assert_eq!(sizes, vec![(320, 240), (160, 120)]);
+    }
+
     #[test]
     fn empty_input_yields_no_frames() {
         let mut dec = VpxDecoder::new(VpxCodec::Vp9).expect("decoder");

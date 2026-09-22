@@ -239,20 +239,21 @@ impl VpxEncoder {
                 ),
                 "enc_init",
             )?;
-            let mut ctx = ctx.assume_init();
+            let ctx = ctx.assume_init();
+            let mut encoder = Self { ctx, width, height };
 
             // Fastest realtime speed setting (CPUUSED is 0..=9 for VP9, higher is
             // faster / lower quality — fine for a solid backend frame).
             check(
-                vpx_codec_control_(&mut ctx, VP8E_SET_CPUUSED as c_int, 8 as c_int),
+                vpx_codec_control_(&mut encoder.ctx, VP8E_SET_CPUUSED as c_int, 8 as c_int),
                 "set_cpuused",
             )?;
             if codec == VpxCodec::Vp9 {
                 // Row-based multithreading; ignore errors on builds without it.
-                let _ = vpx_codec_control_(&mut ctx, VP9E_SET_ROW_MT as c_int, 1 as c_int);
+                let _ = vpx_codec_control_(&mut encoder.ctx, VP9E_SET_ROW_MT as c_int, 1 as c_int);
             }
 
-            Ok(Self { ctx, width, height })
+            Ok(encoder)
         }
     }
 
@@ -726,6 +727,61 @@ mod tests {
                 assert!(frames.iter().all(|frame| frame.temporal_id == 0));
             }
         }
+    }
+
+    /// `unsafe impl Send` claims a libvpx context is not pinned to the thread
+    /// that created it. Build here, encode there.
+    #[test]
+    fn encoder_built_on_one_thread_encodes_on_another() {
+        let mut encoder = VpxEncoder::new(VpxCodec::Vp9, 160, 120, 400).expect("vp9 encoder");
+        let input = blue_i420(160, 120);
+
+        let frames = std::thread::spawn(move || encoder.encode(&input, 0, 33, true))
+            .join()
+            .expect("encoder thread panicked")
+            .expect("encode");
+
+        assert!(
+            frames
+                .iter()
+                .any(|frame| frame.key && !frame.data.is_empty())
+        );
+    }
+
+    /// The SVC callback's `user_priv` points into a boxed buffer, so relocating
+    /// the encoder after registration must not invalidate it. The second push
+    /// reallocates the `Vec` and moves the first encoder to a new address.
+    #[test]
+    fn vp9_svc_encoder_encodes_after_being_relocated() {
+        let mode = Vp9SvcMode::new(2, 1).expect("L2T1 mode");
+        let input = blue_i420(160, 120);
+        let mut encoders = vec![VpxSvcEncoder::new(160, 120, 500, mode).expect("VP9 SVC encoder")];
+        encoders.push(VpxSvcEncoder::new(160, 120, 500, mode).expect("VP9 SVC encoder"));
+
+        let frames = encoders[0].encode(&input, 0, 33, true).expect("encode");
+
+        assert_eq!(frames.len(), 2);
+        assert!(frames.iter().all(|frame| !frame.data.is_empty()));
+    }
+
+    /// A size that does not divide by four leaves libvpx to round each spatial
+    /// layer itself. Every reported layer must still be usable.
+    #[test]
+    fn vp9_svc_reports_usable_dimensions_for_odd_sizes() {
+        let mode = Vp9SvcMode::new(3, 1).expect("L3T1 mode");
+        let mut encoder = VpxSvcEncoder::new(322, 178, 900, mode).expect("VP9 SVC encoder");
+        let input = blue_i420(322, 178);
+
+        let frames = encoder.encode(&input, 0, 33, true).expect("encode");
+
+        assert_eq!(frames.len(), 3);
+        let top = frames.last().expect("top spatial layer");
+        assert_eq!((top.width, top.height), (322, 178));
+        assert!(
+            frames
+                .iter()
+                .all(|frame| frame.width > 0 && frame.height > 0 && !frame.data.is_empty())
+        );
     }
 
     #[test]
