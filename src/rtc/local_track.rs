@@ -321,7 +321,7 @@ struct AudioInner {
     /// Resampled 48 kHz mono PCM awaiting the 20 ms pacer.
     pcm: StdMutex<VecDeque<i16>>,
     resampler: StdMutex<StreamResampler>,
-    encoder: StdMutex<super::opus::Encoder>,
+    encoder: StdMutex<opus::Encoder>,
     pacer: StdMutex<Option<JoinHandle<()>>>,
     pacer_started: AtomicBool,
     pcm_pacing: AtomicBool,
@@ -350,7 +350,12 @@ impl LocalAudioTrack {
         };
         let track_id = format!("audio-{}", uuid::Uuid::new_v4().simple());
         let core = TrackCore::new(codec, track_id, "stream-rust-audio".to_owned())?;
-        let encoder = super::opus::Encoder::new_voip_mono().map_err(RtcError::Media)?;
+        let encoder = opus::Encoder::new(
+            OPUS_SAMPLE_RATE,
+            opus::Channels::Mono,
+            opus::Application::Voip,
+        )
+        .map_err(|error| RtcError::Media(error.to_string()))?;
         Ok(Self {
             inner: Arc::new(AudioInner {
                 core,
@@ -601,12 +606,10 @@ fn push_bounded_pcm(queue: &mut VecDeque<i16>, samples: Vec<i16>) -> usize {
     overflow
 }
 
-fn encode_opus_into(
-    encoder: &mut super::opus::Encoder,
-    pcm: &[i16],
-    output: &mut [u8],
-) -> Result<usize> {
-    encoder.encode(pcm, output).map_err(RtcError::Media)
+fn encode_opus_into(encoder: &mut opus::Encoder, pcm: &[i16], output: &mut [u8]) -> Result<usize> {
+    encoder
+        .encode(pcm, output)
+        .map_err(|error| RtcError::Media(error.to_string()))
 }
 
 // Video
@@ -1914,6 +1917,42 @@ impl LocalTrack {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn encode_opus_into_produces_a_packet_for_a_20ms_mono_frame() {
+        let mut encoder = opus::Encoder::new(
+            OPUS_SAMPLE_RATE,
+            opus::Channels::Mono,
+            opus::Application::Voip,
+        )
+        .expect("encoder");
+        let pcm = vec![1_000i16; FRAME_SAMPLES_20MS];
+        let mut output = vec![0u8; 1_500];
+
+        let length = encode_opus_into(&mut encoder, &pcm, &mut output).expect("encode");
+
+        assert!(
+            length > 0 && length <= output.len(),
+            "packet length {length}"
+        );
+    }
+
+    #[test]
+    fn encode_opus_into_rejects_a_bogus_frame_size() {
+        let mut encoder = opus::Encoder::new(
+            OPUS_SAMPLE_RATE,
+            opus::Channels::Mono,
+            opus::Application::Voip,
+        )
+        .expect("encoder");
+        let mut output = vec![0u8; 1_500];
+
+        // 137 samples is not a valid 48 kHz Opus frame size.
+        let error = encode_opus_into(&mut encoder, &vec![0i16; 137], &mut output)
+            .expect_err("bogus frame size must be rejected");
+
+        assert!(matches!(error, RtcError::Media(_)), "error was: {error}");
+    }
 
     #[tokio::test]
     async fn opus_track_builds_and_writes_sample() {

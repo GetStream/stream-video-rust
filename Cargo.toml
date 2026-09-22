@@ -12,6 +12,7 @@ homepage = "https://getstream.io/video/"
 documentation = "https://docs.rs/getstream"
 keywords = ["video", "webrtc", "sfu", "stream", "rtc"]
 categories = ["api-bindings", "multimedia::video", "network-programming"]
+
 # A published crate's own `.cargo/config.toml` is never read by Cargo (config is
 # discovered from the *consumer's* directory tree), so it is deliberately absent
 # from this list — see the note above `[dependencies]`.
@@ -44,15 +45,13 @@ rustdoc-args = ["--cfg", "docsrs", "--generate-link-to-definition"]
 # system dependency (libvpx) and the vendored-opus build tools.
 
 [dependencies]
-# Opus encode/decode for the audio media path. `opusic-sys` is a maintained
-# libopus binding (tracks libopus 1.6.1) that bundles + static-links a *vendored*
-# libopus, so the SDK build needs no system libopus at link or runtime. It
-# replaces the unmaintained `audiopus_sys` (RUSTSEC-2026-0150); see
-# `src/rtc/opus.rs` for the thin safe wrapper. The bundled CMake build needs
-# `cmake` and a C compiler on PATH and nothing else: its `CMakeLists.txt`
-# declares `cmake_minimum_required(VERSION 3.16)`, which satisfies CMake 4's
+# Opus encode/decode for the audio media path. A safe wrapper over `opusic-sys`,
+# which bundles + static-links a *vendored* libopus, so the SDK build needs no
+# system libopus at link or runtime. The bundled CMake build needs `cmake` and a
+# C compiler on PATH and nothing else: its `CMakeLists.txt` declares
+# `cmake_minimum_required(VERSION 3.16)`, which satisfies CMake 4's
 # minimum-policy floor without any build-time environment override.
-opusic-sys = "0.7.4"
+opus = "0.4"
 base64 = "0.23.1"
 bytes = "1.12.1"
 futures-util = "0.3.34"
@@ -86,9 +85,6 @@ flate2 = "1.1.9"
 openh264 = "=0.8.1"
 
 [dev-dependencies]
-# Example-only convenience for the two executable demos. OpenAI-specific bridge
-# orchestration stays in `examples/gpt_realtime_bot.rs`; `tokio` here adds the
-# runtime and signal features used only by the examples.
 anyhow = "1.0.86"
 criterion = "0.8.2"
 dotenvy = "0.15.7"

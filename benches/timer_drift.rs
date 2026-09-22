@@ -2,10 +2,6 @@
 
 use std::time::Duration;
 
-#[allow(dead_code)]
-#[path = "../src/rtc/opus.rs"]
-mod opus;
-
 const PERIOD: Duration = Duration::from_millis(20);
 const TICKS: usize = 500;
 
@@ -26,7 +22,9 @@ async fn measure_timer_drift() {
             (12_000.0 * (std::f64::consts::TAU * 440.0 * time).sin()) as i16
         })
         .collect();
-    let mut encoder = opus::Encoder::new_voip_mono().expect("create Opus encoder");
+    let mut encoder =
+        opus::Encoder::new(sample_rate, opus::Channels::Mono, opus::Application::Voip)
+            .expect("create Opus encoder");
     let mut encoded = vec![0u8; 1_500];
 
     let mut interval = tokio::time::interval(PERIOD);

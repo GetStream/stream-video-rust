@@ -29,7 +29,6 @@ pub mod identity;
 pub mod join;
 mod layers;
 pub mod local_track;
-mod opus;
 pub mod pcm;
 pub mod peer;
 pub mod proto;
