@@ -98,6 +98,109 @@ async fn wait_for(timeout: Duration, mut predicate: impl FnMut() -> bool, descri
     .unwrap_or_else(|_| panic!("timed out waiting for {description}"));
 }
 
+/// A local SFU WebSocket. It sends each received request to the channel. The
+/// channel closes when the client socket closes. With `answer_join`, it answers
+/// the `JoinRequest`.
+async fn fake_sfu(
+    answer_join: bool,
+) -> (
+    Credentials,
+    tokio::sync::mpsc::UnboundedReceiver<event::SfuRequest>,
+) {
+    use futures_util::{SinkExt, StreamExt};
+    use prost::Message as _;
+    use tokio_tungstenite::tungstenite::Message;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind fake SFU");
+    let address = listener.local_addr().expect("fake SFU address");
+    let (requests, received) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("accept SFU client");
+        let mut socket = tokio_tungstenite::accept_async(stream)
+            .await
+            .expect("SFU WebSocket handshake");
+        while let Some(Ok(message)) = socket.next().await {
+            let Message::Binary(bytes) = message else {
+                continue;
+            };
+            let request = event::SfuRequest::decode(bytes).expect("SFU request");
+            if answer_join
+                && matches!(
+                    request.request_payload,
+                    Some(event::sfu_request::RequestPayload::JoinRequest(_))
+                )
+            {
+                let response = SfuEvent {
+                    event_payload: Some(sfu_event::EventPayload::JoinResponse(
+                        JoinResponse::default(),
+                    )),
+                };
+                socket
+                    .send(Message::Binary(response.encode_to_vec().into()))
+                    .await
+                    .expect("send join response");
+            }
+            let _ = requests.send(request);
+        }
+    });
+    let credentials = Credentials {
+        server: coordinator::SfuServer {
+            edge_name: "fake-edge".to_owned(),
+            url: "http://127.0.0.1:9/twirp".to_owned(),
+            ws_endpoint: format!("ws://{address}/ws"),
+        },
+        token: "sfu-token".to_owned(),
+        ice_servers: Vec::new(),
+    };
+    (credentials, received)
+}
+
+/// Every request the fake SFU received until the client socket closed.
+async fn requests_until_close(
+    mut received: tokio::sync::mpsc::UnboundedReceiver<event::SfuRequest>,
+) -> Vec<event::SfuRequest> {
+    tokio::time::timeout(Duration::from_secs(2), async move {
+        let mut requests = Vec::new();
+        while let Some(request) = received.recv().await {
+            requests.push(request);
+        }
+        requests
+    })
+    .await
+    .expect("SFU socket closed")
+}
+
+fn alive_tasks() -> usize {
+    tokio::runtime::Handle::current()
+        .metrics()
+        .num_alive_tasks()
+}
+
+async fn establish_fake(
+    core: &Arc<RtcCore>,
+    generation: u64,
+) -> (
+    Connection,
+    tokio::sync::mpsc::UnboundedReceiver<event::SfuRequest>,
+) {
+    let (credentials, sfu) = fake_sfu(true).await;
+    let connection = core
+        .clone()
+        .establish(
+            &credentials,
+            0,
+            ReconnectStrategy::Fast,
+            None,
+            generation,
+            None,
+        )
+        .await
+        .expect("establish against fake SFU");
+    (connection, sfu)
+}
+
 fn preferred_codec(core: &RtcCore, generation: u64) -> Option<models::Codec> {
     core.preferred_publish_options(generation)
         .expect("current generation")
@@ -187,6 +290,137 @@ async fn leave_cancels_join_generation_and_allows_later_join() {
     let second = core.begin_join().expect("second generation");
     assert_ne!(first, second);
     assert_eq!(core.lifecycle_snapshot(), (CallingState::Joining, second));
+}
+
+#[tokio::test]
+async fn leave_tears_down_the_stored_connection() {
+    let core = test_core();
+    let generation = prepare_joined_core(&core, "alice");
+    let (connection, sfu) = establish_fake(&core, generation).await;
+    let (subscriber, publisher) = (connection.subscriber.clone(), connection.publisher.clone());
+    *core.connection.lock().await = Some(connection);
+
+    core.leave("test leave").await.expect("leave");
+
+    let requests = requests_until_close(sfu).await;
+    assert!(requests.iter().any(|request| matches!(
+        request.request_payload,
+        Some(event::sfu_request::RequestPayload::LeaveCallRequest(_))
+    )));
+    assert_eq!(
+        subscriber.connection_state(),
+        RTCPeerConnectionState::Closed
+    );
+    assert_eq!(publisher.connection_state(), RTCPeerConnectionState::Closed);
+    let (active, spawned, completed) = core.runtime_task_snapshot();
+    assert_eq!(active, 0);
+    assert_eq!(spawned, completed);
+}
+
+#[tokio::test]
+async fn leave_closes_a_connection_owned_by_a_cancelled_join() {
+    let core = test_core();
+    let generation = prepare_joined_core(&core, "alice");
+    let baseline = alive_tasks();
+    let (connection, sfu) = establish_fake(&core, generation).await;
+    let owner_core = core.clone();
+    let owner = tokio::spawn(async move {
+        owner_core
+            .while_generation(generation, async move {
+                let _connection = connection;
+                std::future::pending::<()>().await;
+            })
+            .await
+    });
+    tokio::task::yield_now().await;
+
+    core.leave("cancel join").await.expect("leave");
+
+    assert!(owner.await.expect("owner task").is_err());
+    requests_until_close(sfu).await;
+    wait_for(
+        Duration::from_secs(2),
+        || alive_tasks() == baseline,
+        "cancelled connection cleanup",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn failed_establish_leaves_no_background_tasks() {
+    let core = test_core();
+    let generation = prepare_joined_core(&core, "alice");
+    core.join_data
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .join_response_timeout = Duration::from_millis(50);
+    let baseline = alive_tasks();
+    let (credentials, sfu) = fake_sfu(false).await;
+
+    let result = core
+        .clone()
+        .establish(
+            &credentials,
+            0,
+            ReconnectStrategy::Fast,
+            None,
+            generation,
+            None,
+        )
+        .await;
+
+    assert!(matches!(result, Err(RtcError::Timeout(_))));
+    requests_until_close(sfu).await;
+    wait_for(
+        Duration::from_secs(2),
+        || alive_tasks() == baseline,
+        "failed establish cleanup",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn leave_during_establish_leaves_no_background_tasks() {
+    let core = test_core();
+    let generation = prepare_joined_core(&core, "alice");
+    let baseline = alive_tasks();
+    let (credentials, mut sfu) = fake_sfu(false).await;
+    let owner_core = core.clone();
+    let owner = tokio::spawn(async move {
+        owner_core
+            .while_generation(
+                generation,
+                owner_core.clone().establish(
+                    &credentials,
+                    0,
+                    ReconnectStrategy::Fast,
+                    None,
+                    generation,
+                    None,
+                ),
+            )
+            .await
+            .map(|_| ())
+    });
+    let join_request = tokio::time::timeout(Duration::from_secs(2), sfu.recv())
+        .await
+        .expect("join request")
+        .expect("SFU socket open");
+    assert!(matches!(
+        join_request.request_payload,
+        Some(event::sfu_request::RequestPayload::JoinRequest(_))
+    ));
+
+    core.leave("cancel establish").await.expect("leave");
+
+    assert!(owner.await.expect("owner task").is_err());
+    requests_until_close(sfu).await;
+    wait_for(
+        Duration::from_secs(2),
+        || alive_tasks() == baseline,
+        "cancelled establish cleanup",
+    )
+    .await;
 }
 
 #[tokio::test]

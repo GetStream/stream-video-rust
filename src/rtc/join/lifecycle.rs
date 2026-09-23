@@ -630,7 +630,7 @@ impl RtcCore {
             reconnect_enabled,
             signal_tasks: vec![event_loop, ping_loop],
             publisher_tasks: Vec::new(),
-            stats_task: stats_loop,
+            stats_task: Some(stats_loop),
         })
     }
 }

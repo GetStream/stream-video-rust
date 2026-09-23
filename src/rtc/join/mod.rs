@@ -297,7 +297,7 @@ struct Connection {
     signal_tasks: Vec<JoinHandle<()>>,
     /// RTCP readers belong to the publisher PC and survive FAST reconnect.
     publisher_tasks: Vec<JoinHandle<()>>,
-    stats_task: JoinHandle<()>,
+    stats_task: Option<JoinHandle<()>>,
 }
 
 #[derive(Default)]
@@ -429,10 +429,27 @@ impl Connection {
         self.stats.flush().await;
         let mut tasks = std::mem::take(&mut self.signal_tasks);
         tasks.append(&mut self.publisher_tasks);
-        tasks.push(self.stats_task);
+        tasks.extend(self.stats_task.take());
         abort_tasks(tasks).await;
         let _ = self.subscriber.close().await;
         let _ = self.publisher.close().await;
+    }
+}
+
+impl Drop for Connection {
+    /// Stops the tasks when a cancelled future drops the connection before
+    /// `teardown`. The tasks own the PeerConnections, so this also drops them.
+    fn drop(&mut self) {
+        self.reconnect_enabled.store(false, Ordering::SeqCst);
+        self.stats.stop();
+        for task in self
+            .signal_tasks
+            .iter()
+            .chain(&self.publisher_tasks)
+            .chain(&self.stats_task)
+        {
+            task.abort();
+        }
     }
 }
 
