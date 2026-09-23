@@ -496,6 +496,69 @@ async fn leave_during_establish_leaves_no_background_tasks() {
 }
 
 #[tokio::test]
+async fn leave_that_overlaps_a_new_join_keeps_the_new_join_state() {
+    let core = test_core();
+    prepare_joined_core(&core, "alice");
+    core.leave("first leave").await.expect("first leave");
+    let connection_slot = core.connection.lock().await;
+    let cancelled = core.generation();
+    let leave_core = core.clone();
+    let leave = tokio::spawn(async move { leave_core.leave("second leave").await });
+    wait_for(
+        Duration::from_secs(1),
+        || core.generation() != cancelled,
+        "second leave cancels its generation",
+    )
+    .await;
+
+    let second = prepare_joined_core(&core, "alice");
+    *core
+        .coordinator_connection_id
+        .lock()
+        .unwrap_or_else(|error| error.into_inner()) = Some((second, "connection-2".to_owned()));
+    assert!(core.apply_join_call_state_if_current(second, "session-2", "alice", None));
+    assert!(core.claim_reconnect(second));
+    drop(connection_slot);
+    leave.await.expect("leave task").expect("second leave");
+
+    assert_eq!(core.state(), CallingState::Joined);
+    assert!(core.user_auth().is_some());
+    assert!(
+        core.participants
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .contains_key("session-2")
+    );
+    assert_eq!(core.active_reconnect_generation(), Some(second));
+}
+
+#[tokio::test]
+async fn stale_coordinator_stop_keeps_the_current_coordinator() {
+    let (base_url, coordinator) = fake_coordinator().await;
+    let core = test_core_with_config(ClientConfig {
+        base_url,
+        ..ClientConfig::default()
+    });
+    let first = prepare_joined_core(&core, "alice");
+    core.leave("cancel first join").await.expect("leave");
+    let second = prepare_joined_core(&core, "alice");
+    let token = core.current_user_token().expect("user token");
+    core.connect_coordinator_events(second, &token, "alice")
+        .await
+        .expect("coordinator events");
+
+    core.stop_coordinator_events(first).await;
+
+    assert!(core.user_auth().is_some());
+    assert!(!coordinator.is_finished());
+    core.leave("cleanup").await.expect("cleanup leave");
+    tokio::time::timeout(Duration::from_secs(2), coordinator)
+        .await
+        .expect("coordinator socket closed")
+        .expect("fake coordinator task");
+}
+
+#[tokio::test]
 async fn forced_strategy_failures_reach_timeout_and_refresh_over_http() {
     for strategy in [
         ReconnectStrategy::Fast,

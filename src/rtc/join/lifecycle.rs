@@ -54,7 +54,7 @@ impl RtcCore {
             .await
             .and_then(|result| result)
         {
-            self.stop_coordinator_events().await;
+            self.stop_coordinator_events(generation).await;
             self.set_state_if_current(generation, CallingState::Idle);
             return Err(error);
         }
@@ -64,7 +64,7 @@ impl RtcCore {
             .await
             .and_then(|result| result);
         if result.is_err() {
-            self.stop_coordinator_events().await;
+            self.stop_coordinator_events(generation).await;
             // Restore to a non-joining terminal state so a retry is allowed.
             if self.state() == CallingState::Joining {
                 self.set_state_if_current(generation, CallingState::Idle);
@@ -662,28 +662,34 @@ impl RtcCore {
             }
             connection.teardown().await;
         }
-        self.participants
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clear();
-        *self
-            .call_state
-            .lock()
-            .unwrap_or_else(|error| error.into_inner()) = CallStateCache::default();
-        self.active_subs
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clear();
-        self.own_capabilities
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clear();
-        *self
-            .reconnect_generation
-            .lock()
-            .unwrap_or_else(|e| e.into_inner()) = None;
+        {
+            // A join that started during the awaits above owns these fields.
+            let lifecycle = self.lifecycle.lock().unwrap_or_else(|e| e.into_inner());
+            if lifecycle.generation == generation {
+                self.participants
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clear();
+                *self
+                    .call_state
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner()) = CallStateCache::default();
+                self.active_subs
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clear();
+                self.own_capabilities
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clear();
+                *self
+                    .reconnect_generation
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()) = None;
+            }
+        }
         self.set_state_if_current(generation, CallingState::Left);
-        self.stop_coordinator_events().await;
+        self.stop_coordinator_events(generation).await;
         Ok(())
     }
 }
@@ -867,15 +873,27 @@ impl RtcCore {
         abort_tasks(tasks).await;
     }
 
-    pub(super) async fn stop_coordinator_events(&self) {
-        *self
-            .coordinator_connection_id
-            .lock()
-            .unwrap_or_else(|error| error.into_inner()) = None;
-        self.user_token
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .clear();
-        self.stop_coordinator_tasks().await;
+    /// Does nothing when `generation` is stale: the fields belong to a newer join.
+    pub(super) async fn stop_coordinator_events(&self, generation: u64) {
+        let tasks = {
+            let lifecycle = self.lifecycle.lock().unwrap_or_else(|e| e.into_inner());
+            if lifecycle.generation != generation {
+                return;
+            }
+            *self
+                .coordinator_connection_id
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()) = None;
+            self.user_token
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .clear();
+            self.coordinator_tasks
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .drain(..)
+                .collect()
+        };
+        abort_tasks(tasks).await;
     }
 }
