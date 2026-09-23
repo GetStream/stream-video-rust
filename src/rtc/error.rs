@@ -422,6 +422,28 @@ mod tests {
     use super::*;
 
     #[test]
+    fn from_signal_error_maps_only_real_codes() {
+        // UNSPECIFIED (and absent) is success.
+        assert!(RtcError::from_signal_error(None).is_ok());
+        assert!(
+            RtcError::from_signal_error(Some(models::Error {
+                code: models::ErrorCode::Unspecified as i32,
+                message: String::new(),
+                should_retry: false,
+            }))
+            .is_ok()
+        );
+        // A real code becomes an error.
+        let err = RtcError::from_signal_error(Some(models::Error {
+            code: models::ErrorCode::ParticipantSignalLost as i32,
+            message: "boom".to_owned(),
+            should_retry: true,
+        }))
+        .expect_err("should be an error");
+        assert!(matches!(err, RtcError::Signal { .. }));
+    }
+
+    #[test]
     fn join_error_codes_match_sfu() {
         assert!(is_join_error_code(ErrorCode::SfuFull as i32));
         assert!(is_join_error_code(ErrorCode::SfuShuttingDown as i32));
