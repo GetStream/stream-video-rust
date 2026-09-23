@@ -43,15 +43,15 @@ use webrtc::track::track_local::TrackLocal;
 use webrtc::track::track_local::TrackLocalWriter;
 use webrtc::track::track_local::track_local_static_rtp::TrackLocalStaticRTP;
 
-use super::codecs::h264::{H264Encoder, validate_h264_encode_request};
-use super::codecs::rtp_h264::H264RtpPacketizer;
-use super::codecs::rtp_vpx::VpxRtpPacketizer;
-use super::codecs::vpx::{Vp9SvcMode, VpxCodec, VpxEncoder, VpxSvcEncoder};
-use super::error::{Result, RtcError};
 use super::layers::{PlannedVideoLayer, simulcast_layers, single_layer};
-use super::pcm::{FRAME_SAMPLES_20MS, OPUS_SAMPLE_RATE, PcmFrame, StreamResampler, rms_i16};
-use super::proto::event::VideoLayerSetting;
-use super::proto::models::{PublishOption, TrackType, VideoLayer};
+use crate::rtc::codecs::h264::{H264Encoder, validate_h264_encode_request};
+use crate::rtc::codecs::rtp_h264::H264RtpPacketizer;
+use crate::rtc::codecs::rtp_vpx::VpxRtpPacketizer;
+use crate::rtc::codecs::vpx::{Vp9SvcMode, VpxCodec, VpxEncoder, VpxSvcEncoder};
+use crate::rtc::error::{Result, RtcError};
+use crate::rtc::pcm::{FRAME_SAMPLES_20MS, OPUS_SAMPLE_RATE, PcmFrame, StreamResampler, rms_i16};
+use crate::rtc::proto::event::VideoLayerSetting;
+use crate::rtc::proto::models::{PublishOption, TrackType, VideoLayer};
 
 /// A raw RTP packet (`webrtc::rtp::packet::Packet`), used by the RTP-forward
 /// republish path.
@@ -908,7 +908,7 @@ impl LocalVideoTrack {
                 mime_type: MIME_TYPE_H264.to_owned(),
                 clock_rate: 90_000,
                 channels: 0,
-                sdp_fmtp_line: super::publish_options::H264_FMTP.to_owned(),
+                sdp_fmtp_line: crate::rtc::publish_options::H264_FMTP.to_owned(),
                 rtcp_feedback: vec![],
             },
             VideoCodec::H264,
@@ -1992,6 +1992,7 @@ impl LocalTrack {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::rtc::proto::models::{Codec, VideoDimension};
 
     /// One 20 ms frame of 440 Hz tone: FEC and DTX both key off whether the
     /// frame carries signal, so silence would not exercise either.
@@ -2290,7 +2291,7 @@ mod tests {
         PublishOption {
             id: 41,
             track_type: track_type as i32,
-            codec: Some(super::super::proto::models::Codec {
+            codec: Some(Codec {
                 name: codec.to_owned(),
                 ..Default::default()
             }),
@@ -2298,7 +2299,7 @@ mod tests {
             fps: 30,
             max_spatial_layers: 3,
             max_temporal_layers: 3,
-            video_dimension: Some(super::super::proto::models::VideoDimension {
+            video_dimension: Some(VideoDimension {
                 width: 1280,
                 height: 720,
             }),
@@ -2494,7 +2495,7 @@ mod tests {
     fn vp9_svc_reconfiguration_preserves_rtp_counters_and_emits_new_ss() {
         let track = LocalVideoTrack::vp9_svc().expect("VP9 SVC");
         let mut option = layered_option(TrackType::Video, "VP9");
-        option.video_dimension = Some(super::super::proto::models::VideoDimension {
+        option.video_dimension = Some(VideoDimension {
             width: 320,
             height: 240,
         });

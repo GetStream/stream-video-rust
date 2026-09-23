@@ -16,10 +16,10 @@ use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
 use webrtc::peer_connection::signaling_state::RTCSignalingState;
 
 use crate::rtc::error::{NegotiationError, Result, RtcError};
-use crate::rtc::local_track::LocalTrack;
 use crate::rtc::proto::models::{PublishOption, TrackInfo, TrackType};
 use crate::rtc::proto::signal::SetPublisherRequest;
 use crate::rtc::sfu::signal::SignalClient;
+use crate::rtc::tracks::LocalTrack;
 
 /// Renegotiate the publisher PeerConnection with the SFU for `tracks`.
 ///
@@ -297,10 +297,10 @@ pub(crate) async fn build_track_infos(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::rtc::local_track::{LocalVideoTrack, LocalVideoTrackConfig};
     use crate::rtc::peer;
     use crate::rtc::proto::event::VideoLayerSetting;
     use crate::rtc::proto::models::{Codec, VideoDimension};
+    use crate::rtc::tracks::{LocalVideoTrack, LocalVideoTrackConfig};
 
     fn video_option(name: &str) -> PublishOption {
         PublishOption {

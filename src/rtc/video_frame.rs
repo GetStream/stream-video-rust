@@ -1,8 +1,8 @@
 //! Decoded video frames ([`VideoFrame`]) produced by
-//! [`RemoteTrack::next_video_frame`](super::remote_track::RemoteTrack::next_video_frame).
+//! [`RemoteTrack::next_video_frame`](crate::rtc::RemoteTrack::next_video_frame).
 //!
 //! Frames are packed I420 (YUV 4:2:0 planar) — the same layout
-//! [`LocalVideoTrack::write_i420`](super::local_track::LocalVideoTrack::write_i420)
+//! [`LocalVideoTrack::write_i420`](crate::rtc::LocalVideoTrack::write_i420)
 //! consumes, so a decode → transform → re-encode bridge needs no conversion in
 //! between.
 //!

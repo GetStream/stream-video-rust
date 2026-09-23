@@ -1,7 +1,7 @@
 //! Minimal libvpx VP8/VP9 encoder and decoder for the outbound and inbound
 //! video paths.
 //!
-//! [`LocalVideoTrack`](crate::rtc::local_track::LocalVideoTrack) needs to turn raw
+//! [`LocalVideoTrack`](crate::rtc::LocalVideoTrack) needs to turn raw
 //! I420 frames into encoded VP8/VP9 for the SFU. The `vpx-encode` crate is too
 //! restrictive for realtime streaming — it hardcodes the encoder config, so it
 //! cannot set `g_lag_in_frames = 0` (VP9 otherwise buffers frames and emits
@@ -10,7 +10,7 @@
 //! that late subscribers miss). This module binds `libvpx` directly (via
 //! `env-libvpx-sys`, exposed as `vpx_sys`) with the correct realtime config.
 //!
-//! [`RemoteTrack::next_video_frame`](crate::rtc::remote_track::RemoteTrack::next_video_frame)
+//! [`RemoteTrack::next_video_frame`](crate::rtc::RemoteTrack::next_video_frame)
 //! needs raw frames, not RTP: an agent that wants to *see* the call has to turn
 //! reassembled VP8/VP9 samples into pixels. The decoder symbols come from the
 //! same `env-libvpx-sys` bindings, so inbound video adds no new native

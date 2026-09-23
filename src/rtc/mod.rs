@@ -26,18 +26,16 @@ pub mod coordinator;
 pub mod error;
 pub mod identity;
 pub mod join;
-mod layers;
-pub mod local_track;
 pub mod pcm;
 pub mod peer;
 pub mod proto;
 mod publish_options;
 pub mod reconnect;
-pub mod remote_track;
 pub mod sfu;
 pub mod stats;
 pub mod subscriptions;
 pub mod tracer;
+mod tracks;
 pub mod video_frame;
 
 pub use client::{RtcCall, RtcClient, TokenFuture, TokenProvider};
@@ -53,10 +51,6 @@ pub use error::{
 };
 pub use identity::{CLIENT_TYPE, SDK_TYPE, client_details, client_header};
 pub use join::{CallEvent, CallStateSnapshot, CallingState, JoinCallData, RtcCore};
-pub use local_track::{
-    LocalAudioTrack, LocalAudioTrackConfig, LocalTrack, LocalVideoTrack, LocalVideoTrackConfig,
-    RtpPacket, VideoLayering, audio_level_dbov,
-};
 pub use pcm::chunk::Pad;
 pub use pcm::convert::G711_SAMPLE_RATE;
 pub use pcm::{
@@ -66,12 +60,16 @@ pub use publish_options::{ClientPublishOptions, PreferredVideoCodec};
 pub use reconnect::{
     DEFAULT_MAX_JOIN_RETRIES, JoinAttemptOutcome, ReconnectStrategy, retry_interval,
 };
-pub use remote_track::{Codec, RemoteParticipant, RemoteTrack};
 pub use sfu::signal::SignalClient;
 pub use sfu::ws::{SfuReceiver, SfuSender};
 pub use stats::{DEFAULT_REPORTING_INTERVAL_MS, reporting_interval};
 pub use subscriptions::{SubscriptionConfig, SubscriptionTarget};
 pub use tracer::{TraceRecord, Tracer};
+pub use tracks::{
+    Codec, LocalAudioTrack, LocalAudioTrackConfig, LocalTrack, LocalVideoTrack,
+    LocalVideoTrackConfig, RemoteParticipant, RemoteTrack, RtpPacket, VideoLayering,
+    audio_level_dbov,
+};
 pub use video_frame::VideoFrame;
 
 #[cfg(test)]

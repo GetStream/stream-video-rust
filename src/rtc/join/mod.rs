@@ -53,7 +53,6 @@ use super::coordinator::ws::{ConnectUserDetails, CoordinatorEvent, WsAuthMessage
 use super::coordinator::{self, Credentials, JoinCallRequest, StatsOptions};
 use super::error::{Result, RtcError, SfuJoinError, SfuTimeoutError};
 use super::identity;
-use super::local_track::LocalTrack;
 use super::peer::{self, PendingIce, negotiate_subscriber, publisher, register_ice_trickle};
 use super::proto::event::{self, JoinRequest, JoinResponse, ReconnectDetails, SfuEvent, sfu_event};
 use super::proto::models::{self, PeerType, TrackType};
@@ -63,12 +62,12 @@ use super::reconnect::{
     self, FailureCaps, ReconnectStrategy, SlidingWindowRateLimiter, escalate_strategy,
     strategy_after_signal_close,
 };
-use super::remote_track::{RemoteParticipant, RemoteTrack};
 use super::sfu::signal::SignalClient;
 use super::sfu::ws::{self, SfuReceiver, SfuSender};
 use super::stats::{self, StatsReporter, StatsReporterParts};
 use super::subscriptions::{SubscriptionConfig, SubscriptionTarget, TrackKey};
 use super::tracer::Tracer;
+use super::tracks::{LocalTrack, RemoteParticipant, RemoteTrack};
 
 use serde_json::json;
 

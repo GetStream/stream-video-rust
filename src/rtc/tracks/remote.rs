@@ -32,14 +32,14 @@ use webrtc::rtp::codecs::vp8::Vp8Packet;
 use webrtc::rtp::codecs::vp9::Vp9Packet;
 use webrtc::track::track_remote::TrackRemote;
 
-use super::codecs::h264::{H264Decoder, access_unit_has_idr};
-use super::codecs::rtp_h264::H264Depacketizer;
-use super::codecs::vpx::{VpxCodec, VpxDecoder};
-use super::error::{Result, RtcError};
-use super::local_track::RtpPacket;
-use super::pcm::{FRAME_SAMPLES_20MS, OPUS_SAMPLE_RATE, PcmFrame};
-use super::proto::models::{self, TrackType};
-use super::video_frame::VideoFrame;
+use super::local::RtpPacket;
+use crate::rtc::codecs::h264::{H264Decoder, access_unit_has_idr};
+use crate::rtc::codecs::rtp_h264::H264Depacketizer;
+use crate::rtc::codecs::vpx::{VpxCodec, VpxDecoder};
+use crate::rtc::error::{Result, RtcError};
+use crate::rtc::pcm::{FRAME_SAMPLES_20MS, OPUS_SAMPLE_RATE, PcmFrame};
+use crate::rtc::proto::models::{self, TrackType};
+use crate::rtc::video_frame::VideoFrame;
 
 /// How many packets the video [`SampleBuilder`] buffers while waiting for gaps
 /// to be filled (by NACK/RTX or a reordered arrival) before giving up on a
