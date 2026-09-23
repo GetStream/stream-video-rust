@@ -10,7 +10,7 @@ use crate::rtc::error::{NegotiationError, Result, RtcError};
 use crate::rtc::proto::event::SubscriberOffer;
 use crate::rtc::proto::models::PeerType;
 use crate::rtc::proto::signal;
-use crate::rtc::signal::SignalClient;
+use crate::rtc::sfu::signal::SignalClient;
 
 /// Answer an SFU subscriber offer and post the answer over Twirp.
 pub async fn negotiate_subscriber(

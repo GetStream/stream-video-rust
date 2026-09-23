@@ -19,7 +19,7 @@ use crate::rtc::error::{NegotiationError, Result, RtcError};
 use crate::rtc::local_track::LocalTrack;
 use crate::rtc::proto::models::{PublishOption, TrackInfo, TrackType};
 use crate::rtc::proto::signal::SetPublisherRequest;
-use crate::rtc::signal::SignalClient;
+use crate::rtc::sfu::signal::SignalClient;
 
 /// Renegotiate the publisher PeerConnection with the SFU for `tracks`.
 ///

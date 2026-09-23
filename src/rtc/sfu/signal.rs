@@ -24,10 +24,10 @@ use url::Url;
 
 use crate::client::DEFAULT_MAX_RESPONSE_BODY_BYTES;
 
-use super::error::{Result, RtcError, TwirpError};
-use super::identity;
-use super::proto::{models, signal};
-use super::tracer::Tracer;
+use crate::rtc::error::{Result, RtcError, TwirpError};
+use crate::rtc::identity;
+use crate::rtc::proto::{models, signal};
+use crate::rtc::tracer::Tracer;
 
 /// Fully-qualified Twirp service name (`package.Service`).
 const SERVICE: &str = "stream.video.sfu.signal.SignalServer";

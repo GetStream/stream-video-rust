@@ -8,7 +8,7 @@ use webrtc::peer_connection::RTCPeerConnection;
 
 use crate::rtc::error::Result;
 use crate::rtc::proto::models::{self, PeerType};
-use crate::rtc::signal::SignalClient;
+use crate::rtc::sfu::signal::SignalClient;
 use crate::rtc::tracer::Tracer;
 
 /// Buffers remote ICE candidates that arrive before a PeerConnection's remote

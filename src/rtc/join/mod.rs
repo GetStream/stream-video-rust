@@ -64,8 +64,8 @@ use super::reconnect::{
     strategy_after_signal_close,
 };
 use super::remote_track::{RemoteParticipant, RemoteTrack};
-use super::sfu_ws::{self, SfuReceiver, SfuSender};
-use super::signal::SignalClient;
+use super::sfu::signal::SignalClient;
+use super::sfu::ws::{self, SfuReceiver, SfuSender};
 use super::stats::{self, StatsReporter, StatsReporterParts};
 use super::subscriptions::{SubscriptionConfig, SubscriptionTarget, TrackKey};
 use super::tracer::Tracer;

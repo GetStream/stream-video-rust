@@ -2,8 +2,8 @@
 //! Cargo feature.
 //!
 //! The wire layer holds the generated protobuf types ([`proto`]), the Twirp
-//! signal client ([`signal`]), the SFU protobuf WebSocket ([`sfu_ws`]), and the
-//! coordinator auth WebSocket ([`coordinator_ws`]).
+//! signal client ([`sfu::signal`]), the SFU protobuf WebSocket ([`sfu::ws`]), and
+//! the coordinator auth WebSocket ([`coordinator_ws`]).
 //!
 //! The participant layer sits on top: the [`coordinator`] join REST, dual
 //! publisher/subscriber PeerConnections ([`peer`]), and the [`join`] state
@@ -14,8 +14,8 @@
 //!
 //! # Stability
 //!
-//! The wire-layer modules — [`proto`], [`peer`], [`sfu_ws`], [`signal`],
-//! [`tracer`], and [`coordinator_ws`] — mirror Stream's SFU
+//! The wire-layer modules — [`proto`], [`peer`], [`sfu`], [`tracer`], and
+//! [`coordinator_ws`] — mirror Stream's SFU
 //! protocol and change with it. They are exempt from this crate's compatibility
 //! guarantees at any version bump. Prefer [`crate::Call`], [`RtcClient`], and
 //! the re-exports below, which are covered by the crate's semver policy.
@@ -35,8 +35,7 @@ pub mod proto;
 mod publish_options;
 pub mod reconnect;
 pub mod remote_track;
-pub mod sfu_ws;
-pub mod signal;
+pub mod sfu;
 pub mod stats;
 pub mod subscriptions;
 pub mod tracer;
@@ -69,8 +68,8 @@ pub use reconnect::{
     DEFAULT_MAX_JOIN_RETRIES, JoinAttemptOutcome, ReconnectStrategy, retry_interval,
 };
 pub use remote_track::{Codec, RemoteParticipant, RemoteTrack};
-pub use sfu_ws::{SfuReceiver, SfuSender};
-pub use signal::SignalClient;
+pub use sfu::signal::SignalClient;
+pub use sfu::ws::{SfuReceiver, SfuSender};
 pub use stats::{DEFAULT_REPORTING_INTERVAL_MS, reporting_interval};
 pub use subscriptions::{SubscriptionConfig, SubscriptionTarget};
 pub use tracer::{TraceRecord, Tracer};
