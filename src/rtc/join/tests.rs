@@ -234,6 +234,22 @@ async fn establish_fake(
     (connection, sfu)
 }
 
+/// The event loop context of `connection` after a migration detached it.
+fn detached_context(core: &Arc<RtcCore>, connection: &Connection) -> EventLoopContext {
+    connection.reconnect_enabled.store(false, Ordering::SeqCst);
+    EventLoopContext {
+        core: core.clone(),
+        subscriber: connection.subscriber.clone(),
+        publisher: connection.publisher.clone(),
+        signal: connection.signal.clone(),
+        session_id: connection.session_id.clone(),
+        pending_ice: connection.pending_ice.clone(),
+        generation: connection.generation,
+        ws_healthy: connection.ws_healthy.clone(),
+        reconnect_enabled: connection.reconnect_enabled.clone(),
+    }
+}
+
 fn preferred_codec(core: &RtcCore, generation: u64) -> Option<models::Codec> {
     core.preferred_publish_options(generation)
         .expect("current generation")
@@ -556,6 +572,60 @@ async fn stale_coordinator_stop_keeps_the_current_coordinator() {
         .await
         .expect("coordinator socket closed")
         .expect("fake coordinator task");
+}
+
+#[tokio::test]
+async fn detached_connection_ignores_publish_options_from_its_sfu() {
+    let core = test_core();
+    let generation = prepare_joined_core(&core, "alice");
+    let (old, _old_sfu) = establish_fake(&core, generation).await;
+    let (current, _sfu) = establish_fake(&core, generation).await;
+    *core.connection.lock().await = Some(current);
+    let context = detached_context(&core, &old);
+
+    connection::handle_event(
+        &context,
+        sfu_event::EventPayload::ChangePublishOptions(event::ChangePublishOptions {
+            publish_options: vec![models::PublishOption {
+                id: 99,
+                ..Default::default()
+            }],
+            reason: "old SFU".to_owned(),
+        }),
+    )
+    .await
+    .expect("handle event");
+
+    let connection = core.connection.lock().await;
+    assert!(
+        connection
+            .as_ref()
+            .expect("current connection")
+            .publish_options
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn detached_connection_still_completes_the_migration() {
+    let core = test_core();
+    let generation = prepare_joined_core(&core, "alice");
+    let (old, _old_sfu) = establish_fake(&core, generation).await;
+    let context = detached_context(&core, &old);
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    core.install_migration_waiter(generation, sender)
+        .expect("migration waiter");
+
+    connection::handle_event(
+        &context,
+        sfu_event::EventPayload::ParticipantMigrationComplete(
+            event::ParticipantMigrationComplete {},
+        ),
+    )
+    .await
+    .expect("handle event");
+
+    receiver.await.expect("migration complete");
 }
 
 #[tokio::test]

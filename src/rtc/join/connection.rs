@@ -220,6 +220,20 @@ pub(super) async fn handle_event(
         return Ok(());
     }
     use sfu_event::EventPayload as E;
+    // During a migration the old SFU still sends events. Its WebRTC commands
+    // are not for the new connection.
+    if !context.reconnect_enabled.load(Ordering::SeqCst)
+        && matches!(
+            payload,
+            E::SubscriberOffer(_)
+                | E::IceTrickle(_)
+                | E::ChangePublishOptions(_)
+                | E::ChangePublishQuality(_)
+                | E::IceRestart(_)
+        )
+    {
+        return Ok(());
+    }
     match payload {
         E::SubscriberOffer(offer) => {
             negotiate_subscriber(
