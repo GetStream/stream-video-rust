@@ -49,8 +49,8 @@ use crate::client::Client;
 use crate::models::CallRequest;
 
 use super::client::UserTokenSource;
+use super::coordinator::ws::{ConnectUserDetails, CoordinatorEvent, WsAuthMessage};
 use super::coordinator::{self, Credentials, JoinCallRequest, StatsOptions};
-use super::coordinator_ws::{self, ConnectUserDetails, CoordinatorEvent, WsAuthMessage};
 use super::error::{Result, RtcError, SfuJoinError, SfuTimeoutError};
 use super::identity;
 use super::local_track::LocalTrack;

@@ -3,7 +3,7 @@
 //!
 //! The wire layer holds the generated protobuf types ([`proto`]), the Twirp
 //! signal client ([`sfu::signal`]), the SFU protobuf WebSocket ([`sfu::ws`]), and
-//! the coordinator auth WebSocket ([`coordinator_ws`]).
+//! the coordinator auth WebSocket ([`coordinator::ws`]).
 //!
 //! The participant layer sits on top: the [`coordinator`] join REST, dual
 //! publisher/subscriber PeerConnections ([`peer`]), and the [`join`] state
@@ -15,7 +15,7 @@
 //! # Stability
 //!
 //! The wire-layer modules — [`proto`], [`peer`], [`sfu`], [`tracer`], and
-//! [`coordinator_ws`] — mirror Stream's SFU
+//! [`coordinator::ws`] — mirror Stream's SFU
 //! protocol and change with it. They are exempt from this crate's compatibility
 //! guarantees at any version bump. Prefer [`crate::Call`], [`RtcClient`], and
 //! the re-exports below, which are covered by the crate's semver policy.
@@ -23,7 +23,6 @@
 pub mod client;
 mod codecs;
 pub mod coordinator;
-pub mod coordinator_ws;
 pub mod error;
 pub mod identity;
 pub mod join;
@@ -42,11 +41,11 @@ pub mod tracer;
 pub mod video_frame;
 
 pub use client::{RtcCall, RtcClient, TokenFuture, TokenProvider};
+pub use coordinator::ws::{
+    ConnectUserDetails, CoordinatorEvent, CoordinatorEvents, CoordinatorWs, WsAuthMessage,
+};
 pub use coordinator::{
     Credentials, IceServer, JoinCallRequest, JoinCallResponse, SfuServer, StatsOptions,
-};
-pub use coordinator_ws::{
-    ConnectUserDetails, CoordinatorEvent, CoordinatorEvents, CoordinatorWs, WsAuthMessage,
 };
 pub use error::{
     ErrorFromResponse, NegotiationError, Result as RtcResult, RtcError, SfuJoinError,

@@ -10,7 +10,7 @@
 //! - the client pings with a `health.check` event (~20s in videosdk)
 //!
 //! This module covers connect, auth, and typed event decode only. The join and
-//! call-watch flow that builds on it lives in [`super::join`].
+//! call-watch flow that builds on it lives in [`crate::rtc::join`].
 
 use std::time::Duration;
 
@@ -28,8 +28,8 @@ use url::Url;
 
 use crate::client::{DEFAULT_BASE_URL, DEFAULT_MAX_WEBSOCKET_MESSAGE_BYTES};
 
-use super::error::{Result, RtcError, SfuTimeoutError};
-use super::identity;
+use crate::rtc::error::{Result, RtcError, SfuTimeoutError};
+use crate::rtc::identity;
 
 type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 

@@ -59,7 +59,7 @@ Rust crate, published as [`getstream`](https://crates.io/crates/getstream).
 | [`webhook`](https://docs.rs/getstream/latest/getstream/webhook/index.html) | Signature verification and typed events |
 
 The wire-level `rtc` transport modules (`proto`, `peer`, `sfu`, `tracer`,
-`coordinator_ws`) are public because they track Stream's SFU protocol, but they
+`coordinator::ws`) are public because they track Stream's SFU protocol, but they
 are exempt from compatibility guarantees.
 
 ## Requirements
@@ -101,7 +101,7 @@ from a checkout, generate it locally with `cargo doc --open`.
 
 This is a `0.x` preview, so minor releases may contain breaking changes. The
 wire-level `rtc` transport modules (`proto`, `peer`, `sfu`, `tracer`,
-`coordinator_ws`) track Stream's SFU protocol directly and are exempt from
+`coordinator::ws`) track Stream's SFU protocol directly and are exempt from
 compatibility guarantees at any version bump.
 
 ## Getting started
