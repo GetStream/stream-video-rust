@@ -599,6 +599,19 @@ impl RtcCore {
         })
     }
 
+    /// Spawn a runtime task that stops at its next `await` after `generation`
+    /// ends. A task that calls `leave` must not use this: `leave` ends the
+    /// generation and would cancel itself.
+    fn spawn_generation_task<F>(self: &Arc<Self>, generation: u64, future: F) -> JoinHandle<()>
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        let core = self.clone();
+        self.spawn_runtime_task(async move {
+            let _ = core.while_generation(generation, future).await;
+        })
+    }
+
     fn cid(&self) -> String {
         format!("{}:{}", self.call_type, self.call_id)
     }

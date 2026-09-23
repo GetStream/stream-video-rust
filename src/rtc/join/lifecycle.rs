@@ -590,28 +590,34 @@ impl RtcCore {
         }));
 
         // Spawn the WS event loop + health-check ping loop + stats loop.
-        let event_loop = self.spawn_runtime_task(event_loop(
-            receiver,
-            EventLoopContext {
-                core: self.clone(),
-                subscriber: subscriber.clone(),
-                publisher: publisher.clone(),
-                signal: signal.clone(),
-                session_id: session_id.clone(),
-                pending_ice: pending_ice.clone(),
-                generation,
-                ws_healthy: ws_healthy.clone(),
-                reconnect_enabled: reconnect_enabled.clone(),
-            },
-        ));
-        let ping_loop = self.spawn_runtime_task(ping_loop(
-            self.clone(),
-            sfu_sender.clone(),
+        let event_loop = self.spawn_generation_task(
             generation,
-            ws_healthy.clone(),
-            reconnect_enabled.clone(),
-        ));
-        let stats_loop = self.spawn_runtime_task(stats::run(stats.clone()));
+            event_loop(
+                receiver,
+                EventLoopContext {
+                    core: self.clone(),
+                    subscriber: subscriber.clone(),
+                    publisher: publisher.clone(),
+                    signal: signal.clone(),
+                    session_id: session_id.clone(),
+                    pending_ice: pending_ice.clone(),
+                    generation,
+                    ws_healthy: ws_healthy.clone(),
+                    reconnect_enabled: reconnect_enabled.clone(),
+                },
+            ),
+        );
+        let ping_loop = self.spawn_generation_task(
+            generation,
+            ping_loop(
+                self.clone(),
+                sfu_sender.clone(),
+                generation,
+                ws_healthy.clone(),
+                reconnect_enabled.clone(),
+            ),
+        );
+        let stats_loop = self.spawn_generation_task(generation, stats::run(stats.clone()));
 
         Ok(Connection {
             generation,
@@ -640,10 +646,7 @@ impl RtcCore {
     /// abort background tasks. Succeeds from any state, including `Joining`
     /// (JS: force to a leaving state rather than waiting for `JOINED`).
     pub async fn leave(&self, reason: impl Into<String>) -> Result<()> {
-        self.leave_inner(reason.into()).await
-    }
-
-    pub(super) async fn leave_inner(&self, reason: String) -> Result<()> {
+        let reason = reason.into();
         let generation = self.cancel_generation();
 
         let connection = self.connection.lock().await.take();
@@ -723,11 +726,8 @@ impl RtcCore {
         let local_user_id = user_id.to_owned();
         let sender = self.events_tx.clone();
         let event_core = self.clone();
-        let event_task = self.spawn_runtime_task(async move {
+        let event_task = self.spawn_generation_task(generation, async move {
             loop {
-                if !event_core.is_generation_current(generation) {
-                    break;
-                }
                 match events.recv().await {
                     Ok(Some(event))
                         if event.raw.get("call_cid").and_then(|value| value.as_str())
@@ -762,14 +762,11 @@ impl RtcCore {
             }
         });
         let health_core = self.clone();
-        let health_task = self.spawn_runtime_task(async move {
+        let health_task = self.spawn_generation_task(generation, async move {
             let mut interval = tokio::time::interval(Duration::from_secs(20));
             interval.tick().await;
             loop {
                 interval.tick().await;
-                if !health_core.is_generation_current(generation) {
-                    break;
-                }
                 if let Err(error) = coordinator.send_health_check().await {
                     tracing::warn!(%error, "stream.rtc.coordinator_health_failed");
                     health_core.clear_coordinator_connection(generation);

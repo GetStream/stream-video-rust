@@ -157,6 +157,39 @@ async fn fake_sfu(
     (credentials, received)
 }
 
+/// A local coordinator WebSocket that sends `connection.ok`. It returns the
+/// REST base URL and a task that ends when the client socket closes.
+async fn fake_coordinator() -> (String, tokio::task::JoinHandle<()>) {
+    use futures_util::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::Message;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind fake coordinator");
+    let address = listener.local_addr().expect("fake coordinator address");
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("accept coordinator client");
+        let mut socket = tokio_tungstenite::accept_async(stream)
+            .await
+            .expect("coordinator WebSocket handshake");
+        socket
+            .next()
+            .await
+            .expect("auth frame")
+            .expect("valid auth frame");
+        socket
+            .send(Message::Text(
+                json!({ "type": "connection.ok", "connection_id": "connection-1" })
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .expect("send connection.ok");
+        while let Some(Ok(_)) = socket.next().await {}
+    });
+    (format!("http://{address}"), server)
+}
+
 /// Every request the fake SFU received until the client socket closed.
 async fn requests_until_close(
     mut received: tokio::sync::mpsc::UnboundedReceiver<event::SfuRequest>,
@@ -344,6 +377,45 @@ async fn leave_closes_a_connection_owned_by_a_cancelled_join() {
         "cancelled connection cleanup",
     )
     .await;
+}
+
+#[tokio::test]
+async fn generation_change_closes_the_coordinator_socket() {
+    let (base_url, coordinator) = fake_coordinator().await;
+    let core = test_core_with_config(ClientConfig {
+        base_url,
+        ..ClientConfig::default()
+    });
+    let generation = prepare_joined_core(&core, "alice");
+    let token = core.current_user_token().expect("user token");
+    core.connect_coordinator_events(generation, &token, "alice")
+        .await
+        .expect("coordinator events");
+
+    core.cancel_generation();
+
+    tokio::time::timeout(Duration::from_secs(2), coordinator)
+        .await
+        .expect("coordinator socket closed")
+        .expect("fake coordinator task");
+}
+
+#[tokio::test]
+async fn generation_change_stops_the_connection_tasks() {
+    let core = test_core();
+    let generation = prepare_joined_core(&core, "alice");
+    let (connection, _sfu) = establish_fake(&core, generation).await;
+    assert!(core.runtime_task_snapshot().0 > 0);
+
+    core.cancel_generation();
+
+    wait_for(
+        Duration::from_secs(2),
+        || core.runtime_task_snapshot().0 == 0,
+        "connection tasks stop",
+    )
+    .await;
+    drop(connection);
 }
 
 #[tokio::test]

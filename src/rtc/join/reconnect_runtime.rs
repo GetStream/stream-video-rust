@@ -854,27 +854,33 @@ impl RtcCore {
         }
         ws_healthy.store(true, Ordering::SeqCst);
         reconnect_enabled.store(true, Ordering::SeqCst);
-        let event_task = self.spawn_runtime_task(event_loop(
-            receiver,
-            EventLoopContext {
-                core: self.clone(),
-                subscriber,
-                publisher,
-                signal,
-                session_id: session_id.clone(),
-                pending_ice,
-                generation,
-                ws_healthy: ws_healthy.clone(),
-                reconnect_enabled: reconnect_enabled.clone(),
-            },
-        ));
-        let ping_task = self.spawn_runtime_task(ping_loop(
-            self.clone(),
-            sfu_sender,
+        let event_task = self.spawn_generation_task(
             generation,
-            ws_healthy,
-            reconnect_enabled,
-        ));
+            event_loop(
+                receiver,
+                EventLoopContext {
+                    core: self.clone(),
+                    subscriber,
+                    publisher,
+                    signal,
+                    session_id: session_id.clone(),
+                    pending_ice,
+                    generation,
+                    ws_healthy: ws_healthy.clone(),
+                    reconnect_enabled: reconnect_enabled.clone(),
+                },
+            ),
+        );
+        let ping_task = self.spawn_generation_task(
+            generation,
+            ping_loop(
+                self.clone(),
+                sfu_sender,
+                generation,
+                ws_healthy,
+                reconnect_enabled,
+            ),
+        );
         let mut guard = self.connection.lock().await;
         let connection = guard.as_mut().ok_or_else(|| {
             RtcError::IllegalState("fast reconnect connection disappeared".to_owned())

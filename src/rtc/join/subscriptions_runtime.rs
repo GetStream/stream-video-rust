@@ -234,7 +234,7 @@ impl RtcCore {
         let on_drop = Box::new(move || {
             if let Some(core) = weak.upgrade() {
                 let task_core = core.clone();
-                std::mem::drop(core.spawn_runtime_task(async move {
+                std::mem::drop(core.spawn_generation_task(generation, async move {
                     task_core
                         .on_remote_track_dropped(generation, connection_epoch, key)
                         .await;
