@@ -99,9 +99,9 @@ impl RtcCore {
             .clone();
         for track in tracks {
             if track.is_muted() {
-                self.roster_remove_track(session_id, track.track_type() as i32);
+                self.remove_published_track(session_id, track.track_type() as i32);
             } else {
-                self.roster_add_track(&user_id, session_id, track.track_type() as i32, None);
+                self.add_published_track(&user_id, session_id, track.track_type() as i32, None);
             }
             track.start_media();
         }
@@ -139,7 +139,7 @@ impl RtcCore {
                 })
                 .await?;
             if muted {
-                self.roster_remove_track(session_id, *track_type as i32);
+                self.remove_published_track(session_id, *track_type as i32);
             }
         }
         for (track_id, _) in pending {

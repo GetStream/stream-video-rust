@@ -589,12 +589,12 @@ fn participant_refresh_replaces_published_track_state() {
         published_tracks: vec![TrackType::Audio as i32, TrackType::Video as i32],
         ..Default::default()
     };
-    core.roster_upsert(&participant);
+    core.upsert_participant(&participant);
     participant.published_tracks = vec![TrackType::Audio as i32];
-    core.roster_upsert(&participant);
+    core.upsert_participant(&participant);
 
-    let roster = core.roster.lock().unwrap_or_else(|e| e.into_inner());
-    let entry = roster.get("session-a").expect("participant");
+    let participants = core.participants.lock().unwrap_or_else(|e| e.into_inner());
+    let entry = participants.get("session-a").expect("participant");
     assert_eq!(entry.published.len(), 1);
     assert!(entry.published.contains(&(TrackType::Audio as i32)));
 }
@@ -1054,7 +1054,7 @@ fn stop_state_is_retryable_until_mute_sync_commits() {
     media.set_status(&track_id, PublicationStatus::Published);
 
     // A stop marks the track `PendingStopMute`: it leaves the active set (so it
-    // is not re-announced on reconnect) but stays in the roster until the mute
+    // is not re-announced on reconnect) but stays in the publication list until the mute
     // RPC commits, so a failed mute can be retried without losing the track.
     media.set_status(&track_id, PublicationStatus::PendingStopMute);
     assert!(media.active_tracks().is_empty());

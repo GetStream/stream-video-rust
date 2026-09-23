@@ -659,7 +659,7 @@ impl RtcCore {
             }
             connection.teardown().await;
         }
-        self.roster
+        self.participants
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clear();

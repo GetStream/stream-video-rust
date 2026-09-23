@@ -1,5 +1,5 @@
-//! The participant roster and cached call state: the SFU's view of who is
-//! in the call, what they publish, and the call-level state that join and
+//! The participants and cached call state: the SFU's view of who is in the
+//! call, what they publish, and the call-level state that join and
 //! incremental SFU events maintain.
 
 use super::*;
@@ -7,7 +7,7 @@ use super::*;
 /// A participant known to be in the call, used to correlate inbound tracks
 /// (by `track_lookup_prefix`) and to build the subscription list.
 #[derive(Clone, Default)]
-pub(super) struct RosterEntry {
+pub(super) struct ParticipantState {
     pub(super) user_id: String,
     pub(super) session_id: String,
     pub(super) track_lookup_prefix: String,
@@ -27,11 +27,11 @@ pub(super) struct CallStateCache {
 
 impl RtcCore {
     /// A snapshot of the participants currently known in the call (including this
-    /// session), built from the SFU roster. Updated as `ParticipantJoined` /
-    /// `ParticipantLeft` events arrive.
+    /// session), built from the SFU participant state. Updated as
+    /// `ParticipantJoined` / `ParticipantLeft` events arrive.
     pub fn participants(&self) -> Vec<RemoteParticipant> {
-        let roster = self.roster.lock().unwrap_or_else(|e| e.into_inner());
-        roster
+        let participants = self.participants.lock().unwrap_or_else(|e| e.into_inner());
+        participants
             .values()
             .map(|entry| {
                 RemoteParticipant::from_proto(&entry.participant, entry.paused.iter().copied())
@@ -67,8 +67,8 @@ impl RtcCore {
     }
 
     pub(super) fn lookup_participant(&self, prefix: &str) -> RemoteParticipant {
-        let roster = self.roster.lock().unwrap_or_else(|e| e.into_inner());
-        for entry in roster.values() {
+        let participants = self.participants.lock().unwrap_or_else(|e| e.into_inner());
+        for entry in participants.values() {
             if !entry.track_lookup_prefix.is_empty() && entry.track_lookup_prefix == prefix {
                 return RemoteParticipant::from_proto(
                     &entry.participant,
@@ -83,8 +83,8 @@ impl RtcCore {
         }
     }
 
-    /// Replace the roster from an authoritative SFU join response when its
-    /// lifecycle generation is still active.
+    /// Replace the participants from an authoritative SFU join response when
+    /// its lifecycle generation is still active.
     pub(super) fn apply_join_call_state_if_current(
         &self,
         generation: u64,
@@ -97,7 +97,7 @@ impl RtcCore {
             return false;
         }
         let state = call_state.unwrap_or_default();
-        let participants = state.participants.clone();
+        let joined = state.participants.clone();
         *self
             .call_state
             .lock()
@@ -109,18 +109,20 @@ impl RtcCore {
             current_grants: None,
         };
         {
-            let mut roster = self.roster.lock().unwrap_or_else(|e| e.into_inner());
-            roster.clear();
-            let me = roster.entry(session_id.to_owned()).or_default();
+            let mut participants = self.participants.lock().unwrap_or_else(|e| e.into_inner());
+            participants.clear();
+            let me = participants.entry(session_id.to_owned()).or_default();
             me.user_id = user_id.to_owned();
             me.session_id = session_id.to_owned();
             me.participant.user_id = user_id.to_owned();
             me.participant.session_id = session_id.to_owned();
-            for participant in &participants {
+            for participant in &joined {
                 if participant.session_id.is_empty() {
                     continue;
                 }
-                let entry = roster.entry(participant.session_id.clone()).or_default();
+                let entry = participants
+                    .entry(participant.session_id.clone())
+                    .or_default();
                 entry.user_id.clone_from(&participant.user_id);
                 entry.session_id.clone_from(&participant.session_id);
                 entry.participant.clone_from(participant);
@@ -135,7 +137,7 @@ impl RtcCore {
                     .extend(participant.published_tracks.iter().copied());
             }
         }
-        for participant in participants {
+        for participant in joined {
             if participant.session_id != session_id {
                 let _ = self
                     .events_tx
@@ -145,13 +147,13 @@ impl RtcCore {
         true
     }
 
-    /// Insert/refresh a participant's roster entry from a `Participant` message.
-    pub(super) fn roster_upsert(&self, p: &models::Participant) {
+    /// Insert/refresh a participant's state from a `Participant` message.
+    pub(super) fn upsert_participant(&self, p: &models::Participant) {
         if p.session_id.is_empty() {
             return;
         }
-        let mut roster = self.roster.lock().unwrap_or_else(|e| e.into_inner());
-        let entry = roster.entry(p.session_id.clone()).or_default();
+        let mut participants = self.participants.lock().unwrap_or_else(|e| e.into_inner());
+        let entry = participants.entry(p.session_id.clone()).or_default();
         entry.user_id = p.user_id.clone();
         entry.session_id = p.session_id.clone();
         entry.participant.clone_from(p);
@@ -162,8 +164,8 @@ impl RtcCore {
         entry.published.extend(p.published_tracks.iter().copied());
     }
 
-    pub(super) fn roster_remove(&self, session_id: &str) {
-        self.roster
+    pub(super) fn remove_participant(&self, session_id: &str) {
+        self.participants
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(session_id);
@@ -171,7 +173,7 @@ impl RtcCore {
 
     /// Record a newly-published track for a participant, learning the
     /// `track_lookup_prefix` from the optional participant hint when present.
-    pub(super) fn roster_add_track(
+    pub(super) fn add_published_track(
         &self,
         user_id: &str,
         session_id: &str,
@@ -182,8 +184,8 @@ impl RtcCore {
             return;
         }
         {
-            let mut roster = self.roster.lock().unwrap_or_else(|e| e.into_inner());
-            let entry = roster.entry(session_id.to_owned()).or_default();
+            let mut participants = self.participants.lock().unwrap_or_else(|e| e.into_inner());
+            let entry = participants.entry(session_id.to_owned()).or_default();
             if let Some(participant) = hint {
                 entry.participant.clone_from(participant);
                 if !participant.track_lookup_prefix.is_empty() {
@@ -210,9 +212,9 @@ impl RtcCore {
         }
     }
 
-    pub(super) fn roster_remove_track(&self, session_id: &str, track_type: i32) {
-        let mut roster = self.roster.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(entry) = roster.get_mut(session_id) {
+    pub(super) fn remove_published_track(&self, session_id: &str, track_type: i32) {
+        let mut participants = self.participants.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(entry) = participants.get_mut(session_id) {
             entry.published.remove(&track_type);
             entry
                 .participant
@@ -222,28 +224,28 @@ impl RtcCore {
     }
 
     pub(super) fn update_connection_quality(&self, updates: &[event::ConnectionQualityInfo]) {
-        let mut roster = self
-            .roster
+        let mut participants = self
+            .participants
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         for update in updates {
-            if let Some(entry) = roster.get_mut(&update.session_id) {
+            if let Some(entry) = participants.get_mut(&update.session_id) {
                 entry.participant.connection_quality = update.connection_quality;
             }
         }
     }
 
     pub(super) fn update_audio_levels(&self, levels: &[event::AudioLevel]) {
-        let mut roster = self
-            .roster
+        let mut participants = self
+            .participants
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        for entry in roster.values_mut() {
+        for entry in participants.values_mut() {
             entry.participant.is_speaking = false;
             entry.participant.audio_level = 0.0;
         }
         for level in levels {
-            if let Some(entry) = roster.get_mut(&level.session_id) {
+            if let Some(entry) = participants.get_mut(&level.session_id) {
                 entry.participant.is_speaking = level.is_speaking;
                 entry.participant.audio_level = level.level;
             }
@@ -251,11 +253,11 @@ impl RtcCore {
     }
 
     pub(super) fn update_dominant_speaker(&self, session_id: &str) {
-        let mut roster = self
-            .roster
+        let mut participants = self
+            .participants
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        for entry in roster.values_mut() {
+        for entry in participants.values_mut() {
             entry.participant.is_dominant_speaker = entry.session_id == session_id;
         }
     }
@@ -275,12 +277,12 @@ impl RtcCore {
     }
 
     pub(super) fn update_inbound_state(&self, states: &[event::InboundVideoState]) {
-        let mut roster = self
-            .roster
+        let mut participants = self
+            .participants
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         for state in states {
-            let Some(entry) = roster.get_mut(&state.session_id) else {
+            let Some(entry) = participants.get_mut(&state.session_id) else {
                 continue;
             };
             if state.paused {

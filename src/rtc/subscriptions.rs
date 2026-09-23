@@ -4,9 +4,9 @@
 //! The SFU never auto-forwards media — without an explicit subscription no
 //! `on_track` fires (JS `DynascaleManager`, stream-py `SubscriptionManager`,
 //! videosdk `UpdateSubscriptions`). This module holds the declarative policy;
-//! [`RtcCore`](super::join::RtcCore) turns it plus the live participant roster
-//! into the concrete `TrackSubscriptionDetails` list and (re)sends it whenever
-//! the roster changes.
+//! [`RtcCore`](super::join::RtcCore) turns it plus the live participants into
+//! the concrete `TrackSubscriptionDetails` list and (re)sends it whenever the
+//! participants change.
 //!
 //! The default policy subscribes to remote **audio** only (the backend-bot
 //! default); video and screen-share are opt-in.

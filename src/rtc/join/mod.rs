@@ -22,7 +22,7 @@
 //! - `connection` — the SFU WebSocket handshake, callbacks, event dispatch;
 //! - `publish` — the publish path; `publication` — its per-track state;
 //! - `subscriptions_runtime` — subscription negotiation and inbound tracks;
-//! - `roster` — the participant roster and cached call state;
+//! - `participants` — the participant state and cached call state;
 //! - `reconnect_runtime` — reconnect execution and media restoration.
 //!
 //! `reconnect_runtime` and `subscriptions_runtime` carry the suffix to avoid
@@ -73,18 +73,18 @@ use serde_json::json;
 
 mod connection;
 mod lifecycle;
+mod participants;
 mod publication;
 mod publish;
 mod reconnect_runtime;
-mod roster;
 mod subscriptions_runtime;
 
 use connection::{
     await_join_response, build_sfu_ws_url, event_loop, ping_loop, register_connection_state,
     register_on_track,
 };
+use participants::{CallStateCache, ParticipantState};
 use publication::{MediaState, PublicationStatus};
-use roster::{CallStateCache, RosterEntry};
 
 const MIGRATION_COMPLETE_TIMEOUT: Duration = Duration::from_secs(7);
 
@@ -511,7 +511,7 @@ pub struct RtcCore {
     /// Exact per-session subscriptions, or `None` while using the coarse policy.
     manual_subscriptions: StdMutex<Option<Vec<SubscriptionTarget>>>,
     /// Known participants keyed by session id (correlation + subscription build).
-    roster: StdMutex<HashMap<String, RosterEntry>>,
+    participants: StdMutex<HashMap<String, ParticipantState>>,
     /// Call-level state supplied by join and incremental SFU events.
     call_state: StdMutex<CallStateCache>,
     /// Serialized publisher negotiation and retryable local publication state.
@@ -576,7 +576,7 @@ impl RtcCore {
             subs_active: AtomicBool::new(false),
             manual_unsub: StdMutex::new(HashSet::new()),
             manual_subscriptions: StdMutex::new(None),
-            roster: StdMutex::new(HashMap::new()),
+            participants: StdMutex::new(HashMap::new()),
             call_state: StdMutex::new(CallStateCache::default()),
             media: TokioMutex::new(MediaState::default()),
             active_subs: StdMutex::new(Vec::new()),

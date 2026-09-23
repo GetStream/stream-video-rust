@@ -115,7 +115,7 @@ impl RtcCore {
             .unwrap_or_else(|e| e.into_inner())
             .user_id
             .clone();
-        self.roster_add_track(&user_id, &session_id, track.track_type() as i32, None);
+        self.add_published_track(&user_id, &session_id, track.track_type() as i32, None);
         track.start_media();
         signal
             .update_mute_states(signal::UpdateMuteStatesRequest {
@@ -189,7 +189,7 @@ impl RtcCore {
             })
             .await?;
         if muted {
-            self.roster_remove_track(&session_id, track_type as i32);
+            self.remove_published_track(&session_id, track_type as i32);
         }
         if let Some(removed) = media.remove(&track_id) {
             removed.stop();
@@ -267,7 +267,7 @@ impl RtcCore {
             return Err(error);
         }
         if muted {
-            self.roster_remove_track(&session_id, track_type as i32);
+            self.remove_published_track(&session_id, track_type as i32);
         } else {
             let user_id = self
                 .join_data
@@ -275,7 +275,7 @@ impl RtcCore {
                 .unwrap_or_else(|error| error.into_inner())
                 .user_id
                 .clone();
-            self.roster_add_track(&user_id, &session_id, track_type as i32, None);
+            self.add_published_track(&user_id, &session_id, track_type as i32, None);
         }
         Ok(())
     }
