@@ -12,8 +12,8 @@ use openh264::encoder::{
 };
 use openh264::formats::YUVSource;
 
-use super::error::{Result, RtcError};
-use super::video_frame::{VideoFrame, i420_len};
+use crate::rtc::error::{Result, RtcError};
+use crate::rtc::video_frame::{VideoFrame, i420_len};
 
 const MAX_H264_DECODE_DIMENSION: usize = 3_840;
 const MAX_H264_DECODE_PIXELS: usize = 3_840 * 2_160;

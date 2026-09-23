@@ -2,8 +2,8 @@
 //! Cargo feature.
 //!
 //! The wire layer holds the generated protobuf types ([`proto`]), the Twirp
-//! signal client ([`signal`]), the SFU protobuf WebSocket ([`sfu_ws`]), and the
-//! coordinator auth WebSocket ([`coordinator_ws`]).
+//! signal client ([`sfu::signal`]), the SFU protobuf WebSocket ([`sfu::ws`]), and
+//! the coordinator auth WebSocket ([`coordinator::ws`]).
 //!
 //! The participant layer sits on top: the [`coordinator`] join REST, dual
 //! publisher/subscriber PeerConnections ([`peer`]), and the [`join`] state
@@ -14,45 +14,36 @@
 //!
 //! # Stability
 //!
-//! The wire-layer modules — [`proto`], [`peer`], [`sfu_ws`], [`signal`],
-//! [`publisher`], [`tracer`], and [`coordinator_ws`] — mirror Stream's SFU
+//! The wire-layer modules — [`proto`], [`peer`], [`sfu`], [`tracer`], and
+//! [`coordinator::ws`] — mirror Stream's SFU
 //! protocol and change with it. They are exempt from this crate's compatibility
 //! guarantees at any version bump. Prefer [`crate::Call`], [`RtcClient`], and
 //! the re-exports below, which are covered by the crate's semver policy.
 
 pub mod client;
+mod codecs;
 pub mod coordinator;
-pub mod coordinator_ws;
 pub mod error;
-mod h264;
 pub mod identity;
 pub mod join;
-mod layers;
-pub mod local_track;
 pub mod pcm;
 pub mod peer;
 pub mod proto;
 mod publish_options;
-pub mod publisher;
 pub mod reconnect;
-pub mod remote_track;
-mod rtp_h264;
-mod rtp_vpx;
-pub mod sfu_ws;
-pub mod signal;
+pub mod sfu;
 pub mod stats;
 pub mod subscriptions;
 pub mod tracer;
+mod tracks;
 pub mod video_frame;
-mod vpx;
-mod vpx_decode;
 
 pub use client::{RtcCall, RtcClient, TokenFuture, TokenProvider};
+pub use coordinator::ws::{
+    ConnectUserDetails, CoordinatorEvent, CoordinatorEvents, CoordinatorWs, WsAuthMessage,
+};
 pub use coordinator::{
     Credentials, IceServer, JoinCallRequest, JoinCallResponse, SfuServer, StatsOptions,
-};
-pub use coordinator_ws::{
-    ConnectUserDetails, CoordinatorEvent, CoordinatorEvents, CoordinatorWs, WsAuthMessage,
 };
 pub use error::{
     ErrorFromResponse, NegotiationError, Result as RtcResult, RtcError, SfuJoinError,
@@ -60,10 +51,6 @@ pub use error::{
 };
 pub use identity::{CLIENT_TYPE, SDK_TYPE, client_details, client_header};
 pub use join::{CallEvent, CallStateSnapshot, CallingState, JoinCallData, RtcCore};
-pub use local_track::{
-    LocalAudioTrack, LocalAudioTrackConfig, LocalTrack, LocalVideoTrack, LocalVideoTrackConfig,
-    RtpPacket, VideoLayering, audio_level_dbov,
-};
 pub use pcm::chunk::Pad;
 pub use pcm::convert::G711_SAMPLE_RATE;
 pub use pcm::{
@@ -73,12 +60,16 @@ pub use publish_options::{ClientPublishOptions, PreferredVideoCodec};
 pub use reconnect::{
     DEFAULT_MAX_JOIN_RETRIES, JoinAttemptOutcome, ReconnectStrategy, retry_interval,
 };
-pub use remote_track::{Codec, RemoteParticipant, RemoteTrack};
-pub use sfu_ws::{SfuReceiver, SfuSender};
-pub use signal::SignalClient;
+pub use sfu::signal::SignalClient;
+pub use sfu::ws::{SfuReceiver, SfuSender};
 pub use stats::{DEFAULT_REPORTING_INTERVAL_MS, reporting_interval};
 pub use subscriptions::{SubscriptionConfig, SubscriptionTarget};
 pub use tracer::{TraceRecord, Tracer};
+pub use tracks::{
+    Codec, LocalAudioTrack, LocalAudioTrackConfig, LocalTrack, LocalVideoTrack,
+    LocalVideoTrackConfig, RemoteParticipant, RemoteTrack, RtpPacket, VideoLayering,
+    audio_level_dbov,
+};
 pub use video_frame::VideoFrame;
 
 #[cfg(test)]

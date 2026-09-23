@@ -3,10 +3,10 @@
 use std::collections::{HashMap, HashSet};
 
 use super::super::error::Result;
-use super::super::local_track::LocalTrack;
 use super::super::proto::event;
 use super::super::proto::models::{self, TrackType};
-use super::super::publisher;
+use crate::rtc::peer::publisher;
+use crate::rtc::tracks::LocalTrack;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum PublicationStatus {

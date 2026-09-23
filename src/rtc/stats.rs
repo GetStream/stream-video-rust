@@ -27,7 +27,7 @@ use super::coordinator::StatsOptions;
 use super::error::Result;
 use super::identity;
 use super::proto::signal::SendStatsRequest;
-use super::signal::SignalClient;
+use super::sfu::signal::SignalClient;
 use super::tracer::{TraceRecord, Tracer, now_ms};
 
 /// Default stats reporting cadence (ms) used when the coordinator does not

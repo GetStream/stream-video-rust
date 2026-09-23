@@ -16,10 +16,9 @@ use crate::token::{self, TokenOptions};
 
 use super::error::{Result, RtcError};
 use super::join::{CallEvent, CallStateSnapshot, CallingState, JoinCallData, RtcCore};
-use super::local_track::{LocalAudioTrack, LocalTrack, LocalVideoTrack};
 use super::proto::models::TrackType;
-use super::remote_track::{RemoteParticipant, RemoteTrack};
 use super::subscriptions::{SubscriptionConfig, SubscriptionTarget};
+use super::tracks::{LocalAudioTrack, LocalTrack, LocalVideoTrack, RemoteParticipant, RemoteTrack};
 
 /// Boxed future returned by an RTC [`TokenProvider`].
 pub type TokenFuture = Pin<Box<dyn Future<Output = CrateResult<String>> + Send + 'static>>;

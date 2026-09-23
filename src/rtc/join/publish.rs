@@ -320,7 +320,9 @@ impl RtcCore {
             .as_ref()
             .map(|connection| (connection.publisher.clone(), connection.pending_ice.clone()));
         if let Some((publisher, pending_ice)) = handles {
-            flush_candidates(&publisher, &pending_ice.publisher).await;
+            pending_ice
+                .flush(&publisher, PeerType::PublisherUnspecified)
+                .await;
         }
     }
 

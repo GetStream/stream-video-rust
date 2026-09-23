@@ -13,7 +13,7 @@
 //! This module intentionally provides **only** the framed transport: connect,
 //! a typed send path, and an async event receiver. The join handshake and
 //! reconnect logic (waiting for `JoinResponse`, ping cadence, health watchdog)
-//! belong to the join state machine in [`super::join`].
+//! belong to the join state machine in [`crate::rtc::join`].
 
 use bytes::Bytes;
 use futures_util::stream::{SplitSink, SplitStream};
@@ -26,8 +26,8 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async_with_conf
 
 use crate::client::DEFAULT_MAX_WEBSOCKET_MESSAGE_BYTES;
 
-use super::error::{Result, RtcError};
-use super::proto::event::{
+use crate::rtc::error::{Result, RtcError};
+use crate::rtc::proto::event::{
     HealthCheckRequest, JoinRequest, LeaveCallRequest, SfuEvent, SfuRequest, sfu_request,
 };
 
@@ -38,7 +38,7 @@ type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 ///
 /// `endpoint` is `credentials.server.ws_endpoint` with the query string the
 /// SFU expects (`?attempt=…&user_id=…&api_key=…&user_session_id=…&cid=…`),
-/// built by the join code in [`super::join`].
+/// built by the join code in [`crate::rtc::join`].
 pub async fn connect(endpoint: &str) -> Result<(SfuSender, SfuReceiver)> {
     connect_with_limit(endpoint, DEFAULT_MAX_WEBSOCKET_MESSAGE_BYTES).await
 }

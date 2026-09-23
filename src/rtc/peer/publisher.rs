@@ -15,11 +15,11 @@ use webrtc::peer_connection::sdp::sdp_type::RTCSdpType;
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
 use webrtc::peer_connection::signaling_state::RTCSignalingState;
 
-use super::error::{NegotiationError, Result, RtcError};
-use super::local_track::LocalTrack;
-use super::proto::models::{PublishOption, TrackInfo, TrackType};
-use super::proto::signal::SetPublisherRequest;
-use super::signal::SignalClient;
+use crate::rtc::error::{NegotiationError, Result, RtcError};
+use crate::rtc::proto::models::{PublishOption, TrackInfo, TrackType};
+use crate::rtc::proto::signal::SetPublisherRequest;
+use crate::rtc::sfu::signal::SignalClient;
+use crate::rtc::tracks::LocalTrack;
 
 /// Renegotiate the publisher PeerConnection with the SFU for `tracks`.
 ///
@@ -184,7 +184,7 @@ pub(crate) async fn add_transceiver_for_track(
         .next()
         .ok_or_else(|| RtcError::Media("local publication has no physical encodings".to_owned()))?;
     let transceiver = publisher
-        .add_transceiver_from_track(first, Some(super::join::send_only()))
+        .add_transceiver_from_track(first, Some(crate::rtc::join::send_only()))
         .await
         .map_err(RtcError::from)?;
     let sender = transceiver.sender().await;
@@ -296,10 +296,11 @@ pub(crate) async fn build_track_infos(
 
 #[cfg(test)]
 mod tests {
-    use super::super::local_track::{LocalVideoTrack, LocalVideoTrackConfig};
-    use super::super::peer;
-    use super::super::proto::models::{Codec, VideoDimension};
     use super::*;
+    use crate::rtc::peer;
+    use crate::rtc::proto::event::VideoLayerSetting;
+    use crate::rtc::proto::models::{Codec, VideoDimension};
+    use crate::rtc::tracks::{LocalVideoTrack, LocalVideoTrackConfig};
 
     fn video_option(name: &str) -> PublishOption {
         PublishOption {
@@ -396,7 +397,7 @@ mod tests {
         assert!(offer.sdp.contains("a=rid:f send"));
         assert!(offer.sdp.contains("a=simulcast:send q;h;f"));
         pc.set_local_description(offer).await.expect("set offer");
-        local.apply_video_layer_settings(&[super::super::proto::event::VideoLayerSetting {
+        local.apply_video_layer_settings(&[VideoLayerSetting {
             name: "h".to_owned(),
             active: false,
             max_bitrate: 450_000,

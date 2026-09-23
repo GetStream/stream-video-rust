@@ -804,7 +804,7 @@ impl RtcCore {
             self.reconnect_attempts.load(Ordering::SeqCst),
         )?;
         let (mut next_sender, mut receiver) =
-            sfu_ws::connect_with_limit(&ws_url, self.client.max_websocket_message_bytes()).await?;
+            ws::connect_with_limit(&ws_url, self.client.max_websocket_message_bytes()).await?;
         let mut join_request = JoinRequest {
             token: credentials.token,
             session_id: session_id.clone(),

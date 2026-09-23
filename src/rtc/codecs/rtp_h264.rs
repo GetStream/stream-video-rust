@@ -5,7 +5,7 @@ use webrtc::rtp::Error as RtpError;
 use webrtc::rtp::codecs::h264::H264Payloader;
 use webrtc::rtp::packetizer::{Depacketizer, Payloader};
 
-use super::error::{Result, RtcError};
+use crate::rtc::error::{Result, RtcError};
 
 const ANNEX_B_START_CODE: &[u8] = &[0, 0, 0, 1];
 const NAL_TYPE_MASK: u8 = 0x1f;

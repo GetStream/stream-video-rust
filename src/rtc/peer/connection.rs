@@ -1,11 +1,4 @@
 //! webrtc-rs PeerConnection construction and the throwaway generic SDPs.
-//!
-//! The participant path uses two PeerConnections (JS / videosdk): the publisher
-//! is the offerer (SetPublisher over Twirp) and the subscriber is the answerer
-//! (answers the SFU's `subscriber_offer` over the WS). This module builds them
-//! with the SDK-supported codec + interceptor set and produces the "generic" SDPs the
-//! SFU inspects to learn our codec capabilities on the `JoinRequest`
-//! (JS `getGenericSdp`, stream-py `create_join_request`).
 
 use std::sync::Arc;
 
@@ -28,10 +21,10 @@ use webrtc::sdp::extmap::{
     AUDIO_LEVEL_URI, SDES_MID_URI, SDES_REPAIR_RTP_STREAM_ID_URI, SDES_RTP_STREAM_ID_URI,
 };
 
-use super::coordinator::IceServer;
-use super::error::Result;
-use super::publish_options::H264_FMTP;
-use super::tracer::Tracer;
+use crate::rtc::coordinator::IceServer;
+use crate::rtc::error::Result;
+use crate::rtc::publish_options::H264_FMTP;
+use crate::rtc::tracer::Tracer;
 
 const OPUS_PAYLOAD_TYPE: u8 = 111;
 const VP8_PAYLOAD_TYPE: u8 = 96;
@@ -42,7 +35,7 @@ const H264_PAYLOAD_TYPE: u8 = 125;
 ///
 /// `MediaEngine::register_default_codecs` also advertises legacy audio, VP9
 /// profile 1, AV1, and HEVC. Negotiating any of those would deliver a track
-/// that the decoded [`RemoteTrack`](super::RemoteTrack) APIs cannot consume.
+/// that the decoded [`RemoteTrack`](crate::rtc::RemoteTrack) APIs cannot consume.
 fn register_supported_codecs(media_engine: &mut MediaEngine) -> Result<()> {
     media_engine.register_codec(
         RTCRtpCodecParameters {

@@ -69,7 +69,7 @@ tokio-tungstenite = { version = "0.30.0", default-features = false, features = [
 tracing = "0.1.44"
 url = "2.5.8"
 uuid = { version = "1.24.0", features = ["v4"] }
-# VP8/VP9 encoder FFI for the video publish path (`rtc::vpx`). The `generate`
+# VP8/VP9 encoder FFI for the video publish path (`rtc::codecs::vpx`). The `generate`
 # feature runs bindgen at build time so any installed libvpx version works (no
 # version-locked pre-generated bindings). This links a **system** libvpx
 # (`brew install libvpx` / `apt install libvpx-dev`) discovered via pkg-config —

@@ -16,10 +16,9 @@ use getstream::rtc::{PcmFrame, StreamResampler};
 #[path = "support/rtc_sources.rs"]
 mod rtc;
 
-use rtc::rtp_vpx::VpxRtpPacketizer;
-use rtc::vpx::{VpxCodec, VpxEncoder};
-use rtc::vpx_decode::VpxDecoder;
-use rtc::{
+use rtc::codecs::rtp_vpx::VpxRtpPacketizer;
+use rtc::codecs::vpx::{VpxCodec, VpxDecoder, VpxEncoder};
+use rtc::codecs::{
     h264::{H264Decoder, H264Encoder},
     rtp_h264::H264RtpPacketizer,
 };

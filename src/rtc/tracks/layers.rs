@@ -6,7 +6,7 @@
 
 use std::num::NonZeroU8;
 
-use super::proto::models::{PublishOption, VideoDimension, VideoLayer, VideoQuality};
+use crate::rtc::proto::models::{PublishOption, VideoDimension, VideoLayer, VideoQuality};
 
 pub(crate) const SIMULCAST_RIDS: [&str; 3] = ["q", "h", "f"];
 

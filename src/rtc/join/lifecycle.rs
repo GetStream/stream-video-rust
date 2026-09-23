@@ -453,18 +453,20 @@ impl RtcCore {
             &self.cid(),
             attempt,
         )?;
-        let (mut sender, mut receiver) =
-            match sfu_ws::connect_with_limit(&ws_url, self.client.max_websocket_message_bytes())
-                .await
-            {
-                Ok(pair) => pair,
-                Err(e) => {
-                    signal.trace("signal.close", json!(e.to_string()));
-                    return Err(RtcError::WsConnection(
-                        super::super::error::WsConnectionError::transport(e.to_string()),
-                    ));
-                }
-            };
+        let (mut sender, mut receiver) = match ws::connect_with_limit(
+            &ws_url,
+            self.client.max_websocket_message_bytes(),
+        )
+        .await
+        {
+            Ok(pair) => pair,
+            Err(e) => {
+                signal.trace("signal.close", json!(e.to_string()));
+                return Err(RtcError::WsConnection(
+                    super::super::error::WsConnectionError::transport(e.to_string()),
+                ));
+            }
+        };
         signal.trace("signal.ws.open", json!(credentials.server.edge_name));
 
         // Build + send the JoinRequest. `fast_reconnect` is deprecated upstream;
@@ -694,8 +696,8 @@ impl RtcCore {
             return Err(join_cancelled());
         }
         let auth = WsAuthMessage::video(user_token, ConnectUserDetails::new(user_id));
-        let coordinator_url = coordinator_ws::coordinator_ws_url(self.client.base_url())?;
-        let (mut coordinator, mut events, connected) = coordinator_ws::connect_with_limit(
+        let coordinator_url = coordinator::ws::coordinator_ws_url(self.client.base_url())?;
+        let (mut coordinator, mut events, connected) = coordinator::ws::connect_with_limit(
             coordinator_url.as_str(),
             &self.api_key,
             user_id,
