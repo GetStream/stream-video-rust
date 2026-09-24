@@ -9,6 +9,7 @@ use crate::rtc::{
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::thread;
+use webrtc::ice_transport::ice_gathering_state::RTCIceGatheringState;
 
 fn test_core() -> Arc<RtcCore> {
     test_core_with_config(ClientConfig::default())
@@ -1768,16 +1769,25 @@ async fn live_twirp_ice_trickle_framing_accepted() {
     }
 }
 
-/// Live proof that reconnect surfaces media-restoration failures.
-///
-/// A reconnect that fails while restoring the publisher must surface the error
-/// instead of silently reporting `Joined`. This joins a live call, publishes
-/// audio, injects a one-shot failure at the REJOIN published-restore hook, forces
-/// a REJOIN, and proves (1) the restore hook was reached and the injected failure
-/// propagated out of the attempt, and (2) the driver retried and recovered to
-/// `Joined` rather than leaving a failed attempt marked joined.
 #[tokio::test]
-async fn live_forced_media_restore_failure_is_surfaced_and_recovers() {
+async fn live_rejoin_restore_failure_is_surfaced_and_recovers() {
+    assert_live_restore_failure_is_surfaced_and_recovers(ReconnectStrategy::Rejoin).await;
+}
+
+#[tokio::test]
+async fn live_fast_restore_failure_is_surfaced_and_recovers() {
+    assert_live_restore_failure_is_surfaced_and_recovers(ReconnectStrategy::Fast).await;
+}
+
+#[tokio::test]
+async fn live_migrate_restore_failure_is_surfaced_and_recovers() {
+    assert_live_restore_failure_is_surfaced_and_recovers(ReconnectStrategy::Migrate).await;
+}
+
+/// Joins a live call, publishes audio, and forces a `strategy` reconnect that
+/// fails once after the published tracks are restored. The failure must end
+/// that attempt, and a retry must bring the call back to `Joined`.
+async fn assert_live_restore_failure_is_surfaced_and_recovers(strategy: ReconnectStrategy) {
     let _ = dotenvy::dotenv();
     let key = std::env::var("STREAM_API_KEY").unwrap_or_default();
     let secret = std::env::var("STREAM_API_SECRET").unwrap_or_default();
@@ -1832,17 +1842,27 @@ async fn live_forced_media_restore_failure_is_surfaced_and_recovers() {
             "initial joined",
         )
         .await;
+        // webrtc-rs cannot restart ICE while it gathers candidates.
+        wait_for(
+            Duration::from_secs(30),
+            || {
+                core.connection.try_lock().is_ok_and(|connection| {
+                    connection.as_ref().is_some_and(|connection| {
+                        connection.publisher.ice_gathering_state() == RTCIceGatheringState::Complete
+                    })
+                })
+            },
+            "publisher ICE gathering complete",
+        )
+        .await;
         let generation = core.lifecycle_snapshot().1;
 
         let probe = Arc::new(ReconnectProbe::default());
-        probe.fail_once(
-            ReconnectStrategy::Rejoin,
-            ReconnectFaultPoint::AfterPublishedRestore,
-        );
+        probe.fail_once(strategy, ReconnectFaultPoint::AfterPublishedRestore);
         core.install_reconnect_probe(probe.clone());
         core.trigger_reconnect(
             generation,
-            ReconnectStrategy::Rejoin,
+            strategy,
             "forced media restore failure".to_owned(),
         );
 
@@ -1852,9 +1872,8 @@ async fn live_forced_media_restore_failure_is_surfaced_and_recovers() {
                 .lock()
                 .unwrap_or_else(|error| error.into_inner())
                 .iter()
-                .any(|(strategy, point)| {
-                    *strategy == ReconnectStrategy::Rejoin
-                        && *point == ReconnectFaultPoint::AfterPublishedRestore
+                .any(|(restored, point)| {
+                    *restored == strategy && *point == ReconnectFaultPoint::AfterPublishedRestore
                 })
         };
         wait_for(
@@ -1876,12 +1895,12 @@ async fn live_forced_media_restore_failure_is_surfaced_and_recovers() {
         .await;
 
         feeder.abort();
-        let restores = probe
-            .restores
+        let attempts = probe
+            .attempts
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .clone();
-        (restores, core.state())
+        (attempts, core.state())
     })
     .await;
 
@@ -1890,14 +1909,12 @@ async fn live_forced_media_restore_failure_is_surfaced_and_recovers() {
         .delete(crate::models::DeleteCallRequest { hard: Some(true) })
         .await;
 
-    let (restores, final_state) = outcome.expect("media-restore test timed out (120s guard)");
-    eprintln!("RESTORE FAILURE: restores={restores:?} final_state={final_state:?}");
+    let (attempts, final_state) = outcome.expect("media-restore test timed out (120s guard)");
+    eprintln!("RESTORE FAILURE {strategy:?}: attempts={attempts:?} final_state={final_state:?}");
+    assert_eq!(attempts.first(), Some(&strategy));
     assert!(
-        restores.iter().any(|(strategy, point)| {
-            *strategy == ReconnectStrategy::Rejoin
-                && *point == ReconnectFaultPoint::AfterPublishedRestore
-        }),
-        "forced REJOIN published-restore failure was never reached/surfaced"
+        attempts.len() >= 2,
+        "the restore failure did not end the {strategy:?} attempt"
     );
     assert_eq!(
         final_state,
