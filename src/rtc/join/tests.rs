@@ -726,6 +726,98 @@ async fn leave_cancels_reconnect_task_before_next_generation() {
 }
 
 #[test]
+fn state_events_arrive_in_the_order_of_the_state_changes() {
+    let core = test_core();
+    let generation = core.begin_join().expect("join generation");
+    let mut events = core.subscribe();
+    let rounds = 20_000;
+    let barrier = Arc::new(std::sync::Barrier::new(3));
+    let workers = [CallingState::Joined, CallingState::Reconnecting].map(|state| {
+        let core = core.clone();
+        let barrier = barrier.clone();
+        thread::spawn(move || {
+            for _ in 0..rounds {
+                barrier.wait();
+                core.set_state_if_current(generation, state);
+                barrier.wait();
+            }
+        })
+    });
+
+    for round in 0..rounds {
+        barrier.wait();
+        barrier.wait();
+        let mut last = None;
+        while let Ok(event) = events.try_recv() {
+            if let CallEvent::CallingStateChanged(state) = event {
+                last = Some(state);
+            }
+        }
+        assert_eq!(last, Some(core.state()), "round {round}");
+    }
+    for worker in workers {
+        worker.join().expect("state worker");
+    }
+}
+
+#[test]
+fn setting_the_same_state_again_sends_no_event() {
+    let core = test_core();
+    let generation = core.begin_join().expect("join generation");
+    let mut events = core.subscribe();
+
+    assert!(core.set_state_if_current(generation, CallingState::Reconnecting));
+    assert!(core.set_state_if_current(generation, CallingState::Reconnecting));
+
+    assert!(matches!(
+        events.try_recv(),
+        Ok(CallEvent::CallingStateChanged(CallingState::Reconnecting))
+    ));
+    assert!(events.try_recv().is_err());
+}
+
+#[test]
+fn join_start_sends_joining() {
+    let core = test_core();
+    let mut events = core.subscribe();
+
+    core.begin_join().expect("join generation");
+
+    assert!(matches!(
+        events.try_recv(),
+        Ok(CallEvent::CallingStateChanged(CallingState::Joining))
+    ));
+}
+
+#[tokio::test]
+async fn state_during_leave_matches_the_last_state_event() {
+    let core = test_core();
+    let mut events = core.subscribe();
+    core.begin_join().expect("join generation");
+    let connection_slot = core.connection.lock().await;
+    let generation = core.generation();
+    let leave_core = core.clone();
+    let leave = tokio::spawn(async move { leave_core.leave("leave during join").await });
+    wait_for(
+        Duration::from_secs(1),
+        || core.generation() != generation,
+        "leave cancels the join",
+    )
+    .await;
+
+    let mut last = None;
+    while let Ok(event) = events.try_recv() {
+        if let CallEvent::CallingStateChanged(state) = event {
+            last = Some(state);
+        }
+    }
+    assert_eq!(last, Some(core.state()));
+    drop(connection_slot);
+    leave.await.expect("leave task").expect("leave");
+}
+
+
+#[test]
 fn stale_reconnect_completion_does_not_release_the_current_generation() {
     let core = test_core();
     let first = core.begin_join().expect("first generation");

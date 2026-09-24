@@ -11,7 +11,7 @@
 //! - a typed [`CallEvent`] broadcast stream (participant joined/left, tracks, …);
 //! - the reconnect state machine (`RtcCore::run_reconnect`) driven by the pure
 //!   decision logic in [`super::reconnect`], with dedup, the rejoin rate limiter,
-//!   the ICE / negotiation caps, the disconnection timeout, and the
+//!   the ICE / negotiation limits, the disconnection timeout, and the
 //!   `restore_published_tracks` / `restore_subscribed_tracks` hooks.
 //!
 //! This root file holds [`RtcCore`] itself — its fields, lifecycle/generation
@@ -59,7 +59,7 @@ use super::proto::models::{self, PeerType, TrackType};
 use super::proto::signal;
 use super::publish_options::ClientPublishOptions;
 use super::reconnect::{
-    self, FailureCaps, ReconnectStrategy, SlidingWindowRateLimiter, escalate_strategy,
+    self, FailureLimits, ReconnectStrategy, SlidingWindowRateLimiter, escalate_strategy,
     strategy_after_signal_close,
 };
 use super::sfu::signal::SignalClient;
@@ -276,6 +276,17 @@ struct Lifecycle {
     generation_publish_options: ClientPublishOptions,
 }
 
+impl Lifecycle {
+    /// Call with the lifecycle lock held, so events arrive in the order of the
+    /// state changes.
+    fn set_state(&mut self, next: CallingState, events: &broadcast::Sender<CallEvent>) {
+        if self.state != next {
+            self.state = next;
+            let _ = events.send(CallEvent::CallingStateChanged(next));
+        }
+    }
+}
+
 /// A live SFU connection bundle. Swapped out wholesale on REJOIN/MIGRATE.
 struct Connection {
     generation: u64,
@@ -484,7 +495,7 @@ pub struct RtcCore {
     stats_options: StdMutex<StatsOptions>,
     own_capabilities: StdMutex<HashSet<String>>,
     disconnection_timeout: StdMutex<Duration>,
-    caps: StdMutex<FailureCaps>,
+    failure_limits: StdMutex<FailureLimits>,
     rate_limiter: StdMutex<SlidingWindowRateLimiter>,
     confirmed_bad_sfus: StdMutex<Vec<String>>,
     reconnect_edge_failures: StdMutex<HashMap<String, u32>>,
@@ -560,7 +571,7 @@ impl RtcCore {
             stats_options: StdMutex::new(StatsOptions::default()),
             own_capabilities: StdMutex::new(HashSet::new()),
             disconnection_timeout: StdMutex::new(Duration::ZERO),
-            caps: StdMutex::new(FailureCaps::default()),
+            failure_limits: StdMutex::new(FailureLimits::default()),
             rate_limiter: StdMutex::new(SlidingWindowRateLimiter::rejoin_default()),
             confirmed_bad_sfus: StdMutex::new(Vec::new()),
             reconnect_edge_failures: StdMutex::new(HashMap::new()),
@@ -658,14 +669,11 @@ impl RtcCore {
     }
 
     fn set_state_if_current(&self, generation: u64, next: CallingState) -> bool {
-        {
-            let mut guard = self.lifecycle.lock().unwrap_or_else(|e| e.into_inner());
-            if guard.generation != generation {
-                return false;
-            }
-            guard.state = next;
+        let mut guard = self.lifecycle.lock().unwrap_or_else(|e| e.into_inner());
+        if guard.generation != generation {
+            return false;
         }
-        let _ = self.events_tx.send(CallEvent::CallingStateChanged(next));
+        guard.set_state(next, &self.events_tx);
         true
     }
 
@@ -724,7 +732,7 @@ impl RtcCore {
             match guard.state {
                 CallingState::Idle | CallingState::Left => {
                     guard.generation = guard.generation.wrapping_add(1);
-                    guard.state = CallingState::Joining;
+                    guard.set_state(CallingState::Joining, &self.events_tx);
                     guard.generation_publish_options = guard.publish_options;
                     guard.generation
                 }
@@ -741,7 +749,10 @@ impl RtcCore {
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = None;
         self.reconnect_attempts.store(0, Ordering::SeqCst);
-        *self.caps.lock().unwrap_or_else(|e| e.into_inner()) = FailureCaps::default();
+        *self
+            .failure_limits
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = FailureLimits::default();
         *self.rate_limiter.lock().unwrap_or_else(|e| e.into_inner()) =
             SlidingWindowRateLimiter::rejoin_default();
         self.confirmed_bad_sfus
@@ -759,9 +770,6 @@ impl RtcCore {
         let generation = {
             let mut guard = self.lifecycle.lock().unwrap_or_else(|e| e.into_inner());
             guard.generation = guard.generation.wrapping_add(1);
-            if guard.state == CallingState::Joining {
-                guard.state = CallingState::Reconnecting;
-            }
             guard.generation
         };
         self.lifecycle_changed.notify_waiters();

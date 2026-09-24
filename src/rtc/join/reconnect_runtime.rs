@@ -206,7 +206,7 @@ impl RtcCore {
     }
 
     /// The reconnect state machine loop (JS `Call.reconnect`). Honors the rejoin
-    /// rate limiter, ICE / negotiation caps, the disconnection timeout, and the
+    /// rate limiter, ICE / negotiation limits, the disconnection timeout, and the
     /// restore hooks. Bounded: it stops when `JOINED`, `RECONNECTING_FAILED`, or
     /// `LEFT`, so it can never spin.
     pub(super) async fn run_reconnect(
@@ -242,7 +242,7 @@ impl RtcCore {
 
         if reason == reconnect::REASON_ICE_UNSUPPORTED {
             let tripped = self
-                .caps
+                .failure_limits
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .record_ice_never_connected();
@@ -301,7 +301,7 @@ impl RtcCore {
             };
             match outcome {
                 Ok(()) => {
-                    self.caps
+                    self.failure_limits
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
                         .reset_negotiation();
@@ -325,7 +325,7 @@ impl RtcCore {
                     }
                     if matches!(err, RtcError::Negotiation(_)) {
                         let tripped = self
-                            .caps
+                            .failure_limits
                             .lock()
                             .unwrap_or_else(|e| e.into_inner())
                             .record_negotiation_failure();

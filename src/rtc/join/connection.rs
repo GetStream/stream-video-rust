@@ -129,7 +129,7 @@ pub(super) fn register_connection_state(
             tracer.trace("connectionstatechange", json!(state.to_string()));
             if state == RTCPeerConnectionState::Connected {
                 ever_connected.store(true, Ordering::SeqCst);
-                core.caps
+                core.failure_limits
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .reset_ice();

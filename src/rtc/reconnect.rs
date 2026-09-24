@@ -3,7 +3,7 @@
 //! Ported from JS `Call.ts` + `coordinator/connection/utils.ts`. Everything in
 //! this module is deterministic (or jitter-only) and side-effect free so it can
 //! be unit-tested without a live SFU: backoff intervals, the rejoin rate
-//! limiter, the ICE / negotiation failure caps, the join-retry decision, and
+//! limiter, the ICE / negotiation failure limits, the join-retry decision, and
 //! the FAST→REJOIN escalation rule. The orchestration that *acts* on these
 //! decisions lives in [`super::join`].
 
@@ -196,17 +196,17 @@ impl SlidingWindowRateLimiter {
     }
 }
 
-/// Tracks the failure caps that force the reconnect loop to give up (JS
+/// Tracks the failure limits that force the reconnect loop to give up (JS
 /// `iceFailuresWithoutConnect` / `consecutiveNegotiationFailures`).
 #[derive(Debug, Clone)]
-pub struct FailureCaps {
+pub struct FailureLimits {
     ice_failures_without_connect: u32,
     consecutive_negotiation_failures: u32,
     max_ice_failures: u32,
     max_consecutive_negotiation: u32,
 }
 
-impl Default for FailureCaps {
+impl Default for FailureLimits {
     fn default() -> Self {
         Self {
             ice_failures_without_connect: 0,
@@ -217,8 +217,8 @@ impl Default for FailureCaps {
     }
 }
 
-impl FailureCaps {
-    /// Record an ICE-never-connected failure. Returns `true` when the cap (2) is
+impl FailureLimits {
+    /// Record an ICE-never-connected failure. Returns `true` when the limit (2) is
     /// reached and the caller must `leave` with `webrtc_unsupported_network`.
     pub fn record_ice_never_connected(&mut self) -> bool {
         self.ice_failures_without_connect += 1;
@@ -230,7 +230,7 @@ impl FailureCaps {
         self.ice_failures_without_connect = 0;
     }
 
-    /// Record a negotiation failure. Returns `true` when the cap (3) is reached
+    /// Record a negotiation failure. Returns `true` when the limit (3) is reached
     /// and the caller must `leave` with `repeated_negotiation_failures`.
     pub fn record_negotiation_failure(&mut self) -> bool {
         self.consecutive_negotiation_failures += 1;
@@ -361,23 +361,23 @@ mod tests {
     }
 
     #[test]
-    fn ice_cap_trips_on_second_failure() {
-        let mut caps = FailureCaps::default();
-        assert!(!caps.record_ice_never_connected());
-        assert!(caps.record_ice_never_connected());
+    fn ice_limit_trips_on_second_failure() {
+        let mut limits = FailureLimits::default();
+        assert!(!limits.record_ice_never_connected());
+        assert!(limits.record_ice_never_connected());
         // reset clears it
-        caps.reset_ice();
-        assert!(!caps.record_ice_never_connected());
+        limits.reset_ice();
+        assert!(!limits.record_ice_never_connected());
     }
 
     #[test]
-    fn negotiation_cap_trips_on_third_failure() {
-        let mut caps = FailureCaps::default();
-        assert!(!caps.record_negotiation_failure());
-        assert!(!caps.record_negotiation_failure());
-        assert!(caps.record_negotiation_failure());
-        caps.reset_negotiation();
-        assert!(!caps.record_negotiation_failure());
+    fn negotiation_limit_trips_on_third_failure() {
+        let mut limits = FailureLimits::default();
+        assert!(!limits.record_negotiation_failure());
+        assert!(!limits.record_negotiation_failure());
+        assert!(limits.record_negotiation_failure());
+        limits.reset_negotiation();
+        assert!(!limits.record_negotiation_failure());
     }
 
     #[test]
