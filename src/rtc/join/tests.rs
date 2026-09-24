@@ -895,6 +895,146 @@ async fn token_load_that_ends_after_a_new_join_keeps_the_new_token() {
     );
 }
 
+#[tokio::test]
+async fn work_that_ends_after_its_generation_changed_is_cancelled() {
+    let core = test_core();
+    let generation = core.begin_join().expect("join generation");
+    let work_core = core.clone();
+
+    let result = core
+        .while_generation(generation, async move {
+            work_core.cancel_generation();
+        })
+        .await;
+
+    assert!(result.is_err());
+}
+
+#[tokio::test]
+async fn work_for_a_stale_generation_never_runs() {
+    let core = test_core();
+    let generation = core.begin_join().expect("join generation");
+    core.cancel_generation();
+    let ran = Arc::new(AtomicBool::new(false));
+    let work_ran = ran.clone();
+
+    let result = core
+        .while_generation(generation, async move {
+            work_ran.store(true, Ordering::SeqCst);
+        })
+        .await;
+
+    assert!(result.is_err());
+    assert!(!ran.load(Ordering::SeqCst));
+}
+
+#[test]
+fn concurrent_reconnect_claims_have_one_winner() {
+    let core = test_core();
+    let generation = core.begin_join().expect("join generation");
+    let rounds = 5_000;
+    let claimers = 4;
+    let barrier = Arc::new(std::sync::Barrier::new(claimers + 1));
+    let wins = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let workers: Vec<_> = (0..claimers)
+        .map(|_| {
+            let core = core.clone();
+            let barrier = barrier.clone();
+            let wins = wins.clone();
+            thread::spawn(move || {
+                for _ in 0..rounds {
+                    barrier.wait();
+                    if core.claim_reconnect(generation) {
+                        wins.fetch_add(1, Ordering::SeqCst);
+                    }
+                    barrier.wait();
+                }
+            })
+        })
+        .collect();
+
+    for round in 0..rounds {
+        barrier.wait();
+        barrier.wait();
+        assert_eq!(wins.swap(0, Ordering::SeqCst), 1, "round {round}");
+        core.release_reconnect(generation);
+    }
+    for worker in workers {
+        worker.join().expect("claim worker");
+    }
+}
+
+#[test]
+fn second_migration_waiter_for_a_generation_is_rejected() {
+    let core = test_core();
+    let generation = core.begin_join().expect("join generation");
+    let (first, _first_receiver) = tokio::sync::oneshot::channel();
+    let (second, _second_receiver) = tokio::sync::oneshot::channel();
+    core.install_migration_waiter(generation, first)
+        .expect("first migration waiter");
+
+    assert!(matches!(
+        core.install_migration_waiter(generation, second),
+        Err(RtcError::IllegalState(_))
+    ));
+}
+
+#[tokio::test]
+async fn migration_waiter_of_a_new_generation_replaces_the_old_one() {
+    let core = test_core();
+    let first = core.begin_join().expect("first generation");
+    let (old_sender, old_receiver) = tokio::sync::oneshot::channel();
+    core.install_migration_waiter(first, old_sender)
+        .expect("old migration waiter");
+    core.leave("next generation").await.expect("leave");
+    let second = core.begin_join().expect("second generation");
+    let (sender, mut receiver) = tokio::sync::oneshot::channel();
+
+    core.install_migration_waiter(second, sender)
+        .expect("new migration waiter");
+
+    assert!(old_receiver.await.is_err());
+    core.complete_migration(second);
+    assert_eq!(receiver.try_recv(), Ok(()));
+}
+
+#[test]
+fn user_query_needs_the_coordinator_connection_of_the_current_generation() {
+    let core = test_core();
+    let generation = prepare_joined_core(&core, "alice");
+    *core
+        .coordinator_connection_id
+        .lock()
+        .unwrap_or_else(|error| error.into_inner()) =
+        Some((generation.wrapping_sub(1), "old-connection".to_owned()));
+
+    assert!(core.user_request_query().is_none());
+    assert!(core.user_auth().is_none());
+}
+
+#[test]
+fn user_query_needs_a_connection_id_and_a_user_id() {
+    let core = test_core();
+    let generation = prepare_joined_core(&core, "alice");
+    let set_connection_id = |id: &str| {
+        *core
+            .coordinator_connection_id
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some((generation, id.to_owned()));
+    };
+
+    set_connection_id("");
+    assert!(core.user_request_query().is_none());
+
+    set_connection_id("connection-1");
+    core.join_data
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .user_id
+        .clear();
+    assert!(core.user_request_query().is_none());
+}
+
 #[test]
 fn stale_reconnect_completion_does_not_release_the_current_generation() {
     let core = test_core();
