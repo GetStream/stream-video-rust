@@ -8,6 +8,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::task::JoinHandle;
 use webrtc::peer_connection::RTCPeerConnection;
@@ -15,7 +16,7 @@ use webrtc::peer_connection::sdp::sdp_type::RTCSdpType;
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
 use webrtc::peer_connection::signaling_state::RTCSignalingState;
 
-use crate::rtc::error::{NegotiationError, Result, RtcError};
+use crate::rtc::error::{NegotiationError, Result, RtcError, SfuTimeoutError};
 use crate::rtc::proto::models::{PublishOption, TrackInfo, TrackType};
 use crate::rtc::proto::signal::SetPublisherRequest;
 use crate::rtc::sfu::signal::SignalClient;
@@ -81,9 +82,30 @@ pub(crate) async fn restart_ice(
     if tracks.is_empty() {
         return Ok(());
     }
-    publisher.restart_ice().await.map_err(neg)?;
+    // webrtc-rs rejects an ICE restart while it gathers candidates.
+    let deadline = tokio::time::Instant::now() + ICE_GATHERING_TIMEOUT;
+    loop {
+        match publisher.restart_ice().await {
+            Err(webrtc::Error::Ice(webrtc::ice::Error::ErrRestartWhenGathering)) => {
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(RtcError::Timeout(SfuTimeoutError::new(
+                        "publisher ICE gathering",
+                        ICE_GATHERING_TIMEOUT,
+                    )));
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            result => {
+                result.map_err(neg)?;
+                break;
+            }
+        }
+    }
     negotiate_publish(publisher, signal, session_id, tracks, publish_options).await
 }
+
+/// Longer than the 5 s STUN timeout of webrtc-rs candidate gathering.
+const ICE_GATHERING_TIMEOUT: Duration = Duration::from_secs(10);
 
 fn neg(e: impl std::fmt::Display) -> RtcError {
     RtcError::Negotiation(NegotiationError(e.to_string()))

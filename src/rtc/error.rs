@@ -79,7 +79,7 @@ pub enum RtcError {
     #[error(transparent)]
     Join(#[from] SfuJoinError),
 
-    /// A client deadline elapsed waiting for the SFU (WS open or `JoinResponse`).
+    /// A client deadline elapsed, e.g. waiting for the SFU `JoinResponse`.
     #[error(transparent)]
     Timeout(#[from] SfuTimeoutError),
 
@@ -333,9 +333,9 @@ impl SfuJoinError {
     }
 }
 
-/// A client-side deadline elapsed waiting for the SFU (WS open or `JoinResponse`).
+/// A client-side deadline elapsed.
 #[derive(Debug, Clone, thiserror::Error)]
-#[error("sfu timeout waiting for {what} after {}ms", timeout.as_millis())]
+#[error("timeout waiting for {what} after {}ms", timeout.as_millis())]
 pub struct SfuTimeoutError {
     /// What we were waiting for, e.g. `"join response"`.
     pub what: String,

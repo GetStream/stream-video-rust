@@ -9,7 +9,6 @@ use crate::rtc::{
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::thread;
-use webrtc::ice_transport::ice_gathering_state::RTCIceGatheringState;
 
 fn test_core() -> Arc<RtcCore> {
     test_core_with_config(ClientConfig::default())
@@ -1784,16 +1783,50 @@ async fn live_migrate_restore_failure_is_surfaced_and_recovers() {
     assert_live_restore_failure_is_surfaced_and_recovers(ReconnectStrategy::Migrate).await;
 }
 
-/// Joins a live call, publishes audio, and forces a `strategy` reconnect that
-/// fails once after the published tracks are restored. The failure must end
-/// that attempt, and a retry must bring the call back to `Joined`.
+#[tokio::test]
+async fn live_fast_reconnect_during_ice_gathering_succeeds_at_once() {
+    let Some((attempts, final_state)) = live_forced_reconnect(ReconnectStrategy::Fast, None).await
+    else {
+        return;
+    };
+    assert_eq!(attempts, [ReconnectStrategy::Fast]);
+    assert_eq!(final_state, CallingState::Joined);
+}
+
+/// A reconnect that fails once after the published tracks are restored must
+/// end that attempt, and a retry must bring the call back to `Joined`.
 async fn assert_live_restore_failure_is_surfaced_and_recovers(strategy: ReconnectStrategy) {
+    let Some((attempts, final_state)) =
+        live_forced_reconnect(strategy, Some(ReconnectFaultPoint::AfterPublishedRestore)).await
+    else {
+        return;
+    };
+    assert_eq!(attempts.first(), Some(&strategy));
+    assert!(
+        attempts.len() >= 2,
+        "the restore failure did not end the {strategy:?} attempt"
+    );
+    assert_eq!(
+        final_state,
+        CallingState::Joined,
+        "reconnect did not recover after a surfaced media-restoration failure"
+    );
+}
+
+/// Joins a live call, publishes audio, and forces a `strategy` reconnect at
+/// once. The reconnect fails once at `fault`, if given. Returns the reconnect
+/// attempts and the state after the reconnect settles, or `None` without
+/// credentials.
+async fn live_forced_reconnect(
+    strategy: ReconnectStrategy,
+    fault: Option<ReconnectFaultPoint>,
+) -> Option<(Vec<ReconnectStrategy>, CallingState)> {
     let _ = dotenvy::dotenv();
     let key = std::env::var("STREAM_API_KEY").unwrap_or_default();
     let secret = std::env::var("STREAM_API_SECRET").unwrap_or_default();
     if key.is_empty() || secret.is_empty() {
-        eprintln!("SKIP: STREAM creds absent; skipping live media-restore failure probe");
-        return;
+        eprintln!("SKIP: STREAM creds absent; skipping live forced reconnect");
+        return None;
     }
 
     let stream = crate::Stream::new(key, secret).expect("client");
@@ -1842,52 +1875,47 @@ async fn assert_live_restore_failure_is_surfaced_and_recovers(strategy: Reconnec
             "initial joined",
         )
         .await;
-        // webrtc-rs cannot restart ICE while it gathers candidates.
-        wait_for(
-            Duration::from_secs(30),
-            || {
-                core.connection.try_lock().is_ok_and(|connection| {
-                    connection.as_ref().is_some_and(|connection| {
-                        connection.publisher.ice_gathering_state() == RTCIceGatheringState::Complete
-                    })
-                })
-            },
-            "publisher ICE gathering complete",
-        )
-        .await;
         let generation = core.lifecycle_snapshot().1;
 
         let probe = Arc::new(ReconnectProbe::default());
-        probe.fail_once(strategy, ReconnectFaultPoint::AfterPublishedRestore);
+        if let Some(point) = fault {
+            probe.fail_once(strategy, point);
+        }
         core.install_reconnect_probe(probe.clone());
-        core.trigger_reconnect(
-            generation,
-            strategy,
-            "forced media restore failure".to_owned(),
-        );
+        core.trigger_reconnect(generation, strategy, "forced reconnect".to_owned());
 
-        let reached = |probe: &Arc<ReconnectProbe>| {
-            probe
-                .restores
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .iter()
-                .any(|(restored, point)| {
-                    *restored == strategy && *point == ReconnectFaultPoint::AfterPublishedRestore
-                })
-        };
         wait_for(
             Duration::from_secs(45),
-            || reached(&probe),
-            "forced restore fault reached",
+            || {
+                !probe
+                    .attempts
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .is_empty()
+            },
+            "reconnect started",
         )
         .await;
+        if let Some(fault) = fault {
+            wait_for(
+                Duration::from_secs(45),
+                || {
+                    probe
+                        .restores
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner())
+                        .contains(&(strategy, fault))
+                },
+                "forced fault reached",
+            )
+            .await;
+        }
         wait_for(
             Duration::from_secs(45),
             || {
                 matches!(
                     core.state(),
-                    CallingState::Joined | CallingState::ReconnectingFailed
+                    CallingState::Joined | CallingState::ReconnectingFailed | CallingState::Left
                 )
             },
             "reconnect settled",
@@ -1909,16 +1937,10 @@ async fn assert_live_restore_failure_is_surfaced_and_recovers(strategy: Reconnec
         .delete(crate::models::DeleteCallRequest { hard: Some(true) })
         .await;
 
-    let (attempts, final_state) = outcome.expect("media-restore test timed out (120s guard)");
-    eprintln!("RESTORE FAILURE {strategy:?}: attempts={attempts:?} final_state={final_state:?}");
-    assert_eq!(attempts.first(), Some(&strategy));
-    assert!(
-        attempts.len() >= 2,
-        "the restore failure did not end the {strategy:?} attempt"
+    let outcome = outcome.expect("forced reconnect timed out (120s guard)");
+    eprintln!(
+        "FORCED RECONNECT {strategy:?} fault={fault:?}: attempts={:?} final_state={:?}",
+        outcome.0, outcome.1
     );
-    assert_eq!(
-        final_state,
-        CallingState::Joined,
-        "reconnect did not recover after a surfaced media-restoration failure"
-    );
+    Some(outcome)
 }
