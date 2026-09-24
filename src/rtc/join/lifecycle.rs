@@ -217,7 +217,6 @@ impl RtcCore {
                         return Err(join_cancelled());
                     }
                     tracing::info!(cid = %self.cid(), edge = %success.edge_name, "stream.rtc.joined");
-                    *self.started.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
                     if !self.set_state_if_current(generation, CallingState::Joined) {
                         return Err(join_cancelled());
                     }

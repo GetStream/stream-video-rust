@@ -172,8 +172,6 @@ pub enum CallingState {
     ReconnectingFailed,
     /// Left (terminal).
     Left,
-    /// Network is offline; waiting to resume.
-    Offline,
 }
 
 /// A typed SFU event delivered on the [`Call`](crate::Call) event stream.
@@ -502,7 +500,6 @@ pub struct RtcCore {
     next_connection_epoch: AtomicU64,
     migration_waiter: StdMutex<Option<(u64, tokio::sync::oneshot::Sender<()>)>>,
     join_data: StdMutex<JoinCallData>,
-    started: StdMutex<Option<Instant>>,
     /// Stable session id spanning reconnects within one join→leave lifecycle,
     /// reported as `SendStats.unified_session_id` so the dashboard correlates a
     /// participant across FAST/REJOIN/MIGRATE (JS `unifiedSessionId`).
@@ -576,7 +573,6 @@ impl RtcCore {
             next_connection_epoch: AtomicU64::new(0),
             migration_waiter: StdMutex::new(None),
             join_data: StdMutex::new(JoinCallData::new("")),
-            started: StdMutex::new(None),
             unified_session_id: StdMutex::new(String::new()),
             on_track_cb: StdMutex::new(None),
             sub_config: StdMutex::new(SubscriptionConfig::default()),
