@@ -852,6 +852,49 @@ async fn late_reconnect_task_does_not_count_toward_the_next_join() {
     core.leave("cleanup").await.expect("cleanup leave");
 }
 
+#[tokio::test]
+async fn token_load_that_ends_after_a_new_join_keeps_the_new_token() {
+    let core = test_core();
+    let generation = prepare_joined_core(&core, "alice");
+    let old_token = core
+        .user_token
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .clone();
+    let weak_core = Arc::downgrade(&core);
+    let provider = move || {
+        let weak_core = weak_core.clone();
+        let old_token = old_token.clone();
+        async move {
+            // A new join starts in the same poll in which this load ends.
+            if let Some(core) = weak_core.upgrade() {
+                core.cancel_generation();
+                *core
+                    .user_token
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner()) = "new-join-token".to_owned();
+            }
+            Ok(old_token)
+        }
+    };
+    *core
+        .token_source
+        .lock()
+        .unwrap_or_else(|error| error.into_inner()) =
+        Some(UserTokenSource::Provider(Arc::new(provider)));
+
+    let result = core.reload_user_token(generation).await;
+
+    assert!(result.is_err());
+    assert_eq!(
+        *core
+            .user_token
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()),
+        "new-join-token"
+    );
+}
+
 #[test]
 fn stale_reconnect_completion_does_not_release_the_current_generation() {
     let core = test_core();

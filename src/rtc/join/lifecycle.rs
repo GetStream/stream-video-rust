@@ -36,7 +36,7 @@ impl RtcCore {
             *source = Some(token_source);
         }
         let user_token = match self
-            .while_generation(generation, self.reload_user_token())
+            .while_generation(generation, self.reload_user_token(generation))
             .await
             .and_then(|result| result)
         {
@@ -73,7 +73,7 @@ impl RtcCore {
         result
     }
 
-    pub(super) async fn reload_user_token(&self) -> Result<String> {
+    pub(super) async fn reload_user_token(&self, generation: u64) -> Result<String> {
         let _refresh = self.token_refresh.lock().await;
         let source = self
             .token_source
@@ -88,6 +88,10 @@ impl RtcCore {
             .user_id
             .clone();
         let token = source.load_with_expiry_retry(&user_id).await?;
+        let lifecycle = self.lifecycle.lock().unwrap_or_else(|e| e.into_inner());
+        if lifecycle.generation != generation {
+            return Err(join_cancelled());
+        }
         *self.user_token.lock().unwrap_or_else(|e| e.into_inner()) = token.clone();
         Ok(token)
     }
@@ -108,7 +112,7 @@ impl RtcCore {
         Ok(token)
     }
 
-    pub(super) async fn refresh_expired_user_token(&self) -> Result<String> {
+    pub(super) async fn refresh_expired_user_token(&self, generation: u64) -> Result<String> {
         let can_refresh = self
             .token_source
             .lock()
@@ -120,10 +124,10 @@ impl RtcCore {
                 crate::error::TokenError::ExpiredByServer,
             ));
         }
-        self.reload_user_token().await
+        self.reload_user_token(generation).await
     }
 
-    pub(super) async fn refresh_before_full_reconnect(&self) -> Result<String> {
+    pub(super) async fn refresh_before_full_reconnect(&self, generation: u64) -> Result<String> {
         let refresh = self
             .token_source
             .lock()
@@ -131,11 +135,13 @@ impl RtcCore {
             .as_ref()
             .is_some_and(UserTokenSource::refreshes_before_full_reconnect);
         if refresh {
-            self.reload_user_token().await
+            self.reload_user_token(generation).await
         } else {
             match self.current_user_token() {
                 Ok(token) => Ok(token),
-                Err(error) if error.is_token_expired() => self.refresh_expired_user_token().await,
+                Err(error) if error.is_token_expired() => {
+                    self.refresh_expired_user_token(generation).await
+                }
                 Err(error) => Err(error),
             }
         }
@@ -198,7 +204,7 @@ impl RtcCore {
                     .err()
                     .is_some_and(|(error, _)| error.is_token_expired());
                 if is_expired && !expired_retry_used {
-                    user_token = self.refresh_expired_user_token().await?;
+                    user_token = self.refresh_expired_user_token(generation).await?;
                     expired_retry_used = true;
                     continue;
                 }

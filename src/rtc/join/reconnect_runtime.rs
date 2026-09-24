@@ -496,7 +496,7 @@ impl RtcCore {
             .await?,
         );
 
-        let mut token = self.refresh_before_full_reconnect().await?;
+        let mut token = self.refresh_before_full_reconnect(generation).await?;
         self.ensure_coordinator_events(generation, &token).await?;
         let reconnect_attempt = self.reconnect_attempts.load(Ordering::SeqCst);
         let mut result = self
@@ -517,7 +517,7 @@ impl RtcCore {
             .err()
             .is_some_and(|(error, _)| error.is_token_expired())
         {
-            token = self.refresh_expired_user_token().await?;
+            token = self.refresh_expired_user_token(generation).await?;
             result = self
                 .clone()
                 .join_once(JoinOnceOptions {
@@ -563,7 +563,7 @@ impl RtcCore {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone();
-        let mut token = self.refresh_before_full_reconnect().await?;
+        let mut token = self.refresh_before_full_reconnect(generation).await?;
         self.ensure_coordinator_events(generation, &token).await?;
         let (previous_session_id, migrating_from, old_reconnect_enabled) = {
             let guard = self.connection.lock().await;
@@ -622,7 +622,7 @@ impl RtcCore {
             .err()
             .is_some_and(|(error, _)| error.is_token_expired())
         {
-            token = match self.refresh_expired_user_token().await {
+            token = match self.refresh_expired_user_token(generation).await {
                 Ok(token) => token,
                 Err(error) => {
                     drop(self.take_migration_waiter(generation));
