@@ -162,6 +162,7 @@ impl RtcCore {
         let mut migrating_from: Option<String> = None;
         let mut edge_failures: std::collections::HashMap<String, u32> =
             std::collections::HashMap::new();
+        let mut confirmed_bad_sfus: Vec<String> = Vec::new();
         let mut last_err: Option<RtcError> = None;
         let mut expired_retry_used = false;
 
@@ -174,13 +175,7 @@ impl RtcCore {
                 notify: data.notify.then_some(true),
                 video: data.video.then_some(true),
                 migrating_from: migrating_from.clone(),
-                migrating_from_list: {
-                    let bad = self
-                        .confirmed_bad_sfus
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner());
-                    bad.clone()
-                },
+                migrating_from_list: confirmed_bad_sfus.clone(),
                 ..Default::default()
             };
 
@@ -258,12 +253,8 @@ impl RtcCore {
                         reconnect::JoinAttemptOutcome::Retry { delay, switch_sfu } => {
                             if switch_sfu && let Some(edge) = edge_name {
                                 migrating_from = Some(edge.clone());
-                                let mut bad = self
-                                    .confirmed_bad_sfus
-                                    .lock()
-                                    .unwrap_or_else(|e| e.into_inner());
-                                if !bad.contains(&edge) {
-                                    bad.push(edge);
+                                if !confirmed_bad_sfus.contains(&edge) {
+                                    confirmed_bad_sfus.push(edge);
                                 }
                             }
                             last_err = Some(err);

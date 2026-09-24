@@ -129,10 +129,10 @@ pub(super) fn register_connection_state(
             tracer.trace("connectionstatechange", json!(state.to_string()));
             if state == RTCPeerConnectionState::Connected {
                 ever_connected.store(true, Ordering::SeqCst);
-                core.failure_limits
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .reset_ice();
+                let mut lifecycle = core.lifecycle.lock().unwrap_or_else(|e| e.into_inner());
+                if lifecycle.generation == generation {
+                    lifecycle.failure_limits.reset_ice();
+                }
             }
             if state == RTCPeerConnectionState::Failed && reconnect_enabled.load(Ordering::SeqCst) {
                 let (pub_h, sub_h) = core.pc_health().await;

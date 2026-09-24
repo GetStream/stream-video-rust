@@ -222,14 +222,7 @@ impl RtcCore {
         let start = Instant::now();
         let mut attempt = 0;
         let mut was_migrating = strategy == ReconnectStrategy::Migrate;
-        self.reconnect_edge_failures
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clear();
-        self.confirmed_bad_sfus
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clear();
+        let mut sfu_failures = SfuRejoinFailures::default();
 
         self.set_state_if_current(
             generation,
@@ -241,12 +234,12 @@ impl RtcCore {
         );
 
         if reason == reconnect::REASON_ICE_UNSUPPORTED {
-            let tripped = self
-                .failure_limits
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .record_ice_never_connected();
-            if tripped {
+            let limit_reached = {
+                let mut lifecycle = self.lifecycle.lock().unwrap_or_else(|e| e.into_inner());
+                lifecycle.generation == generation
+                    && lifecycle.failure_limits.record_ice_never_connected()
+            };
+            if limit_reached {
                 let _ = self.leave(reconnect::REASON_ICE_UNSUPPORTED).await;
                 return;
             }
@@ -277,11 +270,13 @@ impl RtcCore {
             // Rate limit only REJOIN/MIGRATE.
             if strategy.is_rate_limited() {
                 let now_ms = elapsed_ms();
-                let allowed = self
-                    .rate_limiter
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .try_register(now_ms);
+                let allowed = {
+                    let mut lifecycle = self.lifecycle.lock().unwrap_or_else(|e| e.into_inner());
+                    if lifecycle.generation != generation {
+                        return;
+                    }
+                    lifecycle.rate_limiter.try_register(now_ms)
+                };
                 if !allowed {
                     let _ = self.leave(reconnect::REASON_REJOIN_LIMIT).await;
                     return;
@@ -292,7 +287,8 @@ impl RtcCore {
             let outcome = match self
                 .while_generation(
                     generation,
-                    self.clone().reconnect_once(generation, strategy, &reason),
+                    self.clone()
+                        .reconnect_once(generation, strategy, &reason, &mut sfu_failures),
                 )
                 .await
             {
@@ -301,10 +297,13 @@ impl RtcCore {
             };
             match outcome {
                 Ok(()) => {
-                    self.failure_limits
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .reset_negotiation();
+                    {
+                        let mut lifecycle =
+                            self.lifecycle.lock().unwrap_or_else(|e| e.into_inner());
+                        if lifecycle.generation == generation {
+                            lifecycle.failure_limits.reset_negotiation();
+                        }
+                    }
                     self.set_state_if_current(generation, CallingState::Joined);
                     return;
                 }
@@ -324,12 +323,13 @@ impl RtcCore {
                         return;
                     }
                     if matches!(err, RtcError::Negotiation(_)) {
-                        let tripped = self
-                            .failure_limits
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .record_negotiation_failure();
-                        if tripped {
+                        let limit_reached = {
+                            let mut lifecycle =
+                                self.lifecycle.lock().unwrap_or_else(|e| e.into_inner());
+                            lifecycle.generation == generation
+                                && lifecycle.failure_limits.record_negotiation_failure()
+                        };
+                        if limit_reached {
                             let _ = self.leave(reconnect::REASON_NEGOTIATION_FAILURES).await;
                             return;
                         }
@@ -377,11 +377,15 @@ impl RtcCore {
         generation: u64,
         strategy: ReconnectStrategy,
         reason: &str,
+        sfu_failures: &mut SfuRejoinFailures,
     ) -> Result<()> {
         self.observe_reconnect(strategy, ReconnectFaultPoint::BeforeAttempt)?;
         match strategy {
             ReconnectStrategy::Fast => self.reconnect_fast(generation, reason).await,
-            ReconnectStrategy::Rejoin => self.reconnect_rejoin(generation, reason).await,
+            ReconnectStrategy::Rejoin => {
+                self.reconnect_rejoin(generation, reason, sfu_failures)
+                    .await
+            }
             ReconnectStrategy::Migrate => self.reconnect_migrate(generation, reason).await,
             ReconnectStrategy::Disconnect => Err(RtcError::IllegalState(
                 "disconnect strategy must leave the call".to_owned(),
@@ -448,6 +452,7 @@ impl RtcCore {
         self: Arc<Self>,
         generation: u64,
         reason: &str,
+        sfu_failures: &mut SfuRejoinFailures,
     ) -> Result<()> {
         let data = self
             .join_data
@@ -469,11 +474,7 @@ impl RtcCore {
             }
         };
 
-        let confirmed_bad_sfus = self
-            .confirmed_bad_sfus
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone();
+        let confirmed_bad_sfus = sfu_failures.confirmed().to_vec();
         let request = JoinCallRequest {
             location: data
                 .location
@@ -535,7 +536,7 @@ impl RtcCore {
             Ok(_) => {}
             Err((error, edge)) => {
                 if let Some(edge) = edge {
-                    self.record_reconnect_edge_failure(&edge, error.is_join_error_code());
+                    sfu_failures.record(&edge, error.is_join_error_code());
                 }
                 return Err(error);
             }
@@ -550,30 +551,6 @@ impl RtcCore {
             ReconnectStrategy::Rejoin,
             ReconnectFaultPoint::AfterSubscribedRestore,
         )
-    }
-
-    pub(super) fn record_reconnect_edge_failure(&self, edge: &str, force_switch: bool) {
-        let failures = {
-            let mut counts = self
-                .reconnect_edge_failures
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            let count = counts.entry(edge.to_owned()).or_insert(0);
-            *count = count.saturating_add(1);
-            if force_switch {
-                *count = (*count).max(2);
-            }
-            *count
-        };
-        if failures >= 2 {
-            let mut bad = self
-                .confirmed_bad_sfus
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            if !bad.iter().any(|known| known == edge) {
-                bad.push(edge.to_owned());
-            }
-        }
     }
 
     pub(super) async fn reconnect_migrate(

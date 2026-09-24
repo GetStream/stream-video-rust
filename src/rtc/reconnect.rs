@@ -7,7 +7,7 @@
 //! the FAST→REJOIN escalation rule. The orchestration that *acts* on these
 //! decisions lives in [`super::join`].
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use super::proto::models::WebsocketReconnectStrategy;
@@ -243,6 +243,32 @@ impl FailureLimits {
     }
 }
 
+/// SFUs that failed a rejoin during one reconnect. Two failures confirm an SFU
+/// as bad; a join error code confirms it at once.
+#[derive(Debug, Default)]
+pub(crate) struct SfuRejoinFailures {
+    counts: HashMap<String, u32>,
+    confirmed: Vec<String>,
+}
+
+impl SfuRejoinFailures {
+    pub(crate) fn record(&mut self, edge: &str, force_switch: bool) {
+        let count = self.counts.entry(edge.to_owned()).or_insert(0);
+        *count = count.saturating_add(1);
+        if force_switch {
+            *count = (*count).max(2);
+        }
+        if *count >= 2 && !self.confirmed.iter().any(|known| known == edge) {
+            self.confirmed.push(edge.to_owned());
+        }
+    }
+
+    /// Confirmed bad SFUs, in the order they were confirmed.
+    pub(crate) fn confirmed(&self) -> &[String] {
+        &self.confirmed
+    }
+}
+
 /// Decide the strategy for the *next* reconnect attempt after the current one
 /// failed (JS `shouldRejoin` escalation). Once we fall back to `REJOIN` we stay
 /// there.
@@ -361,7 +387,7 @@ mod tests {
     }
 
     #[test]
-    fn ice_limit_trips_on_second_failure() {
+    fn ice_limit_is_reached_on_second_failure() {
         let mut limits = FailureLimits::default();
         assert!(!limits.record_ice_never_connected());
         assert!(limits.record_ice_never_connected());
@@ -371,7 +397,25 @@ mod tests {
     }
 
     #[test]
-    fn negotiation_limit_trips_on_third_failure() {
+    fn sfu_is_confirmed_bad_after_two_rejoin_failures() {
+        let mut failures = SfuRejoinFailures::default();
+        failures.record("sfu-a", false);
+        assert!(failures.confirmed().is_empty());
+        failures.record("sfu-a", false);
+        assert_eq!(failures.confirmed(), ["sfu-a"]);
+    }
+
+    #[test]
+    fn join_error_code_confirms_the_sfu_at_once() {
+        let mut failures = SfuRejoinFailures::default();
+        failures.record("sfu-a", true);
+        failures.record("sfu-b", true);
+        failures.record("sfu-a", true);
+        assert_eq!(failures.confirmed(), ["sfu-a", "sfu-b"]);
+    }
+
+    #[test]
+    fn negotiation_limit_is_reached_on_third_failure() {
         let mut limits = FailureLimits::default();
         assert!(!limits.record_negotiation_failure());
         assert!(!limits.record_negotiation_failure());

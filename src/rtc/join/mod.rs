@@ -59,8 +59,8 @@ use super::proto::models::{self, PeerType, TrackType};
 use super::proto::signal;
 use super::publish_options::ClientPublishOptions;
 use super::reconnect::{
-    self, FailureLimits, ReconnectStrategy, SlidingWindowRateLimiter, escalate_strategy,
-    strategy_after_signal_close,
+    self, FailureLimits, ReconnectStrategy, SfuRejoinFailures, SlidingWindowRateLimiter,
+    escalate_strategy, strategy_after_signal_close,
 };
 use super::sfu::signal::SignalClient;
 use super::sfu::ws::{self, SfuReceiver, SfuSender};
@@ -274,6 +274,8 @@ struct Lifecycle {
     generation: u64,
     publish_options: ClientPublishOptions,
     generation_publish_options: ClientPublishOptions,
+    failure_limits: FailureLimits,
+    rate_limiter: SlidingWindowRateLimiter,
 }
 
 impl Lifecycle {
@@ -495,10 +497,6 @@ pub struct RtcCore {
     stats_options: StdMutex<StatsOptions>,
     own_capabilities: StdMutex<HashSet<String>>,
     disconnection_timeout: StdMutex<Duration>,
-    failure_limits: StdMutex<FailureLimits>,
-    rate_limiter: StdMutex<SlidingWindowRateLimiter>,
-    confirmed_bad_sfus: StdMutex<Vec<String>>,
-    reconnect_edge_failures: StdMutex<HashMap<String, u32>>,
     reconnect_generation: StdMutex<Option<u64>>,
     reconnect_attempts: AtomicU32,
     next_connection_epoch: AtomicU64,
@@ -565,16 +563,14 @@ impl RtcCore {
                 generation: 0,
                 publish_options: ClientPublishOptions::default(),
                 generation_publish_options: ClientPublishOptions::default(),
+                failure_limits: FailureLimits::default(),
+                rate_limiter: SlidingWindowRateLimiter::rejoin_default(),
             }),
             lifecycle_changed: Notify::new(),
             connection: TokioMutex::new(None),
             stats_options: StdMutex::new(StatsOptions::default()),
             own_capabilities: StdMutex::new(HashSet::new()),
             disconnection_timeout: StdMutex::new(Duration::ZERO),
-            failure_limits: StdMutex::new(FailureLimits::default()),
-            rate_limiter: StdMutex::new(SlidingWindowRateLimiter::rejoin_default()),
-            confirmed_bad_sfus: StdMutex::new(Vec::new()),
-            reconnect_edge_failures: StdMutex::new(HashMap::new()),
             reconnect_generation: StdMutex::new(None),
             reconnect_attempts: AtomicU32::new(0),
             next_connection_epoch: AtomicU64::new(0),
@@ -734,6 +730,8 @@ impl RtcCore {
                     guard.generation = guard.generation.wrapping_add(1);
                     guard.set_state(CallingState::Joining, &self.events_tx);
                     guard.generation_publish_options = guard.publish_options;
+                    guard.failure_limits = FailureLimits::default();
+                    guard.rate_limiter = SlidingWindowRateLimiter::rejoin_default();
                     guard.generation
                 }
                 _ => {
@@ -749,20 +747,6 @@ impl RtcCore {
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = None;
         self.reconnect_attempts.store(0, Ordering::SeqCst);
-        *self
-            .failure_limits
-            .lock()
-            .unwrap_or_else(|e| e.into_inner()) = FailureLimits::default();
-        *self.rate_limiter.lock().unwrap_or_else(|e| e.into_inner()) =
-            SlidingWindowRateLimiter::rejoin_default();
-        self.confirmed_bad_sfus
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clear();
-        self.reconnect_edge_failures
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clear();
         Ok(generation)
     }
 

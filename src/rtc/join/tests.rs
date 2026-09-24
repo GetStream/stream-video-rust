@@ -816,6 +816,41 @@ async fn state_during_leave_matches_the_last_state_event() {
     leave.await.expect("leave task").expect("leave");
 }
 
+#[tokio::test]
+async fn late_reconnect_task_does_not_count_toward_the_next_join() {
+    let core = test_core();
+    let first = prepare_joined_core(&core, "alice");
+    core.trigger_reconnect(
+        first,
+        ReconnectStrategy::Fast,
+        reconnect::REASON_ICE_UNSUPPORTED.to_owned(),
+    );
+    core.leave("leave before the reconnect task runs")
+        .await
+        .expect("leave");
+    let second = prepare_joined_core(&core, "alice");
+    wait_for(
+        Duration::from_secs(1),
+        || core.runtime_task_snapshot().0 == 0,
+        "late reconnect task ends",
+    )
+    .await;
+
+    core.trigger_reconnect(
+        second,
+        ReconnectStrategy::Fast,
+        reconnect::REASON_ICE_UNSUPPORTED.to_owned(),
+    );
+    wait_for(
+        Duration::from_secs(1),
+        || core.state() != CallingState::Joined,
+        "second reconnect starts",
+    )
+    .await;
+
+    assert_eq!(core.state(), CallingState::Reconnecting);
+    core.leave("cleanup").await.expect("cleanup leave");
+}
 
 #[test]
 fn stale_reconnect_completion_does_not_release_the_current_generation() {
