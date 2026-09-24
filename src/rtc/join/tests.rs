@@ -1110,6 +1110,46 @@ async fn only_the_stored_connection_of_the_current_generation_is_current() {
     drop(old);
 }
 
+#[tokio::test]
+async fn video_track_with_a_non_video_type_is_not_published() {
+    let core = test_core();
+    let generation = prepare_joined_core(&core, "alice");
+    let (connection, _sfu) = establish_fake(&core, generation).await;
+    *core.connection.lock().await = Some(connection);
+    core.own_capabilities
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .insert("send-video".to_owned());
+    let track =
+        LocalVideoTrack::h264_with_config(LocalVideoTrackConfig::default().server_managed())
+            .expect("video track");
+
+    let result = core
+        .publish(LocalTrack::Video {
+            track,
+            track_type: TrackType::Unspecified,
+        })
+        .await;
+
+    assert!(
+        matches!(result, Err(RtcError::IllegalState(_))),
+        "{result:?}"
+    );
+    assert!(core.media.lock().await.publications.is_empty());
+}
+
+#[tokio::test]
+async fn unspecified_track_type_cannot_be_muted() {
+    let core = test_core();
+
+    let result = core.set_track_muted(TrackType::Unspecified, true).await;
+
+    assert!(
+        matches!(result, Err(RtcError::IllegalState(_))),
+        "{result:?}"
+    );
+}
+
 #[test]
 fn stale_reconnect_completion_does_not_release_the_current_generation() {
     let core = test_core();

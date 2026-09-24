@@ -7,6 +7,13 @@ impl RtcCore {
     /// Publish a local track: add its send-only transceiver and renegotiate the
     /// publisher PC with the SFU (`SetPublisher`). Errors if not joined.
     pub async fn publish(self: &Arc<Self>, track: LocalTrack) -> Result<()> {
+        if let LocalTrack::Video { track_type, .. } = &track
+            && !matches!(track_type, TrackType::Video | TrackType::ScreenShare)
+        {
+            return Err(RtcError::IllegalState(format!(
+                "a video track cannot be published as {track_type:?}"
+            )));
+        }
         let Some((publisher, signal, session_id, publish_options)) = self.publisher_handles().await
         else {
             return Err(RtcError::IllegalState("publish() before join()".to_owned()));
@@ -207,6 +214,11 @@ impl RtcCore {
         track_type: TrackType,
         muted: bool,
     ) -> Result<()> {
+        if track_type == TrackType::Unspecified {
+            return Err(RtcError::IllegalState(
+                "cannot mute an unspecified track type".to_owned(),
+            ));
+        }
         if !muted {
             let capability = required_publish_capability(track_type);
             if !self
