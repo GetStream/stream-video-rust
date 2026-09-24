@@ -41,17 +41,24 @@ fn prepare_joined_core(core: &Arc<RtcCore>, user_id: &str) -> u64 {
     generation
 }
 
-fn refresh_server() -> (
+/// A local HTTP server that answers one request with the JSON `body`.
+fn one_shot_http_server(
+    body: &str,
+) -> (
     String,
     std::sync::mpsc::Receiver<String>,
     thread::JoinHandle<()>,
 ) {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind refresh server");
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind HTTP server");
     listener
         .set_nonblocking(true)
-        .expect("set refresh server nonblocking");
-    let address = listener.local_addr().expect("refresh server address");
+        .expect("set HTTP server nonblocking");
+    let address = listener.local_addr().expect("HTTP server address");
     let (request_tx, request_rx) = std::sync::mpsc::channel();
+    let response = format!(
+        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+        body.len()
+    );
     let server = thread::spawn(move || {
         let deadline = Instant::now() + Duration::from_secs(3);
         loop {
@@ -59,29 +66,24 @@ fn refresh_server() -> (
                 Ok((mut stream, _)) => {
                     stream
                         .set_nonblocking(false)
-                        .expect("set refresh stream blocking");
+                        .expect("set HTTP stream blocking");
                     stream
                         .set_read_timeout(Some(Duration::from_secs(1)))
-                        .expect("set refresh read timeout");
+                        .expect("set HTTP read timeout");
                     let mut request = [0_u8; 4096];
-                    let read = stream.read(&mut request).expect("read refresh request");
+                    let read = stream.read(&mut request).expect("read HTTP request");
                     let request = String::from_utf8_lossy(&request[..read]).into_owned();
-                    request_tx.send(request).expect("record refresh request");
+                    request_tx.send(request).expect("record HTTP request");
                     stream
-                        .write_all(
-                            b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{}",
-                        )
-                        .expect("write refresh response");
+                        .write_all(response.as_bytes())
+                        .expect("write HTTP response");
                     return;
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                    assert!(
-                        Instant::now() < deadline,
-                        "refresh server received no request"
-                    );
+                    assert!(Instant::now() < deadline, "HTTP server received no request");
                     thread::sleep(Duration::from_millis(5));
                 }
-                Err(error) => panic!("accept refresh request: {error}"),
+                Err(error) => panic!("accept HTTP request: {error}"),
             }
         }
     });
@@ -635,7 +637,7 @@ async fn forced_strategy_failures_reach_timeout_and_refresh_over_http() {
         ReconnectStrategy::Rejoin,
         ReconnectStrategy::Migrate,
     ] {
-        let (base_url, request_rx, server) = refresh_server();
+        let (base_url, request_rx, server) = one_shot_http_server("{}");
         let core = test_core_with_config(ClientConfig {
             base_url,
             request_timeout: Duration::from_secs(1),
@@ -1033,6 +1035,79 @@ fn user_query_needs_a_connection_id_and_a_user_id() {
         .user_id
         .clear();
     assert!(core.user_request_query().is_none());
+}
+
+#[tokio::test]
+async fn join_attempt_stores_the_stats_options_and_the_sfu_session() {
+    let (credentials, mut sfu) = fake_sfu(true).await;
+    let join_response = json!({
+        "credentials": {
+            "server": {
+                "edge_name": credentials.server.edge_name,
+                "url": credentials.server.url,
+                "ws_endpoint": credentials.server.ws_endpoint,
+            },
+            "token": credentials.token,
+            "ice_servers": [],
+        },
+        "stats_options": { "reporting_interval_ms": 1234, "enable_rtc_stats": true },
+    })
+    .to_string();
+    let (base_url, _requests, server) = one_shot_http_server(&join_response);
+    let core = test_core_with_config(ClientConfig {
+        base_url,
+        ..ClientConfig::default()
+    });
+    let generation = prepare_joined_core(&core, "alice");
+    *core
+        .coordinator_connection_id
+        .lock()
+        .unwrap_or_else(|error| error.into_inner()) = Some((generation, "connection-1".to_owned()));
+    let token = core.current_user_token().expect("user token");
+
+    core.clone()
+        .join_once(JoinOnceOptions {
+            user_token: &token,
+            request: &JoinCallRequest::default(),
+            attempt: 0,
+            strategy: ReconnectStrategy::Fast,
+            reconnect_details: None,
+            generation,
+            session_id: None,
+            retain_old: false,
+        })
+        .await
+        .map_err(|(error, _)| error)
+        .expect("join attempt");
+
+    let stats_options = core.stats_options();
+    assert_eq!(stats_options.reporting_interval_ms, 1234);
+    assert!(stats_options.enable_rtc_stats);
+    let Some(event::sfu_request::RequestPayload::JoinRequest(join_request)) =
+        sfu.recv().await.expect("SFU join request").request_payload
+    else {
+        panic!("first SFU request is not a join request");
+    };
+    assert_eq!(core.session_id().await, Some(join_request.session_id));
+    core.leave("test leave").await.expect("leave");
+    assert_eq!(core.session_id().await, None);
+    server.join().expect("coordinator server");
+}
+
+#[tokio::test]
+async fn only_the_stored_connection_of_the_current_generation_is_current() {
+    let core = test_core();
+    let generation = prepare_joined_core(&core, "alice");
+    let (old, _old_sfu) = establish_fake(&core, generation).await;
+    let (current, _sfu) = establish_fake(&core, generation).await;
+    let (old_epoch, epoch) = (old.epoch, current.epoch);
+    *core.connection.lock().await = Some(current);
+
+    assert!(core.is_connection_current(generation, epoch).await);
+    assert!(!core.is_connection_current(generation, old_epoch).await);
+    core.cancel_generation();
+    assert!(!core.is_connection_current(generation, epoch).await);
+    drop(old);
 }
 
 #[test]
