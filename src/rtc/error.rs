@@ -79,7 +79,7 @@ pub enum RtcError {
     #[error(transparent)]
     Join(#[from] SfuJoinError),
 
-    /// A client deadline elapsed waiting for the SFU (WS open or `JoinResponse`).
+    /// A client deadline elapsed, e.g. waiting for the SFU `JoinResponse`.
     #[error(transparent)]
     Timeout(#[from] SfuTimeoutError),
 
@@ -333,9 +333,9 @@ impl SfuJoinError {
     }
 }
 
-/// A client-side deadline elapsed waiting for the SFU (WS open or `JoinResponse`).
+/// A client-side deadline elapsed.
 #[derive(Debug, Clone, thiserror::Error)]
-#[error("sfu timeout waiting for {what} after {}ms", timeout.as_millis())]
+#[error("timeout waiting for {what} after {}ms", timeout.as_millis())]
 pub struct SfuTimeoutError {
     /// What we were waiting for, e.g. `"join response"`.
     pub what: String,
@@ -420,6 +420,28 @@ pub struct TwirpError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn from_signal_error_maps_only_real_codes() {
+        // UNSPECIFIED (and absent) is success.
+        assert!(RtcError::from_signal_error(None).is_ok());
+        assert!(
+            RtcError::from_signal_error(Some(models::Error {
+                code: models::ErrorCode::Unspecified as i32,
+                message: String::new(),
+                should_retry: false,
+            }))
+            .is_ok()
+        );
+        // A real code becomes an error.
+        let err = RtcError::from_signal_error(Some(models::Error {
+            code: models::ErrorCode::ParticipantSignalLost as i32,
+            message: "boom".to_owned(),
+            should_retry: true,
+        }))
+        .expect_err("should be an error");
+        assert!(matches!(err, RtcError::Signal { .. }));
+    }
 
     #[test]
     fn join_error_codes_match_sfu() {

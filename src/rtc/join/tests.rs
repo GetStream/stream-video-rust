@@ -41,17 +41,24 @@ fn prepare_joined_core(core: &Arc<RtcCore>, user_id: &str) -> u64 {
     generation
 }
 
-fn refresh_server() -> (
+/// A local HTTP server that answers one request with the JSON `body`.
+fn one_shot_http_server(
+    body: &str,
+) -> (
     String,
     std::sync::mpsc::Receiver<String>,
     thread::JoinHandle<()>,
 ) {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind refresh server");
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind HTTP server");
     listener
         .set_nonblocking(true)
-        .expect("set refresh server nonblocking");
-    let address = listener.local_addr().expect("refresh server address");
+        .expect("set HTTP server nonblocking");
+    let address = listener.local_addr().expect("HTTP server address");
     let (request_tx, request_rx) = std::sync::mpsc::channel();
+    let response = format!(
+        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+        body.len()
+    );
     let server = thread::spawn(move || {
         let deadline = Instant::now() + Duration::from_secs(3);
         loop {
@@ -59,29 +66,24 @@ fn refresh_server() -> (
                 Ok((mut stream, _)) => {
                     stream
                         .set_nonblocking(false)
-                        .expect("set refresh stream blocking");
+                        .expect("set HTTP stream blocking");
                     stream
                         .set_read_timeout(Some(Duration::from_secs(1)))
-                        .expect("set refresh read timeout");
+                        .expect("set HTTP read timeout");
                     let mut request = [0_u8; 4096];
-                    let read = stream.read(&mut request).expect("read refresh request");
+                    let read = stream.read(&mut request).expect("read HTTP request");
                     let request = String::from_utf8_lossy(&request[..read]).into_owned();
-                    request_tx.send(request).expect("record refresh request");
+                    request_tx.send(request).expect("record HTTP request");
                     stream
-                        .write_all(
-                            b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{}",
-                        )
-                        .expect("write refresh response");
+                        .write_all(response.as_bytes())
+                        .expect("write HTTP response");
                     return;
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                    assert!(
-                        Instant::now() < deadline,
-                        "refresh server received no request"
-                    );
+                    assert!(Instant::now() < deadline, "HTTP server received no request");
                     thread::sleep(Duration::from_millis(5));
                 }
-                Err(error) => panic!("accept refresh request: {error}"),
+                Err(error) => panic!("accept HTTP request: {error}"),
             }
         }
     });
@@ -96,6 +98,158 @@ async fn wait_for(timeout: Duration, mut predicate: impl FnMut() -> bool, descri
     })
     .await
     .unwrap_or_else(|_| panic!("timed out waiting for {description}"));
+}
+
+/// A local SFU WebSocket. It sends each received request to the channel. The
+/// channel closes when the client socket closes. With `answer_join`, it answers
+/// the `JoinRequest`.
+async fn fake_sfu(
+    answer_join: bool,
+) -> (
+    Credentials,
+    tokio::sync::mpsc::UnboundedReceiver<event::SfuRequest>,
+) {
+    use futures_util::{SinkExt, StreamExt};
+    use prost::Message as _;
+    use tokio_tungstenite::tungstenite::Message;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind fake SFU");
+    let address = listener.local_addr().expect("fake SFU address");
+    let (requests, received) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("accept SFU client");
+        let mut socket = tokio_tungstenite::accept_async(stream)
+            .await
+            .expect("SFU WebSocket handshake");
+        while let Some(Ok(message)) = socket.next().await {
+            let Message::Binary(bytes) = message else {
+                continue;
+            };
+            let request = event::SfuRequest::decode(bytes).expect("SFU request");
+            if answer_join
+                && matches!(
+                    request.request_payload,
+                    Some(event::sfu_request::RequestPayload::JoinRequest(_))
+                )
+            {
+                let response = SfuEvent {
+                    event_payload: Some(sfu_event::EventPayload::JoinResponse(
+                        JoinResponse::default(),
+                    )),
+                };
+                socket
+                    .send(Message::Binary(response.encode_to_vec().into()))
+                    .await
+                    .expect("send join response");
+            }
+            let _ = requests.send(request);
+        }
+    });
+    let credentials = Credentials {
+        server: coordinator::SfuServer {
+            edge_name: "fake-edge".to_owned(),
+            url: "http://127.0.0.1:9/twirp".to_owned(),
+            ws_endpoint: format!("ws://{address}/ws"),
+        },
+        token: "sfu-token".to_owned(),
+        ice_servers: Vec::new(),
+    };
+    (credentials, received)
+}
+
+/// A local coordinator WebSocket that sends `connection.ok`. It returns the
+/// REST base URL and a task that ends when the client socket closes.
+async fn fake_coordinator() -> (String, tokio::task::JoinHandle<()>) {
+    use futures_util::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::Message;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind fake coordinator");
+    let address = listener.local_addr().expect("fake coordinator address");
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("accept coordinator client");
+        let mut socket = tokio_tungstenite::accept_async(stream)
+            .await
+            .expect("coordinator WebSocket handshake");
+        socket
+            .next()
+            .await
+            .expect("auth frame")
+            .expect("valid auth frame");
+        socket
+            .send(Message::Text(
+                json!({ "type": "connection.ok", "connection_id": "connection-1" })
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .expect("send connection.ok");
+        while let Some(Ok(_)) = socket.next().await {}
+    });
+    (format!("http://{address}"), server)
+}
+
+/// Every request the fake SFU received until the client socket closed.
+async fn requests_until_close(
+    mut received: tokio::sync::mpsc::UnboundedReceiver<event::SfuRequest>,
+) -> Vec<event::SfuRequest> {
+    tokio::time::timeout(Duration::from_secs(2), async move {
+        let mut requests = Vec::new();
+        while let Some(request) = received.recv().await {
+            requests.push(request);
+        }
+        requests
+    })
+    .await
+    .expect("SFU socket closed")
+}
+
+fn alive_tasks() -> usize {
+    tokio::runtime::Handle::current()
+        .metrics()
+        .num_alive_tasks()
+}
+
+async fn establish_fake(
+    core: &Arc<RtcCore>,
+    generation: u64,
+) -> (
+    Connection,
+    tokio::sync::mpsc::UnboundedReceiver<event::SfuRequest>,
+) {
+    let (credentials, sfu) = fake_sfu(true).await;
+    let connection = core
+        .clone()
+        .establish(
+            &credentials,
+            0,
+            ReconnectStrategy::Fast,
+            None,
+            generation,
+            None,
+        )
+        .await
+        .expect("establish against fake SFU");
+    (connection, sfu)
+}
+
+/// The event loop context of `connection` after a migration detached it.
+fn detached_context(core: &Arc<RtcCore>, connection: &Connection) -> EventLoopContext {
+    connection.reconnect_enabled.store(false, Ordering::SeqCst);
+    EventLoopContext {
+        core: core.clone(),
+        subscriber: connection.subscriber.clone(),
+        publisher: connection.publisher.clone(),
+        signal: connection.signal.clone(),
+        session_id: connection.session_id.clone(),
+        pending_ice: connection.pending_ice.clone(),
+        generation: connection.generation,
+        ws_healthy: connection.ws_healthy.clone(),
+        reconnect_enabled: connection.reconnect_enabled.clone(),
+    }
 }
 
 fn preferred_codec(core: &RtcCore, generation: u64) -> Option<models::Codec> {
@@ -190,13 +344,300 @@ async fn leave_cancels_join_generation_and_allows_later_join() {
 }
 
 #[tokio::test]
+async fn leave_tears_down_the_stored_connection() {
+    let core = test_core();
+    let generation = prepare_joined_core(&core, "alice");
+    let (connection, sfu) = establish_fake(&core, generation).await;
+    let (subscriber, publisher) = (connection.subscriber.clone(), connection.publisher.clone());
+    *core.connection.lock().await = Some(connection);
+
+    core.leave("test leave").await.expect("leave");
+
+    let requests = requests_until_close(sfu).await;
+    assert!(requests.iter().any(|request| matches!(
+        request.request_payload,
+        Some(event::sfu_request::RequestPayload::LeaveCallRequest(_))
+    )));
+    assert_eq!(
+        subscriber.connection_state(),
+        RTCPeerConnectionState::Closed
+    );
+    assert_eq!(publisher.connection_state(), RTCPeerConnectionState::Closed);
+    let (active, spawned, completed) = core.runtime_task_snapshot();
+    assert_eq!(active, 0);
+    assert_eq!(spawned, completed);
+}
+
+#[tokio::test]
+async fn leave_closes_a_connection_owned_by_a_cancelled_join() {
+    let core = test_core();
+    let generation = prepare_joined_core(&core, "alice");
+    let baseline = alive_tasks();
+    let (connection, sfu) = establish_fake(&core, generation).await;
+    let owner_core = core.clone();
+    let owner = tokio::spawn(async move {
+        owner_core
+            .while_generation(generation, async move {
+                let _connection = connection;
+                std::future::pending::<()>().await;
+            })
+            .await
+    });
+    tokio::task::yield_now().await;
+
+    core.leave("cancel join").await.expect("leave");
+
+    assert!(owner.await.expect("owner task").is_err());
+    requests_until_close(sfu).await;
+    wait_for(
+        Duration::from_secs(2),
+        || alive_tasks() == baseline,
+        "cancelled connection cleanup",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn generation_change_closes_the_coordinator_socket() {
+    let (base_url, coordinator) = fake_coordinator().await;
+    let core = test_core_with_config(ClientConfig {
+        base_url,
+        ..ClientConfig::default()
+    });
+    let generation = prepare_joined_core(&core, "alice");
+    let token = core.current_user_token().expect("user token");
+    core.connect_coordinator_events(generation, &token, "alice")
+        .await
+        .expect("coordinator events");
+
+    core.cancel_generation();
+
+    tokio::time::timeout(Duration::from_secs(2), coordinator)
+        .await
+        .expect("coordinator socket closed")
+        .expect("fake coordinator task");
+}
+
+#[tokio::test]
+async fn generation_change_stops_the_connection_tasks() {
+    let core = test_core();
+    let generation = prepare_joined_core(&core, "alice");
+    let (connection, _sfu) = establish_fake(&core, generation).await;
+    assert!(core.runtime_task_snapshot().0 > 0);
+
+    core.cancel_generation();
+
+    wait_for(
+        Duration::from_secs(2),
+        || core.runtime_task_snapshot().0 == 0,
+        "connection tasks stop",
+    )
+    .await;
+    drop(connection);
+}
+
+#[tokio::test]
+async fn failed_establish_leaves_no_background_tasks() {
+    let core = test_core();
+    let generation = prepare_joined_core(&core, "alice");
+    core.join_data
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .join_response_timeout = Duration::from_millis(50);
+    let baseline = alive_tasks();
+    let (credentials, sfu) = fake_sfu(false).await;
+
+    let result = core
+        .clone()
+        .establish(
+            &credentials,
+            0,
+            ReconnectStrategy::Fast,
+            None,
+            generation,
+            None,
+        )
+        .await;
+
+    assert!(matches!(result, Err(RtcError::Timeout(_))));
+    requests_until_close(sfu).await;
+    wait_for(
+        Duration::from_secs(2),
+        || alive_tasks() == baseline,
+        "failed establish cleanup",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn leave_during_establish_leaves_no_background_tasks() {
+    let core = test_core();
+    let generation = prepare_joined_core(&core, "alice");
+    let baseline = alive_tasks();
+    let (credentials, mut sfu) = fake_sfu(false).await;
+    let owner_core = core.clone();
+    let owner = tokio::spawn(async move {
+        owner_core
+            .while_generation(
+                generation,
+                owner_core.clone().establish(
+                    &credentials,
+                    0,
+                    ReconnectStrategy::Fast,
+                    None,
+                    generation,
+                    None,
+                ),
+            )
+            .await
+            .map(|_| ())
+    });
+    let join_request = tokio::time::timeout(Duration::from_secs(2), sfu.recv())
+        .await
+        .expect("join request")
+        .expect("SFU socket open");
+    assert!(matches!(
+        join_request.request_payload,
+        Some(event::sfu_request::RequestPayload::JoinRequest(_))
+    ));
+
+    core.leave("cancel establish").await.expect("leave");
+
+    assert!(owner.await.expect("owner task").is_err());
+    requests_until_close(sfu).await;
+    wait_for(
+        Duration::from_secs(2),
+        || alive_tasks() == baseline,
+        "cancelled establish cleanup",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn leave_that_overlaps_a_new_join_keeps_the_new_join_state() {
+    let core = test_core();
+    prepare_joined_core(&core, "alice");
+    core.leave("first leave").await.expect("first leave");
+    let connection_slot = core.connection.lock().await;
+    let cancelled = core.generation();
+    let leave_core = core.clone();
+    let leave = tokio::spawn(async move { leave_core.leave("second leave").await });
+    wait_for(
+        Duration::from_secs(1),
+        || core.generation() != cancelled,
+        "second leave cancels its generation",
+    )
+    .await;
+
+    let second = prepare_joined_core(&core, "alice");
+    *core
+        .coordinator_connection_id
+        .lock()
+        .unwrap_or_else(|error| error.into_inner()) = Some((second, "connection-2".to_owned()));
+    assert!(core.apply_join_call_state_if_current(second, "session-2", "alice", None));
+    assert!(core.claim_reconnect(second));
+    drop(connection_slot);
+    leave.await.expect("leave task").expect("second leave");
+
+    assert_eq!(core.state(), CallingState::Joined);
+    assert!(core.user_auth().is_some());
+    assert!(
+        core.participants
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .contains_key("session-2")
+    );
+    assert_eq!(core.active_reconnect_generation(), Some(second));
+}
+
+#[tokio::test]
+async fn stale_coordinator_stop_keeps_the_current_coordinator() {
+    let (base_url, coordinator) = fake_coordinator().await;
+    let core = test_core_with_config(ClientConfig {
+        base_url,
+        ..ClientConfig::default()
+    });
+    let first = prepare_joined_core(&core, "alice");
+    core.leave("cancel first join").await.expect("leave");
+    let second = prepare_joined_core(&core, "alice");
+    let token = core.current_user_token().expect("user token");
+    core.connect_coordinator_events(second, &token, "alice")
+        .await
+        .expect("coordinator events");
+
+    core.stop_coordinator_events(first).await;
+
+    assert!(core.user_auth().is_some());
+    assert!(!coordinator.is_finished());
+    core.leave("cleanup").await.expect("cleanup leave");
+    tokio::time::timeout(Duration::from_secs(2), coordinator)
+        .await
+        .expect("coordinator socket closed")
+        .expect("fake coordinator task");
+}
+
+#[tokio::test]
+async fn detached_connection_ignores_publish_options_from_its_sfu() {
+    let core = test_core();
+    let generation = prepare_joined_core(&core, "alice");
+    let (old, _old_sfu) = establish_fake(&core, generation).await;
+    let (current, _sfu) = establish_fake(&core, generation).await;
+    *core.connection.lock().await = Some(current);
+    let context = detached_context(&core, &old);
+
+    connection::handle_event(
+        &context,
+        sfu_event::EventPayload::ChangePublishOptions(event::ChangePublishOptions {
+            publish_options: vec![models::PublishOption {
+                id: 99,
+                ..Default::default()
+            }],
+            reason: "old SFU".to_owned(),
+        }),
+    )
+    .await
+    .expect("handle event");
+
+    let connection = core.connection.lock().await;
+    assert!(
+        connection
+            .as_ref()
+            .expect("current connection")
+            .publish_options
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn detached_connection_still_completes_the_migration() {
+    let core = test_core();
+    let generation = prepare_joined_core(&core, "alice");
+    let (old, _old_sfu) = establish_fake(&core, generation).await;
+    let context = detached_context(&core, &old);
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    core.install_migration_waiter(generation, sender)
+        .expect("migration waiter");
+
+    connection::handle_event(
+        &context,
+        sfu_event::EventPayload::ParticipantMigrationComplete(
+            event::ParticipantMigrationComplete {},
+        ),
+    )
+    .await
+    .expect("handle event");
+
+    receiver.await.expect("migration complete");
+}
+
+#[tokio::test]
 async fn forced_strategy_failures_reach_timeout_and_refresh_over_http() {
     for strategy in [
         ReconnectStrategy::Fast,
         ReconnectStrategy::Rejoin,
         ReconnectStrategy::Migrate,
     ] {
-        let (base_url, request_rx, server) = refresh_server();
+        let (base_url, request_rx, server) = one_shot_http_server("{}");
         let core = test_core_with_config(ClientConfig {
             base_url,
             request_timeout: Duration::from_secs(1),
@@ -287,6 +728,429 @@ async fn leave_cancels_reconnect_task_before_next_generation() {
 }
 
 #[test]
+fn state_events_arrive_in_the_order_of_the_state_changes() {
+    let core = test_core();
+    let generation = core.begin_join().expect("join generation");
+    let mut events = core.subscribe();
+    let rounds = 20_000;
+    let barrier = Arc::new(std::sync::Barrier::new(3));
+    let workers = [CallingState::Joined, CallingState::Reconnecting].map(|state| {
+        let core = core.clone();
+        let barrier = barrier.clone();
+        thread::spawn(move || {
+            for _ in 0..rounds {
+                barrier.wait();
+                core.set_state_if_current(generation, state);
+                barrier.wait();
+            }
+        })
+    });
+
+    for round in 0..rounds {
+        barrier.wait();
+        barrier.wait();
+        let mut last = None;
+        while let Ok(event) = events.try_recv() {
+            if let CallEvent::CallingStateChanged(state) = event {
+                last = Some(state);
+            }
+        }
+        assert_eq!(last, Some(core.state()), "round {round}");
+    }
+    for worker in workers {
+        worker.join().expect("state worker");
+    }
+}
+
+#[test]
+fn setting_the_same_state_again_sends_no_event() {
+    let core = test_core();
+    let generation = core.begin_join().expect("join generation");
+    let mut events = core.subscribe();
+
+    assert!(core.set_state_if_current(generation, CallingState::Reconnecting));
+    assert!(core.set_state_if_current(generation, CallingState::Reconnecting));
+
+    assert!(matches!(
+        events.try_recv(),
+        Ok(CallEvent::CallingStateChanged(CallingState::Reconnecting))
+    ));
+    assert!(events.try_recv().is_err());
+}
+
+#[test]
+fn join_start_sends_joining() {
+    let core = test_core();
+    let mut events = core.subscribe();
+
+    core.begin_join().expect("join generation");
+
+    assert!(matches!(
+        events.try_recv(),
+        Ok(CallEvent::CallingStateChanged(CallingState::Joining))
+    ));
+}
+
+#[tokio::test]
+async fn state_during_leave_matches_the_last_state_event() {
+    let core = test_core();
+    let mut events = core.subscribe();
+    core.begin_join().expect("join generation");
+    let connection_slot = core.connection.lock().await;
+    let generation = core.generation();
+    let leave_core = core.clone();
+    let leave = tokio::spawn(async move { leave_core.leave("leave during join").await });
+    wait_for(
+        Duration::from_secs(1),
+        || core.generation() != generation,
+        "leave cancels the join",
+    )
+    .await;
+
+    let mut last = None;
+    while let Ok(event) = events.try_recv() {
+        if let CallEvent::CallingStateChanged(state) = event {
+            last = Some(state);
+        }
+    }
+    assert_eq!(last, Some(core.state()));
+    drop(connection_slot);
+    leave.await.expect("leave task").expect("leave");
+}
+
+#[tokio::test]
+async fn late_reconnect_task_does_not_count_toward_the_next_join() {
+    let core = test_core();
+    let first = prepare_joined_core(&core, "alice");
+    core.trigger_reconnect(
+        first,
+        ReconnectStrategy::Fast,
+        reconnect::REASON_ICE_UNSUPPORTED.to_owned(),
+    );
+    core.leave("leave before the reconnect task runs")
+        .await
+        .expect("leave");
+    let second = prepare_joined_core(&core, "alice");
+    wait_for(
+        Duration::from_secs(1),
+        || core.runtime_task_snapshot().0 == 0,
+        "late reconnect task ends",
+    )
+    .await;
+
+    core.trigger_reconnect(
+        second,
+        ReconnectStrategy::Fast,
+        reconnect::REASON_ICE_UNSUPPORTED.to_owned(),
+    );
+    wait_for(
+        Duration::from_secs(1),
+        || core.state() != CallingState::Joined,
+        "second reconnect starts",
+    )
+    .await;
+
+    assert_eq!(core.state(), CallingState::Reconnecting);
+    core.leave("cleanup").await.expect("cleanup leave");
+}
+
+#[tokio::test]
+async fn token_load_that_ends_after_a_new_join_keeps_the_new_token() {
+    let core = test_core();
+    let generation = prepare_joined_core(&core, "alice");
+    let old_token = core
+        .user_token
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .clone();
+    let weak_core = Arc::downgrade(&core);
+    let provider = move || {
+        let weak_core = weak_core.clone();
+        let old_token = old_token.clone();
+        async move {
+            // A new join starts in the same poll in which this load ends.
+            if let Some(core) = weak_core.upgrade() {
+                core.cancel_generation();
+                *core
+                    .user_token
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner()) = "new-join-token".to_owned();
+            }
+            Ok(old_token)
+        }
+    };
+    *core
+        .token_source
+        .lock()
+        .unwrap_or_else(|error| error.into_inner()) =
+        Some(UserTokenSource::Provider(Arc::new(provider)));
+
+    let result = core.reload_user_token(generation).await;
+
+    assert!(result.is_err());
+    assert_eq!(
+        *core
+            .user_token
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()),
+        "new-join-token"
+    );
+}
+
+#[tokio::test]
+async fn work_that_ends_after_its_generation_changed_is_cancelled() {
+    let core = test_core();
+    let generation = core.begin_join().expect("join generation");
+    let work_core = core.clone();
+
+    let result = core
+        .while_generation(generation, async move {
+            work_core.cancel_generation();
+        })
+        .await;
+
+    assert!(result.is_err());
+}
+
+#[tokio::test]
+async fn work_for_a_stale_generation_never_runs() {
+    let core = test_core();
+    let generation = core.begin_join().expect("join generation");
+    core.cancel_generation();
+    let ran = Arc::new(AtomicBool::new(false));
+    let work_ran = ran.clone();
+
+    let result = core
+        .while_generation(generation, async move {
+            work_ran.store(true, Ordering::SeqCst);
+        })
+        .await;
+
+    assert!(result.is_err());
+    assert!(!ran.load(Ordering::SeqCst));
+}
+
+#[test]
+fn concurrent_reconnect_claims_have_one_winner() {
+    let core = test_core();
+    let generation = core.begin_join().expect("join generation");
+    let rounds = 5_000;
+    let claimers = 4;
+    let barrier = Arc::new(std::sync::Barrier::new(claimers + 1));
+    let wins = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let workers: Vec<_> = (0..claimers)
+        .map(|_| {
+            let core = core.clone();
+            let barrier = barrier.clone();
+            let wins = wins.clone();
+            thread::spawn(move || {
+                for _ in 0..rounds {
+                    barrier.wait();
+                    if core.claim_reconnect(generation) {
+                        wins.fetch_add(1, Ordering::SeqCst);
+                    }
+                    barrier.wait();
+                }
+            })
+        })
+        .collect();
+
+    for round in 0..rounds {
+        barrier.wait();
+        barrier.wait();
+        assert_eq!(wins.swap(0, Ordering::SeqCst), 1, "round {round}");
+        core.release_reconnect(generation);
+    }
+    for worker in workers {
+        worker.join().expect("claim worker");
+    }
+}
+
+#[test]
+fn second_migration_waiter_for_a_generation_is_rejected() {
+    let core = test_core();
+    let generation = core.begin_join().expect("join generation");
+    let (first, _first_receiver) = tokio::sync::oneshot::channel();
+    let (second, _second_receiver) = tokio::sync::oneshot::channel();
+    core.install_migration_waiter(generation, first)
+        .expect("first migration waiter");
+
+    assert!(matches!(
+        core.install_migration_waiter(generation, second),
+        Err(RtcError::IllegalState(_))
+    ));
+}
+
+#[tokio::test]
+async fn migration_waiter_of_a_new_generation_replaces_the_old_one() {
+    let core = test_core();
+    let first = core.begin_join().expect("first generation");
+    let (old_sender, old_receiver) = tokio::sync::oneshot::channel();
+    core.install_migration_waiter(first, old_sender)
+        .expect("old migration waiter");
+    core.leave("next generation").await.expect("leave");
+    let second = core.begin_join().expect("second generation");
+    let (sender, mut receiver) = tokio::sync::oneshot::channel();
+
+    core.install_migration_waiter(second, sender)
+        .expect("new migration waiter");
+
+    assert!(old_receiver.await.is_err());
+    core.complete_migration(second);
+    assert_eq!(receiver.try_recv(), Ok(()));
+}
+
+#[test]
+fn user_query_needs_the_coordinator_connection_of_the_current_generation() {
+    let core = test_core();
+    let generation = prepare_joined_core(&core, "alice");
+    *core
+        .coordinator_connection_id
+        .lock()
+        .unwrap_or_else(|error| error.into_inner()) =
+        Some((generation.wrapping_sub(1), "old-connection".to_owned()));
+
+    assert!(core.user_request_query().is_none());
+    assert!(core.user_auth().is_none());
+}
+
+#[test]
+fn user_query_needs_a_connection_id_and_a_user_id() {
+    let core = test_core();
+    let generation = prepare_joined_core(&core, "alice");
+    let set_connection_id = |id: &str| {
+        *core
+            .coordinator_connection_id
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some((generation, id.to_owned()));
+    };
+
+    set_connection_id("");
+    assert!(core.user_request_query().is_none());
+
+    set_connection_id("connection-1");
+    core.join_data
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .user_id
+        .clear();
+    assert!(core.user_request_query().is_none());
+}
+
+#[tokio::test]
+async fn join_attempt_stores_the_stats_options_and_the_sfu_session() {
+    let (credentials, mut sfu) = fake_sfu(true).await;
+    let join_response = json!({
+        "credentials": {
+            "server": {
+                "edge_name": credentials.server.edge_name,
+                "url": credentials.server.url,
+                "ws_endpoint": credentials.server.ws_endpoint,
+            },
+            "token": credentials.token,
+            "ice_servers": [],
+        },
+        "stats_options": { "reporting_interval_ms": 1234, "enable_rtc_stats": true },
+    })
+    .to_string();
+    let (base_url, _requests, server) = one_shot_http_server(&join_response);
+    let core = test_core_with_config(ClientConfig {
+        base_url,
+        ..ClientConfig::default()
+    });
+    let generation = prepare_joined_core(&core, "alice");
+    *core
+        .coordinator_connection_id
+        .lock()
+        .unwrap_or_else(|error| error.into_inner()) = Some((generation, "connection-1".to_owned()));
+    let token = core.current_user_token().expect("user token");
+
+    core.clone()
+        .join_once(JoinOnceOptions {
+            user_token: &token,
+            request: &JoinCallRequest::default(),
+            attempt: 0,
+            strategy: ReconnectStrategy::Fast,
+            reconnect_details: None,
+            generation,
+            session_id: None,
+            retain_old: false,
+        })
+        .await
+        .map_err(|(error, _)| error)
+        .expect("join attempt");
+
+    let stats_options = core.stats_options();
+    assert_eq!(stats_options.reporting_interval_ms, 1234);
+    assert!(stats_options.enable_rtc_stats);
+    let Some(event::sfu_request::RequestPayload::JoinRequest(join_request)) =
+        sfu.recv().await.expect("SFU join request").request_payload
+    else {
+        panic!("first SFU request is not a join request");
+    };
+    assert_eq!(core.session_id().await, Some(join_request.session_id));
+    core.leave("test leave").await.expect("leave");
+    assert_eq!(core.session_id().await, None);
+    server.join().expect("coordinator server");
+}
+
+#[tokio::test]
+async fn only_the_stored_connection_of_the_current_generation_is_current() {
+    let core = test_core();
+    let generation = prepare_joined_core(&core, "alice");
+    let (old, _old_sfu) = establish_fake(&core, generation).await;
+    let (current, _sfu) = establish_fake(&core, generation).await;
+    let (old_epoch, epoch) = (old.epoch, current.epoch);
+    *core.connection.lock().await = Some(current);
+
+    assert!(core.is_connection_current(generation, epoch).await);
+    assert!(!core.is_connection_current(generation, old_epoch).await);
+    core.cancel_generation();
+    assert!(!core.is_connection_current(generation, epoch).await);
+    drop(old);
+}
+
+#[tokio::test]
+async fn video_track_with_a_non_video_type_is_not_published() {
+    let core = test_core();
+    let generation = prepare_joined_core(&core, "alice");
+    let (connection, _sfu) = establish_fake(&core, generation).await;
+    *core.connection.lock().await = Some(connection);
+    core.own_capabilities
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .insert("send-video".to_owned());
+    let track =
+        LocalVideoTrack::h264_with_config(LocalVideoTrackConfig::default().server_managed())
+            .expect("video track");
+
+    let result = core
+        .publish(LocalTrack::Video {
+            track,
+            track_type: TrackType::Unspecified,
+        })
+        .await;
+
+    assert!(
+        matches!(result, Err(RtcError::IllegalState(_))),
+        "{result:?}"
+    );
+    assert!(core.media.lock().await.publications.is_empty());
+}
+
+#[tokio::test]
+async fn unspecified_track_type_cannot_be_muted() {
+    let core = test_core();
+
+    let result = core.set_track_muted(TrackType::Unspecified, true).await;
+
+    assert!(
+        matches!(result, Err(RtcError::IllegalState(_))),
+        "{result:?}"
+    );
+}
+
+#[test]
 fn stale_reconnect_completion_does_not_release_the_current_generation() {
     let core = test_core();
     let first = core.begin_join().expect("first generation");
@@ -355,12 +1219,12 @@ fn participant_refresh_replaces_published_track_state() {
         published_tracks: vec![TrackType::Audio as i32, TrackType::Video as i32],
         ..Default::default()
     };
-    core.roster_upsert(&participant);
+    core.upsert_participant(&participant);
     participant.published_tracks = vec![TrackType::Audio as i32];
-    core.roster_upsert(&participant);
+    core.upsert_participant(&participant);
 
-    let roster = core.roster.lock().unwrap_or_else(|e| e.into_inner());
-    let entry = roster.get("session-a").expect("participant");
+    let participants = core.participants.lock().unwrap_or_else(|e| e.into_inner());
+    let entry = participants.get("session-a").expect("participant");
     assert_eq!(entry.published.len(), 1);
     assert!(entry.published.contains(&(TrackType::Audio as i32)));
 }
@@ -820,7 +1684,7 @@ fn stop_state_is_retryable_until_mute_sync_commits() {
     media.set_status(&track_id, PublicationStatus::Published);
 
     // A stop marks the track `PendingStopMute`: it leaves the active set (so it
-    // is not re-announced on reconnect) but stays in the roster until the mute
+    // is not re-announced on reconnect) but stays in the publication list until the mute
     // RPC commits, so a failed mute can be retried without losing the track.
     media.set_status(&track_id, PublicationStatus::PendingStopMute);
     assert!(media.active_tracks().is_empty());
@@ -904,22 +1768,65 @@ async fn live_twirp_ice_trickle_framing_accepted() {
     }
 }
 
-/// Live proof that reconnect surfaces media-restoration failures.
-///
-/// A reconnect that fails while restoring the publisher must surface the error
-/// instead of silently reporting `Joined`. This joins a live call, publishes
-/// audio, injects a one-shot failure at the REJOIN published-restore hook, forces
-/// a REJOIN, and proves (1) the restore hook was reached and the injected failure
-/// propagated out of the attempt, and (2) the driver retried and recovered to
-/// `Joined` rather than leaving a failed attempt marked joined.
 #[tokio::test]
-async fn live_forced_media_restore_failure_is_surfaced_and_recovers() {
+async fn live_rejoin_restore_failure_is_surfaced_and_recovers() {
+    assert_live_restore_failure_is_surfaced_and_recovers(ReconnectStrategy::Rejoin).await;
+}
+
+#[tokio::test]
+async fn live_fast_restore_failure_is_surfaced_and_recovers() {
+    assert_live_restore_failure_is_surfaced_and_recovers(ReconnectStrategy::Fast).await;
+}
+
+#[tokio::test]
+async fn live_migrate_restore_failure_is_surfaced_and_recovers() {
+    assert_live_restore_failure_is_surfaced_and_recovers(ReconnectStrategy::Migrate).await;
+}
+
+#[tokio::test]
+async fn live_fast_reconnect_during_ice_gathering_succeeds_at_once() {
+    let Some((attempts, final_state)) = live_forced_reconnect(ReconnectStrategy::Fast, None).await
+    else {
+        return;
+    };
+    assert_eq!(attempts, [ReconnectStrategy::Fast]);
+    assert_eq!(final_state, CallingState::Joined);
+}
+
+/// A reconnect that fails once after the published tracks are restored must
+/// end that attempt, and a retry must bring the call back to `Joined`.
+async fn assert_live_restore_failure_is_surfaced_and_recovers(strategy: ReconnectStrategy) {
+    let Some((attempts, final_state)) =
+        live_forced_reconnect(strategy, Some(ReconnectFaultPoint::AfterPublishedRestore)).await
+    else {
+        return;
+    };
+    assert_eq!(attempts.first(), Some(&strategy));
+    assert!(
+        attempts.len() >= 2,
+        "the restore failure did not end the {strategy:?} attempt"
+    );
+    assert_eq!(
+        final_state,
+        CallingState::Joined,
+        "reconnect did not recover after a surfaced media-restoration failure"
+    );
+}
+
+/// Joins a live call, publishes audio, and forces a `strategy` reconnect at
+/// once. The reconnect fails once at `fault`, if given. Returns the reconnect
+/// attempts and the state after the reconnect settles, or `None` without
+/// credentials.
+async fn live_forced_reconnect(
+    strategy: ReconnectStrategy,
+    fault: Option<ReconnectFaultPoint>,
+) -> Option<(Vec<ReconnectStrategy>, CallingState)> {
     let _ = dotenvy::dotenv();
     let key = std::env::var("STREAM_API_KEY").unwrap_or_default();
     let secret = std::env::var("STREAM_API_SECRET").unwrap_or_default();
     if key.is_empty() || secret.is_empty() {
-        eprintln!("SKIP: STREAM creds absent; skipping live media-restore failure probe");
-        return;
+        eprintln!("SKIP: STREAM creds absent; skipping live forced reconnect");
+        return None;
     }
 
     let stream = crate::Stream::new(key, secret).expect("client");
@@ -971,40 +1878,44 @@ async fn live_forced_media_restore_failure_is_surfaced_and_recovers() {
         let generation = core.lifecycle_snapshot().1;
 
         let probe = Arc::new(ReconnectProbe::default());
-        probe.fail_once(
-            ReconnectStrategy::Rejoin,
-            ReconnectFaultPoint::AfterPublishedRestore,
-        );
+        if let Some(point) = fault {
+            probe.fail_once(strategy, point);
+        }
         core.install_reconnect_probe(probe.clone());
-        core.trigger_reconnect(
-            generation,
-            ReconnectStrategy::Rejoin,
-            "forced media restore failure".to_owned(),
-        );
+        core.trigger_reconnect(generation, strategy, "forced reconnect".to_owned());
 
-        let reached = |probe: &Arc<ReconnectProbe>| {
-            probe
-                .restores
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .iter()
-                .any(|(strategy, point)| {
-                    *strategy == ReconnectStrategy::Rejoin
-                        && *point == ReconnectFaultPoint::AfterPublishedRestore
-                })
-        };
         wait_for(
             Duration::from_secs(45),
-            || reached(&probe),
-            "forced restore fault reached",
+            || {
+                !probe
+                    .attempts
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .is_empty()
+            },
+            "reconnect started",
         )
         .await;
+        if let Some(fault) = fault {
+            wait_for(
+                Duration::from_secs(45),
+                || {
+                    probe
+                        .restores
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner())
+                        .contains(&(strategy, fault))
+                },
+                "forced fault reached",
+            )
+            .await;
+        }
         wait_for(
             Duration::from_secs(45),
             || {
                 matches!(
                     core.state(),
-                    CallingState::Joined | CallingState::ReconnectingFailed
+                    CallingState::Joined | CallingState::ReconnectingFailed | CallingState::Left
                 )
             },
             "reconnect settled",
@@ -1012,12 +1923,12 @@ async fn live_forced_media_restore_failure_is_surfaced_and_recovers() {
         .await;
 
         feeder.abort();
-        let restores = probe
-            .restores
+        let attempts = probe
+            .attempts
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .clone();
-        (restores, core.state())
+        (attempts, core.state())
     })
     .await;
 
@@ -1026,18 +1937,10 @@ async fn live_forced_media_restore_failure_is_surfaced_and_recovers() {
         .delete(crate::models::DeleteCallRequest { hard: Some(true) })
         .await;
 
-    let (restores, final_state) = outcome.expect("media-restore test timed out (120s guard)");
-    eprintln!("RESTORE FAILURE: restores={restores:?} final_state={final_state:?}");
-    assert!(
-        restores.iter().any(|(strategy, point)| {
-            *strategy == ReconnectStrategy::Rejoin
-                && *point == ReconnectFaultPoint::AfterPublishedRestore
-        }),
-        "forced REJOIN published-restore failure was never reached/surfaced"
+    let outcome = outcome.expect("forced reconnect timed out (120s guard)");
+    eprintln!(
+        "FORCED RECONNECT {strategy:?} fault={fault:?}: attempts={:?} final_state={:?}",
+        outcome.0, outcome.1
     );
-    assert_eq!(
-        final_state,
-        CallingState::Joined,
-        "reconnect did not recover after a surfaced media-restoration failure"
-    );
+    Some(outcome)
 }

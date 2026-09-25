@@ -443,6 +443,17 @@ mod tests {
     }
 
     #[test]
+    fn ws_auth_message_serializes_video_product() {
+        let auth = WsAuthMessage::video("jwt-token", ConnectUserDetails::new("agent"));
+        let json = serde_json::to_value(&auth).expect("serialize");
+        assert_eq!(json["token"], "jwt-token");
+        assert_eq!(json["user_details"]["id"], "agent");
+        assert_eq!(json["products"][0], "video");
+        // Optional user fields are omitted when unset.
+        assert!(json["user_details"].get("name").is_none());
+    }
+
+    #[test]
     fn coordinator_message_limit_accepts_exact_and_rejects_oversized_input() {
         ensure_message_size("coordinator test message", 64, 64).expect("exact limit");
         assert!(matches!(

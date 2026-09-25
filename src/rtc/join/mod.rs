@@ -11,7 +11,7 @@
 //! - a typed [`CallEvent`] broadcast stream (participant joined/left, tracks, …);
 //! - the reconnect state machine (`RtcCore::run_reconnect`) driven by the pure
 //!   decision logic in [`super::reconnect`], with dedup, the rejoin rate limiter,
-//!   the ICE / negotiation caps, the disconnection timeout, and the
+//!   the ICE / negotiation limits, the disconnection timeout, and the
 //!   `restore_published_tracks` / `restore_subscribed_tracks` hooks.
 //!
 //! This root file holds [`RtcCore`] itself — its fields, lifecycle/generation
@@ -22,7 +22,7 @@
 //! - `connection` — the SFU WebSocket handshake, callbacks, event dispatch;
 //! - `publish` — the publish path; `publication` — its per-track state;
 //! - `subscriptions_runtime` — subscription negotiation and inbound tracks;
-//! - `roster` — the participant roster and cached call state;
+//! - `participants` — the participant state and cached call state;
 //! - `reconnect_runtime` — reconnect execution and media restoration.
 //!
 //! `reconnect_runtime` and `subscriptions_runtime` carry the suffix to avoid
@@ -59,8 +59,8 @@ use super::proto::models::{self, PeerType, TrackType};
 use super::proto::signal;
 use super::publish_options::ClientPublishOptions;
 use super::reconnect::{
-    self, FailureCaps, ReconnectStrategy, SlidingWindowRateLimiter, escalate_strategy,
-    strategy_after_signal_close,
+    self, FailureLimits, ReconnectStrategy, SfuRejoinFailures, SlidingWindowRateLimiter,
+    escalate_strategy, strategy_after_signal_close,
 };
 use super::sfu::signal::SignalClient;
 use super::sfu::ws::{self, SfuReceiver, SfuSender};
@@ -73,18 +73,18 @@ use serde_json::json;
 
 mod connection;
 mod lifecycle;
+mod participants;
 mod publication;
 mod publish;
 mod reconnect_runtime;
-mod roster;
 mod subscriptions_runtime;
 
 use connection::{
     await_join_response, build_sfu_ws_url, event_loop, ping_loop, register_connection_state,
     register_on_track,
 };
+use participants::{CallStateCache, ParticipantState};
 use publication::{MediaState, PublicationStatus};
-use roster::{CallStateCache, RosterEntry};
 
 const MIGRATION_COMPLETE_TIMEOUT: Duration = Duration::from_secs(7);
 
@@ -172,8 +172,6 @@ pub enum CallingState {
     ReconnectingFailed,
     /// Left (terminal).
     Left,
-    /// Network is offline; waiting to resume.
-    Offline,
 }
 
 /// A typed SFU event delivered on the [`Call`](crate::Call) event stream.
@@ -274,6 +272,19 @@ struct Lifecycle {
     generation: u64,
     publish_options: ClientPublishOptions,
     generation_publish_options: ClientPublishOptions,
+    failure_limits: FailureLimits,
+    rate_limiter: SlidingWindowRateLimiter,
+}
+
+impl Lifecycle {
+    /// Call with the lifecycle lock held, so events arrive in the order of the
+    /// state changes.
+    fn set_state(&mut self, next: CallingState, events: &broadcast::Sender<CallEvent>) {
+        if self.state != next {
+            self.state = next;
+            let _ = events.send(CallEvent::CallingStateChanged(next));
+        }
+    }
 }
 
 /// A live SFU connection bundle. Swapped out wholesale on REJOIN/MIGRATE.
@@ -297,7 +308,7 @@ struct Connection {
     signal_tasks: Vec<JoinHandle<()>>,
     /// RTCP readers belong to the publisher PC and survive FAST reconnect.
     publisher_tasks: Vec<JoinHandle<()>>,
-    stats_task: JoinHandle<()>,
+    stats_task: Option<JoinHandle<()>>,
 }
 
 #[derive(Default)]
@@ -429,10 +440,27 @@ impl Connection {
         self.stats.flush().await;
         let mut tasks = std::mem::take(&mut self.signal_tasks);
         tasks.append(&mut self.publisher_tasks);
-        tasks.push(self.stats_task);
+        tasks.extend(self.stats_task.take());
         abort_tasks(tasks).await;
         let _ = self.subscriber.close().await;
         let _ = self.publisher.close().await;
+    }
+}
+
+impl Drop for Connection {
+    /// Stops the tasks when a cancelled future drops the connection before
+    /// `teardown`. The tasks own the PeerConnections, so this also drops them.
+    fn drop(&mut self) {
+        self.reconnect_enabled.store(false, Ordering::SeqCst);
+        self.stats.stop();
+        for task in self
+            .signal_tasks
+            .iter()
+            .chain(&self.publisher_tasks)
+            .chain(&self.stats_task)
+        {
+            task.abort();
+        }
     }
 }
 
@@ -467,16 +495,11 @@ pub struct RtcCore {
     stats_options: StdMutex<StatsOptions>,
     own_capabilities: StdMutex<HashSet<String>>,
     disconnection_timeout: StdMutex<Duration>,
-    caps: StdMutex<FailureCaps>,
-    rate_limiter: StdMutex<SlidingWindowRateLimiter>,
-    confirmed_bad_sfus: StdMutex<Vec<String>>,
-    reconnect_edge_failures: StdMutex<HashMap<String, u32>>,
     reconnect_generation: StdMutex<Option<u64>>,
     reconnect_attempts: AtomicU32,
     next_connection_epoch: AtomicU64,
     migration_waiter: StdMutex<Option<(u64, tokio::sync::oneshot::Sender<()>)>>,
     join_data: StdMutex<JoinCallData>,
-    started: StdMutex<Option<Instant>>,
     /// Stable session id spanning reconnects within one join→leave lifecycle,
     /// reported as `SendStats.unified_session_id` so the dashboard correlates a
     /// participant across FAST/REJOIN/MIGRATE (JS `unifiedSessionId`).
@@ -494,7 +517,7 @@ pub struct RtcCore {
     /// Exact per-session subscriptions, or `None` while using the coarse policy.
     manual_subscriptions: StdMutex<Option<Vec<SubscriptionTarget>>>,
     /// Known participants keyed by session id (correlation + subscription build).
-    roster: StdMutex<HashMap<String, RosterEntry>>,
+    participants: StdMutex<HashMap<String, ParticipantState>>,
     /// Call-level state supplied by join and incremental SFU events.
     call_state: StdMutex<CallStateCache>,
     /// Serialized publisher negotiation and retryable local publication state.
@@ -537,29 +560,26 @@ impl RtcCore {
                 generation: 0,
                 publish_options: ClientPublishOptions::default(),
                 generation_publish_options: ClientPublishOptions::default(),
+                failure_limits: FailureLimits::default(),
+                rate_limiter: SlidingWindowRateLimiter::rejoin_default(),
             }),
             lifecycle_changed: Notify::new(),
             connection: TokioMutex::new(None),
             stats_options: StdMutex::new(StatsOptions::default()),
             own_capabilities: StdMutex::new(HashSet::new()),
             disconnection_timeout: StdMutex::new(Duration::ZERO),
-            caps: StdMutex::new(FailureCaps::default()),
-            rate_limiter: StdMutex::new(SlidingWindowRateLimiter::rejoin_default()),
-            confirmed_bad_sfus: StdMutex::new(Vec::new()),
-            reconnect_edge_failures: StdMutex::new(HashMap::new()),
             reconnect_generation: StdMutex::new(None),
             reconnect_attempts: AtomicU32::new(0),
             next_connection_epoch: AtomicU64::new(0),
             migration_waiter: StdMutex::new(None),
             join_data: StdMutex::new(JoinCallData::new("")),
-            started: StdMutex::new(None),
             unified_session_id: StdMutex::new(String::new()),
             on_track_cb: StdMutex::new(None),
             sub_config: StdMutex::new(SubscriptionConfig::default()),
             subs_active: AtomicBool::new(false),
             manual_unsub: StdMutex::new(HashSet::new()),
             manual_subscriptions: StdMutex::new(None),
-            roster: StdMutex::new(HashMap::new()),
+            participants: StdMutex::new(HashMap::new()),
             call_state: StdMutex::new(CallStateCache::default()),
             media: TokioMutex::new(MediaState::default()),
             active_subs: StdMutex::new(Vec::new()),
@@ -579,6 +599,19 @@ impl RtcCore {
         tokio::spawn(async move {
             let _guard = guard;
             future.await;
+        })
+    }
+
+    /// Spawn a runtime task that stops at its next `await` after `generation`
+    /// ends. A task that calls `leave` must not use this: `leave` ends the
+    /// generation and would cancel itself.
+    fn spawn_generation_task<F>(self: &Arc<Self>, generation: u64, future: F) -> JoinHandle<()>
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        let core = self.clone();
+        self.spawn_runtime_task(async move {
+            let _ = core.while_generation(generation, future).await;
         })
     }
 
@@ -628,14 +661,11 @@ impl RtcCore {
     }
 
     fn set_state_if_current(&self, generation: u64, next: CallingState) -> bool {
-        {
-            let mut guard = self.lifecycle.lock().unwrap_or_else(|e| e.into_inner());
-            if guard.generation != generation {
-                return false;
-            }
-            guard.state = next;
+        let mut guard = self.lifecycle.lock().unwrap_or_else(|e| e.into_inner());
+        if guard.generation != generation {
+            return false;
         }
-        let _ = self.events_tx.send(CallEvent::CallingStateChanged(next));
+        guard.set_state(next, &self.events_tx);
         true
     }
 
@@ -694,8 +724,10 @@ impl RtcCore {
             match guard.state {
                 CallingState::Idle | CallingState::Left => {
                     guard.generation = guard.generation.wrapping_add(1);
-                    guard.state = CallingState::Joining;
+                    guard.set_state(CallingState::Joining, &self.events_tx);
                     guard.generation_publish_options = guard.publish_options;
+                    guard.failure_limits = FailureLimits::default();
+                    guard.rate_limiter = SlidingWindowRateLimiter::rejoin_default();
                     guard.generation
                 }
                 _ => {
@@ -711,17 +743,6 @@ impl RtcCore {
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = None;
         self.reconnect_attempts.store(0, Ordering::SeqCst);
-        *self.caps.lock().unwrap_or_else(|e| e.into_inner()) = FailureCaps::default();
-        *self.rate_limiter.lock().unwrap_or_else(|e| e.into_inner()) =
-            SlidingWindowRateLimiter::rejoin_default();
-        self.confirmed_bad_sfus
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clear();
-        self.reconnect_edge_failures
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clear();
         Ok(generation)
     }
 
@@ -729,9 +750,6 @@ impl RtcCore {
         let generation = {
             let mut guard = self.lifecycle.lock().unwrap_or_else(|e| e.into_inner());
             guard.generation = guard.generation.wrapping_add(1);
-            if guard.state == CallingState::Joining {
-                guard.state = CallingState::Reconnecting;
-            }
             guard.generation
         };
         self.lifecycle_changed.notify_waiters();

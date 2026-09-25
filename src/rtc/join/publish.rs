@@ -7,6 +7,13 @@ impl RtcCore {
     /// Publish a local track: add its send-only transceiver and renegotiate the
     /// publisher PC with the SFU (`SetPublisher`). Errors if not joined.
     pub async fn publish(self: &Arc<Self>, track: LocalTrack) -> Result<()> {
+        if let LocalTrack::Video { track_type, .. } = &track
+            && !matches!(track_type, TrackType::Video | TrackType::ScreenShare)
+        {
+            return Err(RtcError::IllegalState(format!(
+                "a video track cannot be published as {track_type:?}"
+            )));
+        }
         let Some((publisher, signal, session_id, publish_options)) = self.publisher_handles().await
         else {
             return Err(RtcError::IllegalState("publish() before join()".to_owned()));
@@ -115,7 +122,7 @@ impl RtcCore {
             .unwrap_or_else(|e| e.into_inner())
             .user_id
             .clone();
-        self.roster_add_track(&user_id, &session_id, track.track_type() as i32, None);
+        self.add_published_track(&user_id, &session_id, track.track_type() as i32, None);
         track.start_media();
         signal
             .update_mute_states(signal::UpdateMuteStatesRequest {
@@ -189,7 +196,7 @@ impl RtcCore {
             })
             .await?;
         if muted {
-            self.roster_remove_track(&session_id, track_type as i32);
+            self.remove_published_track(&session_id, track_type as i32);
         }
         if let Some(removed) = media.remove(&track_id) {
             removed.stop();
@@ -207,6 +214,11 @@ impl RtcCore {
         track_type: TrackType,
         muted: bool,
     ) -> Result<()> {
+        if track_type == TrackType::Unspecified {
+            return Err(RtcError::IllegalState(
+                "cannot mute an unspecified track type".to_owned(),
+            ));
+        }
         if !muted {
             let capability = required_publish_capability(track_type);
             if !self
@@ -267,7 +279,7 @@ impl RtcCore {
             return Err(error);
         }
         if muted {
-            self.roster_remove_track(&session_id, track_type as i32);
+            self.remove_published_track(&session_id, track_type as i32);
         } else {
             let user_id = self
                 .join_data
@@ -275,7 +287,7 @@ impl RtcCore {
                 .unwrap_or_else(|error| error.into_inner())
                 .user_id
                 .clone();
-            self.roster_add_track(&user_id, &session_id, track_type as i32, None);
+            self.add_published_track(&user_id, &session_id, track_type as i32, None);
         }
         Ok(())
     }

@@ -121,7 +121,7 @@ async fn two_sessions_join_and_observe_each_other() {
             .await
             .expect("session B join failed");
 
-        // A should see B arrive as an event; B should see A via the initial roster.
+        // A should see B arrive as an event; B should see A via the initial participants.
         let saw_b = observe_participant(rx_a, user_b.clone(), Duration::from_secs(30));
         let saw_a = observe_participant(rx_b, user_a.clone(), Duration::from_secs(30));
         let (saw_b, saw_a) = tokio::join!(saw_b, saw_a);

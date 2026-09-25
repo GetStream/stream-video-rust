@@ -13,8 +13,8 @@ impl RtcCore {
     }
 
     /// Set the subscription policy and (re)send `UpdateSubscriptions`. Activates
-    /// the reactive subscriber: subscriptions are recomputed on every roster
-    /// change from here on.
+    /// the reactive subscriber: subscriptions are recomputed on every
+    /// participant change from here on.
     pub async fn update_subscriptions(&self, config: SubscriptionConfig) -> Result<()> {
         *self.sub_config.lock().unwrap_or_else(|e| e.into_inner()) = config;
         *self
@@ -59,7 +59,7 @@ impl RtcCore {
         Ok(())
     }
 
-    /// Rebuild the desired subscription list from the roster + policy and send it
+    /// Rebuild the desired subscription list from the participants + policy and send it
     /// to the SFU if it changed since the last send on this connection.
     pub(super) async fn recompute_subscriptions(&self) -> Result<()> {
         self.recompute_subscriptions_for_generation(self.generation())
@@ -99,10 +99,10 @@ impl RtcCore {
 
         let mut tracks: Vec<signal::TrackSubscriptionDetails> = Vec::new();
         {
-            let roster = self.roster.lock().unwrap_or_else(|e| e.into_inner());
+            let participants = self.participants.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(targets) = targets {
                 for target in targets {
-                    let Some(entry) = roster.get(&target.session_id) else {
+                    let Some(entry) = participants.get(&target.session_id) else {
                         continue;
                     };
                     if entry.session_id == session_id
@@ -123,7 +123,7 @@ impl RtcCore {
                     });
                 }
             } else {
-                for entry in roster.values() {
+                for entry in participants.values() {
                     if entry.session_id == session_id {
                         continue;
                     }
@@ -160,7 +160,7 @@ impl RtcCore {
             left.session_id == right.session_id && left.track_type == right.track_type
         });
 
-        // Skip an identical resend (roster churn that doesn't change the set).
+        // Skip an identical resend (participant churn that doesn't change the set).
         if *self.active_subs.lock().unwrap_or_else(|e| e.into_inner()) == tracks {
             return Ok(());
         }
@@ -234,7 +234,7 @@ impl RtcCore {
         let on_drop = Box::new(move || {
             if let Some(core) = weak.upgrade() {
                 let task_core = core.clone();
-                std::mem::drop(core.spawn_runtime_task(async move {
+                std::mem::drop(core.spawn_generation_task(generation, async move {
                     task_core
                         .on_remote_track_dropped(generation, connection_epoch, key)
                         .await;

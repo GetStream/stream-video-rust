@@ -3,11 +3,11 @@
 //! Ported from JS `Call.ts` + `coordinator/connection/utils.ts`. Everything in
 //! this module is deterministic (or jitter-only) and side-effect free so it can
 //! be unit-tested without a live SFU: backoff intervals, the rejoin rate
-//! limiter, the ICE / negotiation failure caps, the join-retry decision, and
+//! limiter, the ICE / negotiation failure limits, the join-retry decision, and
 //! the FAST→REJOIN escalation rule. The orchestration that *acts* on these
 //! decisions lives in [`super::join`].
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use super::proto::models::WebsocketReconnectStrategy;
@@ -196,17 +196,17 @@ impl SlidingWindowRateLimiter {
     }
 }
 
-/// Tracks the failure caps that force the reconnect loop to give up (JS
+/// Tracks the failure limits that force the reconnect loop to give up (JS
 /// `iceFailuresWithoutConnect` / `consecutiveNegotiationFailures`).
 #[derive(Debug, Clone)]
-pub struct FailureCaps {
+pub struct FailureLimits {
     ice_failures_without_connect: u32,
     consecutive_negotiation_failures: u32,
     max_ice_failures: u32,
     max_consecutive_negotiation: u32,
 }
 
-impl Default for FailureCaps {
+impl Default for FailureLimits {
     fn default() -> Self {
         Self {
             ice_failures_without_connect: 0,
@@ -217,8 +217,8 @@ impl Default for FailureCaps {
     }
 }
 
-impl FailureCaps {
-    /// Record an ICE-never-connected failure. Returns `true` when the cap (2) is
+impl FailureLimits {
+    /// Record an ICE-never-connected failure. Returns `true` when the limit (2) is
     /// reached and the caller must `leave` with `webrtc_unsupported_network`.
     pub fn record_ice_never_connected(&mut self) -> bool {
         self.ice_failures_without_connect += 1;
@@ -230,7 +230,7 @@ impl FailureCaps {
         self.ice_failures_without_connect = 0;
     }
 
-    /// Record a negotiation failure. Returns `true` when the cap (3) is reached
+    /// Record a negotiation failure. Returns `true` when the limit (3) is reached
     /// and the caller must `leave` with `repeated_negotiation_failures`.
     pub fn record_negotiation_failure(&mut self) -> bool {
         self.consecutive_negotiation_failures += 1;
@@ -240,6 +240,32 @@ impl FailureCaps {
     /// A successful reconnect clears the consecutive-negotiation counter.
     pub fn reset_negotiation(&mut self) {
         self.consecutive_negotiation_failures = 0;
+    }
+}
+
+/// SFUs that failed a rejoin during one reconnect. Two failures confirm an SFU
+/// as bad; a join error code confirms it at once.
+#[derive(Debug, Default)]
+pub(crate) struct SfuRejoinFailures {
+    counts: HashMap<String, u32>,
+    confirmed: Vec<String>,
+}
+
+impl SfuRejoinFailures {
+    pub(crate) fn record(&mut self, edge: &str, force_switch: bool) {
+        let count = self.counts.entry(edge.to_owned()).or_insert(0);
+        *count = count.saturating_add(1);
+        if force_switch {
+            *count = (*count).max(2);
+        }
+        if *count >= 2 && !self.confirmed.iter().any(|known| known == edge) {
+            self.confirmed.push(edge.to_owned());
+        }
+    }
+
+    /// Confirmed bad SFUs, in the order they were confirmed.
+    pub(crate) fn confirmed(&self) -> &[String] {
+        &self.confirmed
     }
 }
 
@@ -361,23 +387,41 @@ mod tests {
     }
 
     #[test]
-    fn ice_cap_trips_on_second_failure() {
-        let mut caps = FailureCaps::default();
-        assert!(!caps.record_ice_never_connected());
-        assert!(caps.record_ice_never_connected());
+    fn ice_limit_is_reached_on_second_failure() {
+        let mut limits = FailureLimits::default();
+        assert!(!limits.record_ice_never_connected());
+        assert!(limits.record_ice_never_connected());
         // reset clears it
-        caps.reset_ice();
-        assert!(!caps.record_ice_never_connected());
+        limits.reset_ice();
+        assert!(!limits.record_ice_never_connected());
     }
 
     #[test]
-    fn negotiation_cap_trips_on_third_failure() {
-        let mut caps = FailureCaps::default();
-        assert!(!caps.record_negotiation_failure());
-        assert!(!caps.record_negotiation_failure());
-        assert!(caps.record_negotiation_failure());
-        caps.reset_negotiation();
-        assert!(!caps.record_negotiation_failure());
+    fn sfu_is_confirmed_bad_after_two_rejoin_failures() {
+        let mut failures = SfuRejoinFailures::default();
+        failures.record("sfu-a", false);
+        assert!(failures.confirmed().is_empty());
+        failures.record("sfu-a", false);
+        assert_eq!(failures.confirmed(), ["sfu-a"]);
+    }
+
+    #[test]
+    fn join_error_code_confirms_the_sfu_at_once() {
+        let mut failures = SfuRejoinFailures::default();
+        failures.record("sfu-a", true);
+        failures.record("sfu-b", true);
+        failures.record("sfu-a", true);
+        assert_eq!(failures.confirmed(), ["sfu-a", "sfu-b"]);
+    }
+
+    #[test]
+    fn negotiation_limit_is_reached_on_third_failure() {
+        let mut limits = FailureLimits::default();
+        assert!(!limits.record_negotiation_failure());
+        assert!(!limits.record_negotiation_failure());
+        assert!(limits.record_negotiation_failure());
+        limits.reset_negotiation();
+        assert!(!limits.record_negotiation_failure());
     }
 
     #[test]

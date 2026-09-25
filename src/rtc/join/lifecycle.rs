@@ -36,7 +36,7 @@ impl RtcCore {
             *source = Some(token_source);
         }
         let user_token = match self
-            .while_generation(generation, self.reload_user_token())
+            .while_generation(generation, self.reload_user_token(generation))
             .await
             .and_then(|result| result)
         {
@@ -54,7 +54,7 @@ impl RtcCore {
             .await
             .and_then(|result| result)
         {
-            self.stop_coordinator_events().await;
+            self.stop_coordinator_events(generation).await;
             self.set_state_if_current(generation, CallingState::Idle);
             return Err(error);
         }
@@ -64,7 +64,7 @@ impl RtcCore {
             .await
             .and_then(|result| result);
         if result.is_err() {
-            self.stop_coordinator_events().await;
+            self.stop_coordinator_events(generation).await;
             // Restore to a non-joining terminal state so a retry is allowed.
             if self.state() == CallingState::Joining {
                 self.set_state_if_current(generation, CallingState::Idle);
@@ -73,7 +73,7 @@ impl RtcCore {
         result
     }
 
-    pub(super) async fn reload_user_token(&self) -> Result<String> {
+    pub(super) async fn reload_user_token(&self, generation: u64) -> Result<String> {
         let _refresh = self.token_refresh.lock().await;
         let source = self
             .token_source
@@ -88,6 +88,10 @@ impl RtcCore {
             .user_id
             .clone();
         let token = source.load_with_expiry_retry(&user_id).await?;
+        let lifecycle = self.lifecycle.lock().unwrap_or_else(|e| e.into_inner());
+        if lifecycle.generation != generation {
+            return Err(join_cancelled());
+        }
         *self.user_token.lock().unwrap_or_else(|e| e.into_inner()) = token.clone();
         Ok(token)
     }
@@ -108,7 +112,7 @@ impl RtcCore {
         Ok(token)
     }
 
-    pub(super) async fn refresh_expired_user_token(&self) -> Result<String> {
+    pub(super) async fn refresh_expired_user_token(&self, generation: u64) -> Result<String> {
         let can_refresh = self
             .token_source
             .lock()
@@ -120,10 +124,10 @@ impl RtcCore {
                 crate::error::TokenError::ExpiredByServer,
             ));
         }
-        self.reload_user_token().await
+        self.reload_user_token(generation).await
     }
 
-    pub(super) async fn refresh_before_full_reconnect(&self) -> Result<String> {
+    pub(super) async fn refresh_before_full_reconnect(&self, generation: u64) -> Result<String> {
         let refresh = self
             .token_source
             .lock()
@@ -131,11 +135,13 @@ impl RtcCore {
             .as_ref()
             .is_some_and(UserTokenSource::refreshes_before_full_reconnect);
         if refresh {
-            self.reload_user_token().await
+            self.reload_user_token(generation).await
         } else {
             match self.current_user_token() {
                 Ok(token) => Ok(token),
-                Err(error) if error.is_token_expired() => self.refresh_expired_user_token().await,
+                Err(error) if error.is_token_expired() => {
+                    self.refresh_expired_user_token(generation).await
+                }
                 Err(error) => Err(error),
             }
         }
@@ -162,6 +168,7 @@ impl RtcCore {
         let mut migrating_from: Option<String> = None;
         let mut edge_failures: std::collections::HashMap<String, u32> =
             std::collections::HashMap::new();
+        let mut confirmed_bad_sfus: Vec<String> = Vec::new();
         let mut last_err: Option<RtcError> = None;
         let mut expired_retry_used = false;
 
@@ -174,13 +181,7 @@ impl RtcCore {
                 notify: data.notify.then_some(true),
                 video: data.video.then_some(true),
                 migrating_from: migrating_from.clone(),
-                migrating_from_list: {
-                    let bad = self
-                        .confirmed_bad_sfus
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner());
-                    bad.clone()
-                },
+                migrating_from_list: confirmed_bad_sfus.clone(),
                 ..Default::default()
             };
 
@@ -203,7 +204,7 @@ impl RtcCore {
                     .err()
                     .is_some_and(|(error, _)| error.is_token_expired());
                 if is_expired && !expired_retry_used {
-                    user_token = self.refresh_expired_user_token().await?;
+                    user_token = self.refresh_expired_user_token(generation).await?;
                     expired_retry_used = true;
                     continue;
                 }
@@ -216,7 +217,6 @@ impl RtcCore {
                         return Err(join_cancelled());
                     }
                     tracing::info!(cid = %self.cid(), edge = %success.edge_name, "stream.rtc.joined");
-                    *self.started.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
                     if !self.set_state_if_current(generation, CallingState::Joined) {
                         return Err(join_cancelled());
                     }
@@ -258,12 +258,8 @@ impl RtcCore {
                         reconnect::JoinAttemptOutcome::Retry { delay, switch_sfu } => {
                             if switch_sfu && let Some(edge) = edge_name {
                                 migrating_from = Some(edge.clone());
-                                let mut bad = self
-                                    .confirmed_bad_sfus
-                                    .lock()
-                                    .unwrap_or_else(|e| e.into_inner());
-                                if !bad.contains(&edge) {
-                                    bad.push(edge);
+                                if !confirmed_bad_sfus.contains(&edge) {
+                                    confirmed_bad_sfus.push(edge);
                                 }
                             }
                             last_err = Some(err);
@@ -590,28 +586,34 @@ impl RtcCore {
         }));
 
         // Spawn the WS event loop + health-check ping loop + stats loop.
-        let event_loop = self.spawn_runtime_task(event_loop(
-            receiver,
-            EventLoopContext {
-                core: self.clone(),
-                subscriber: subscriber.clone(),
-                publisher: publisher.clone(),
-                signal: signal.clone(),
-                session_id: session_id.clone(),
-                pending_ice: pending_ice.clone(),
-                generation,
-                ws_healthy: ws_healthy.clone(),
-                reconnect_enabled: reconnect_enabled.clone(),
-            },
-        ));
-        let ping_loop = self.spawn_runtime_task(ping_loop(
-            self.clone(),
-            sfu_sender.clone(),
+        let event_loop = self.spawn_generation_task(
             generation,
-            ws_healthy.clone(),
-            reconnect_enabled.clone(),
-        ));
-        let stats_loop = self.spawn_runtime_task(stats::run(stats.clone()));
+            event_loop(
+                receiver,
+                EventLoopContext {
+                    core: self.clone(),
+                    subscriber: subscriber.clone(),
+                    publisher: publisher.clone(),
+                    signal: signal.clone(),
+                    session_id: session_id.clone(),
+                    pending_ice: pending_ice.clone(),
+                    generation,
+                    ws_healthy: ws_healthy.clone(),
+                    reconnect_enabled: reconnect_enabled.clone(),
+                },
+            ),
+        );
+        let ping_loop = self.spawn_generation_task(
+            generation,
+            ping_loop(
+                self.clone(),
+                sfu_sender.clone(),
+                generation,
+                ws_healthy.clone(),
+                reconnect_enabled.clone(),
+            ),
+        );
+        let stats_loop = self.spawn_generation_task(generation, stats::run(stats.clone()));
 
         Ok(Connection {
             generation,
@@ -630,7 +632,7 @@ impl RtcCore {
             reconnect_enabled,
             signal_tasks: vec![event_loop, ping_loop],
             publisher_tasks: Vec::new(),
-            stats_task: stats_loop,
+            stats_task: Some(stats_loop),
         })
     }
 }
@@ -640,10 +642,7 @@ impl RtcCore {
     /// abort background tasks. Succeeds from any state, including `Joining`
     /// (JS: force to a leaving state rather than waiting for `JOINED`).
     pub async fn leave(&self, reason: impl Into<String>) -> Result<()> {
-        self.leave_inner(reason.into()).await
-    }
-
-    pub(super) async fn leave_inner(&self, reason: String) -> Result<()> {
+        let reason = reason.into();
         let generation = self.cancel_generation();
 
         let connection = self.connection.lock().await.take();
@@ -659,28 +658,34 @@ impl RtcCore {
             }
             connection.teardown().await;
         }
-        self.roster
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clear();
-        *self
-            .call_state
-            .lock()
-            .unwrap_or_else(|error| error.into_inner()) = CallStateCache::default();
-        self.active_subs
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clear();
-        self.own_capabilities
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clear();
-        *self
-            .reconnect_generation
-            .lock()
-            .unwrap_or_else(|e| e.into_inner()) = None;
+        {
+            // A join that started during the awaits above owns these fields.
+            let lifecycle = self.lifecycle.lock().unwrap_or_else(|e| e.into_inner());
+            if lifecycle.generation == generation {
+                self.participants
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clear();
+                *self
+                    .call_state
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner()) = CallStateCache::default();
+                self.active_subs
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clear();
+                self.own_capabilities
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clear();
+                *self
+                    .reconnect_generation
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()) = None;
+            }
+        }
         self.set_state_if_current(generation, CallingState::Left);
-        self.stop_coordinator_events().await;
+        self.stop_coordinator_events(generation).await;
         Ok(())
     }
 }
@@ -723,11 +728,8 @@ impl RtcCore {
         let local_user_id = user_id.to_owned();
         let sender = self.events_tx.clone();
         let event_core = self.clone();
-        let event_task = self.spawn_runtime_task(async move {
+        let event_task = self.spawn_generation_task(generation, async move {
             loop {
-                if !event_core.is_generation_current(generation) {
-                    break;
-                }
                 match events.recv().await {
                     Ok(Some(event))
                         if event.raw.get("call_cid").and_then(|value| value.as_str())
@@ -762,14 +764,11 @@ impl RtcCore {
             }
         });
         let health_core = self.clone();
-        let health_task = self.spawn_runtime_task(async move {
+        let health_task = self.spawn_generation_task(generation, async move {
             let mut interval = tokio::time::interval(Duration::from_secs(20));
             interval.tick().await;
             loop {
                 interval.tick().await;
-                if !health_core.is_generation_current(generation) {
-                    break;
-                }
                 if let Err(error) = coordinator.send_health_check().await {
                     tracing::warn!(%error, "stream.rtc.coordinator_health_failed");
                     health_core.clear_coordinator_connection(generation);
@@ -870,15 +869,27 @@ impl RtcCore {
         abort_tasks(tasks).await;
     }
 
-    pub(super) async fn stop_coordinator_events(&self) {
-        *self
-            .coordinator_connection_id
-            .lock()
-            .unwrap_or_else(|error| error.into_inner()) = None;
-        self.user_token
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .clear();
-        self.stop_coordinator_tasks().await;
+    /// Does nothing when `generation` is stale: the fields belong to a newer join.
+    pub(super) async fn stop_coordinator_events(&self, generation: u64) {
+        let tasks = {
+            let lifecycle = self.lifecycle.lock().unwrap_or_else(|e| e.into_inner());
+            if lifecycle.generation != generation {
+                return;
+            }
+            *self
+                .coordinator_connection_id
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()) = None;
+            self.user_token
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .clear();
+            self.coordinator_tasks
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .drain(..)
+                .collect()
+        };
+        abort_tasks(tasks).await;
     }
 }

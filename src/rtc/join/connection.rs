@@ -129,10 +129,10 @@ pub(super) fn register_connection_state(
             tracer.trace("connectionstatechange", json!(state.to_string()));
             if state == RTCPeerConnectionState::Connected {
                 ever_connected.store(true, Ordering::SeqCst);
-                core.caps
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .reset_ice();
+                let mut lifecycle = core.lifecycle.lock().unwrap_or_else(|e| e.into_inner());
+                if lifecycle.generation == generation {
+                    lifecycle.failure_limits.reset_ice();
+                }
             }
             if state == RTCPeerConnectionState::Failed && reconnect_enabled.load(Ordering::SeqCst) {
                 let (pub_h, sub_h) = core.pc_health().await;
@@ -220,6 +220,20 @@ pub(super) async fn handle_event(
         return Ok(());
     }
     use sfu_event::EventPayload as E;
+    // During a migration the old SFU still sends events. Its WebRTC commands
+    // are not for the new connection.
+    if !context.reconnect_enabled.load(Ordering::SeqCst)
+        && matches!(
+            payload,
+            E::SubscriberOffer(_)
+                | E::IceTrickle(_)
+                | E::ChangePublishOptions(_)
+                | E::ChangePublishQuality(_)
+                | E::IceRestart(_)
+        )
+    {
+        return Ok(());
+    }
     match payload {
         E::SubscriberOffer(offer) => {
             negotiate_subscriber(
@@ -245,7 +259,7 @@ pub(super) async fn handle_event(
         }
         E::ParticipantJoined(ev) => {
             if let Some(p) = ev.participant {
-                core.roster_upsert(&p);
+                core.upsert_participant(&p);
                 core.recompute_subscriptions_for_generation(context.generation)
                     .await?;
                 let _ = core.events_tx.send(CallEvent::ParticipantJoined(p));
@@ -253,7 +267,7 @@ pub(super) async fn handle_event(
         }
         E::ParticipantLeft(ev) => {
             if let Some(p) = ev.participant {
-                core.roster_remove(&p.session_id);
+                core.remove_participant(&p.session_id);
                 core.recompute_subscriptions_for_generation(context.generation)
                     .await?;
                 let _ = core.events_tx.send(CallEvent::ParticipantLeft(p));
@@ -261,14 +275,14 @@ pub(super) async fn handle_event(
         }
         E::ParticipantUpdated(ev) => {
             if let Some(p) = ev.participant {
-                core.roster_upsert(&p);
+                core.upsert_participant(&p);
                 core.recompute_subscriptions_for_generation(context.generation)
                     .await?;
                 let _ = core.events_tx.send(CallEvent::ParticipantUpdated(p));
             }
         }
         E::TrackPublished(ev) => {
-            core.roster_add_track(
+            core.add_published_track(
                 &ev.user_id,
                 &ev.session_id,
                 ev.r#type,
@@ -283,7 +297,7 @@ pub(super) async fn handle_event(
             });
         }
         E::TrackUnpublished(ev) => {
-            core.roster_remove_track(&ev.session_id, ev.r#type);
+            core.remove_published_track(&ev.session_id, ev.r#type);
             core.recompute_subscriptions_for_generation(context.generation)
                 .await?;
             let _ = core.events_tx.send(CallEvent::TrackUnpublished {
