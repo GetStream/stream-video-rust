@@ -219,6 +219,8 @@ struct AudioDecode {
     /// rebuilt frame as long as the output buffer. A lost packet states no
     /// length, so the stream's own frame size is the best value to use.
     frame_samples: usize,
+    /// Decode output, reused for every packet. Queued frames are exact copies.
+    scratch: Vec<i16>,
 }
 
 /// How this track's payload is turned into something the caller can use.
@@ -515,6 +517,7 @@ impl AudioDecode {
             last_seq: None,
             ready: VecDeque::new(),
             frame_samples: FRAME_SAMPLES_20MS,
+            scratch: vec![0; MAX_OPUS_FRAME_SAMPLES],
         }
     }
 
@@ -571,17 +574,18 @@ impl AudioDecode {
         } else {
             MAX_OPUS_FRAME_SAMPLES
         };
-        let mut out = vec![0i16; capacity];
-        match self.decoder.decode(payload, &mut out, fec) {
+        match self
+            .decoder
+            .decode(payload, &mut self.scratch[..capacity], fec)
+        {
             Ok(samples) => {
-                out.truncate(samples);
-                if out.is_empty() {
+                if samples == 0 {
                     return;
                 }
                 if !rebuilt {
                     self.frame_samples = samples;
                 }
-                self.ready.push_back(out);
+                self.ready.push_back(self.scratch[..samples].to_vec());
             }
             Err(error) => {
                 tracing::debug!(error = %error, "stream.rtc.remote.opus_decode_failed");
@@ -824,6 +828,17 @@ mod tests {
                 "packet {index} queued extra frames"
             );
         }
+    }
+
+    #[test]
+    fn a_decoded_frame_holds_only_its_samples() {
+        let packets = tone_packets(1, true);
+        let mut state = audio_decode();
+
+        state.push_packet(0, &packets[0]);
+
+        let frame = state.take_frame().expect("decoded frame");
+        assert_eq!(frame.capacity(), frame.len());
     }
 
     #[test]

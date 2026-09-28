@@ -23,6 +23,8 @@ pub(super) struct CallStateCache {
     pub(super) started_at: Option<prost_types::Timestamp>,
     pub(super) e2ee_enabled: bool,
     pub(super) current_grants: Option<models::CallGrants>,
+    /// Set by the first report of the call end.
+    pub(super) ended: bool,
 }
 
 impl RtcCore {
@@ -107,6 +109,7 @@ impl RtcCore {
             started_at: state.started_at,
             e2ee_enabled: state.e2ee_enabled,
             current_grants: None,
+            ended: false,
         };
         {
             let mut participants = self.participants.lock().unwrap_or_else(|e| e.into_inner());

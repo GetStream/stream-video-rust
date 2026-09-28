@@ -65,7 +65,9 @@ use super::reconnect::{
 use super::sfu::signal::SignalClient;
 use super::sfu::ws::{self, SfuReceiver, SfuSender};
 use super::stats::{self, StatsReporter, StatsReporterParts};
-use super::subscriptions::{SubscriptionConfig, SubscriptionTarget, TrackKey};
+use super::subscriptions::{
+    DEFAULT_VIDEO_DIMENSION, SubscriptionConfig, SubscriptionTarget, TrackKey,
+};
 use super::tracer::Tracer;
 use super::tracks::{LocalTrack, RemoteParticipant, RemoteTrack};
 
@@ -240,7 +242,8 @@ pub enum CallEvent {
     IceRestarted(PeerType),
     /// The SFU reported an error for this participant.
     Error(SfuJoinError),
-    /// The call ended.
+    /// The call ended: the SFU or the coordinator (`call.ended`) reported it.
+    /// Sent once, after which the SDK leaves the call.
     CallEnded,
     /// The connection state changed.
     CallingStateChanged(CallingState),

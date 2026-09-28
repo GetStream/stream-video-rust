@@ -162,6 +162,13 @@ async fn fake_sfu(
 /// A local coordinator WebSocket that sends `connection.ok`. It returns the
 /// REST base URL and a task that ends when the client socket closes.
 async fn fake_coordinator() -> (String, tokio::task::JoinHandle<()>) {
+    fake_coordinator_sending(Vec::new()).await
+}
+
+/// [`fake_coordinator`] that also sends `events` after `connection.ok`.
+async fn fake_coordinator_sending(
+    events: Vec<serde_json::Value>,
+) -> (String, tokio::task::JoinHandle<()>) {
     use futures_util::{SinkExt, StreamExt};
     use tokio_tungstenite::tungstenite::Message;
 
@@ -187,6 +194,12 @@ async fn fake_coordinator() -> (String, tokio::task::JoinHandle<()>) {
             ))
             .await
             .expect("send connection.ok");
+        for event in events {
+            socket
+                .send(Message::Text(event.to_string().into()))
+                .await
+                .expect("send coordinator event");
+        }
         while let Some(Ok(_)) = socket.next().await {}
     });
     (format!("ws://{address}"), server)
@@ -234,6 +247,21 @@ async fn establish_fake(
         .await
         .expect("establish against fake SFU");
     (connection, sfu)
+}
+
+/// The event loop context of the current `connection`.
+fn event_context(core: &Arc<RtcCore>, connection: &Connection) -> EventLoopContext {
+    EventLoopContext {
+        core: core.clone(),
+        subscriber: connection.subscriber.clone(),
+        publisher: connection.publisher.clone(),
+        signal: connection.signal.clone(),
+        session_id: connection.session_id.clone(),
+        pending_ice: connection.pending_ice.clone(),
+        generation: connection.generation,
+        ws_healthy: connection.ws_healthy.clone(),
+        reconnect_enabled: connection.reconnect_enabled.clone(),
+    }
 }
 
 /// The event loop context of `connection` after a migration detached it.
@@ -366,6 +394,140 @@ async fn leave_tears_down_the_stored_connection() {
     let (active, spawned, completed) = core.runtime_task_snapshot();
     assert_eq!(active, 0);
     assert_eq!(spawned, completed);
+}
+
+#[tokio::test]
+async fn call_ended_from_the_coordinator_is_reported_once_and_leaves_the_call() {
+    let (coordinator_ws_url, _coordinator) = fake_coordinator_sending(vec![
+        json!({ "type": "call.ended", "call_cid": "default:test-call" }),
+    ])
+    .await;
+    let core = test_core_with_config(ClientConfig {
+        coordinator_ws_url,
+        ..ClientConfig::default()
+    });
+    let generation = prepare_joined_core(&core, "alice");
+    let (connection, sfu) = establish_fake(&core, generation).await;
+    let context = event_context(&core, &connection);
+    *core.connection.lock().await = Some(connection);
+    let mut events = core.subscribe();
+    let token = core.current_user_token().expect("user token");
+
+    core.connect_coordinator_events(generation, &token, "alice")
+        .await
+        .expect("coordinator events");
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if let Ok(CallEvent::CallEnded) = events.recv().await {
+                return;
+            }
+        }
+    })
+    .await
+    .expect("call ended event");
+    connection::handle_event(
+        &context,
+        sfu_event::EventPayload::CallEnded(event::CallEnded::default()),
+    )
+    .await
+    .expect("handle SFU call ended");
+
+    wait_for(
+        Duration::from_secs(2),
+        || core.state() == CallingState::Left,
+        "the ended call is left",
+    )
+    .await;
+    let mut repeated = 0;
+    while let Ok(event) = events.try_recv() {
+        if matches!(event, CallEvent::CallEnded) {
+            repeated += 1;
+        }
+    }
+    assert_eq!(repeated, 0, "call ended is reported once");
+    let requests = requests_until_close(sfu).await;
+    assert!(requests.iter().any(|request| matches!(
+        request.request_payload,
+        Some(event::sfu_request::RequestPayload::LeaveCallRequest(_))
+    )));
+}
+
+#[tokio::test]
+async fn call_ended_twice_before_the_leave_is_reported_once() {
+    let core = test_core();
+    let generation = prepare_joined_core(&core, "alice");
+    let (connection, _sfu) = establish_fake(&core, generation).await;
+    let context = event_context(&core, &connection);
+    *core.connection.lock().await = Some(connection);
+    let mut events = core.subscribe();
+
+    // Neither call yields, so the spawned leave cannot run between them.
+    for _ in 0..2 {
+        connection::handle_event(
+            &context,
+            sfu_event::EventPayload::CallEnded(event::CallEnded::default()),
+        )
+        .await
+        .expect("handle SFU call ended");
+    }
+
+    wait_for(
+        Duration::from_secs(2),
+        || core.state() == CallingState::Left,
+        "the ended call is left",
+    )
+    .await;
+    let mut reported = 0;
+    while let Ok(event) = events.try_recv() {
+        if matches!(event, CallEvent::CallEnded) {
+            reported += 1;
+        }
+    }
+    assert_eq!(reported, 1);
+}
+
+#[tokio::test]
+async fn dropped_join_allows_a_new_join() {
+    let (coordinator_ws_url, coordinator) = fake_coordinator().await;
+    // Accepts connections but never answers, so the coordinator join call waits.
+    let silent = TcpListener::bind("127.0.0.1:0").expect("bind silent server");
+    let core = test_core_with_config(ClientConfig {
+        coordinator_ws_url,
+        base_url: format!("http://{}", silent.local_addr().expect("silent address")),
+        ..ClientConfig::default()
+    });
+    let token = crate::token::create_user_token(
+        b"test-secret",
+        "alice",
+        &crate::token::TokenOptions::default(),
+    )
+    .expect("test user token");
+    let mut data = JoinCallData::new("alice");
+    data.location = Some("test-location".to_owned());
+
+    let join = tokio::time::timeout(Duration::from_millis(500), core.join(token, data)).await;
+    assert!(join.is_err(), "join waits for the coordinator");
+
+    assert_eq!(core.state(), CallingState::Idle);
+    tokio::time::timeout(Duration::from_secs(2), coordinator)
+        .await
+        .expect("coordinator socket closed")
+        .expect("fake coordinator task");
+    core.begin_join().expect("a new join can start");
+}
+
+#[tokio::test]
+async fn dropped_leave_still_leaves_the_call() {
+    let core = test_core();
+    prepare_joined_core(&core, "alice");
+    let connection_slot = core.connection.lock().await;
+
+    let leave = tokio::time::timeout(Duration::from_millis(50), core.leave("dropped leave")).await;
+    assert!(leave.is_err(), "leave waits for the connection lock");
+    drop(connection_slot);
+
+    assert_eq!(core.state(), CallingState::Left);
+    core.begin_join().expect("a new join can start");
 }
 
 #[tokio::test]
@@ -616,6 +778,65 @@ async fn published_audio_is_paced_only_while_the_publisher_is_connected() {
         "closed publisher pauses pacing",
     )
     .await;
+    let _ = receiver.close().await;
+    core.leave("test cleanup").await.expect("leave");
+}
+
+#[tokio::test]
+async fn remote_track_dropped_without_a_runtime_unsubscribes() {
+    let core = test_core();
+    let generation = prepare_joined_core(&core, "alice");
+    let (connection, _sfu) = establish_fake(&core, generation).await;
+    let (epoch, reconnect_enabled) = (connection.epoch, connection.reconnect_enabled.clone());
+    *core.connection.lock().await = Some(connection);
+    let (remote_tx, remote_rx) = std::sync::mpsc::channel();
+    *core
+        .on_track_cb
+        .lock()
+        .unwrap_or_else(|error| error.into_inner()) = Some(Arc::new(move |remote| {
+        let _ = remote_tx.send(remote);
+    }));
+    let audio = LocalAudioTrack::opus().expect("opus track");
+    let sender = peer::new_peer_connection(&[]).await.expect("sender");
+    sender
+        .add_track(audio.webrtc_track())
+        .await
+        .expect("add track");
+    let (receiver, mut inbound) = peer::connect_audio_receiver(&sender).await;
+    audio.start_pacing().await;
+    let inbound = tokio::time::timeout(Duration::from_secs(5), inbound.recv())
+        .await
+        .expect("inbound track")
+        .expect("inbound track channel");
+    core.clone()
+        .handle_incoming_track(
+            generation,
+            epoch,
+            reconnect_enabled,
+            inbound,
+            Arc::downgrade(&receiver),
+        )
+        .await;
+    let remote = remote_rx.recv().expect("remote track");
+    let key = TrackKey::new(remote.participant().session_id.clone(), remote.track_type());
+
+    thread::spawn(move || drop(remote))
+        .join()
+        .expect("a drop without a runtime does not panic");
+
+    wait_for(
+        Duration::from_secs(2),
+        || {
+            core.manual_unsub
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .contains(&key)
+        },
+        "unsubscribe after the drop",
+    )
+    .await;
+    audio.stop();
+    let _ = sender.close().await;
     let _ = receiver.close().await;
     core.leave("test cleanup").await.expect("leave");
 }

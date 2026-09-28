@@ -29,7 +29,7 @@
 use std::collections::VecDeque;
 use std::num::NonZeroU8;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, AtomicU16, AtomicU32, Ordering};
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::{Arc, Mutex as StdMutex, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
@@ -657,21 +657,25 @@ impl LocalAudioTrack {
         {
             return;
         }
-        let inner = self.inner.clone();
-        let handle = tokio::spawn(async move { pace_audio(inner).await });
+        let track = Arc::downgrade(&self.inner);
+        let handle = tokio::spawn(async move { pace_audio(track).await });
         *self.inner.pacer.lock().unwrap_or_else(|e| e.into_inner()) = Some(handle);
     }
 }
 
 /// The 20 ms pacing loop: pull one Opus frame worth of PCM (or silence) every
-/// tick, encode it, and packetize it onto the outbound track.
-async fn pace_audio(inner: Arc<AudioInner>) {
+/// tick, encode it, and packetize it onto the outbound track. It ends when the
+/// track is stopped or dropped.
+async fn pace_audio(track: Weak<AudioInner>) {
     let mut interval = tokio::time::interval(Duration::from_millis(20));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut scratch = vec![0i16; FRAME_SAMPLES_20MS];
     let mut encoded = vec![0u8; MAX_OPUS_PACKET_BYTES];
     loop {
         interval.tick().await;
+        let Some(inner) = track.upgrade() else {
+            return;
+        };
         if inner.core.stopped.load(Ordering::SeqCst) {
             return;
         }
@@ -2305,6 +2309,29 @@ mod tests {
             })
         ));
         track.stop();
+    }
+
+    #[tokio::test]
+    async fn dropping_a_started_track_ends_its_pacer() {
+        let alive_tasks = || {
+            tokio::runtime::Handle::current()
+                .metrics()
+                .num_alive_tasks()
+        };
+        let before = alive_tasks();
+        let track = LocalAudioTrack::opus().expect("opus track");
+        track.start_pacing().await;
+        assert_eq!(alive_tasks(), before + 1);
+
+        drop(track);
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while alive_tasks() != before {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the pacer ends with its track");
     }
 
     #[tokio::test]

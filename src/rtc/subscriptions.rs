@@ -13,6 +13,10 @@
 
 use super::proto::models::TrackType;
 
+/// Video dimension requested when a subscription gives none. The SFU rejects a
+/// video or screen-share subscription without a dimension.
+pub(crate) const DEFAULT_VIDEO_DIMENSION: (u32, u32) = (1280, 720);
+
 /// A precise subscription to one participant session and track kind.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 #[non_exhaustive]
@@ -21,12 +25,13 @@ pub struct SubscriptionTarget {
     pub session_id: String,
     /// The remote track kind to receive.
     pub track_type: TrackType,
-    /// Optional preferred video dimensions sent as an SFU adaptation hint.
+    /// Preferred video dimensions sent as an SFU adaptation hint. `None`
+    /// requests 1280×720 for video and screen-share.
     pub dimension: Option<(u32, u32)>,
 }
 
 impl SubscriptionTarget {
-    /// Subscribe to `track_type` from `session_id` using the SFU's default size.
+    /// Subscribe to `track_type` from `session_id`, at 1280×720 for video.
     pub fn new(session_id: impl Into<String>, track_type: TrackType) -> Self {
         Self {
             session_id: session_id.into(),
@@ -55,7 +60,8 @@ pub struct SubscriptionConfig {
     pub video: bool,
     /// Subscribe to remote screen-share (video + audio).
     pub screen_share: bool,
-    /// Preferred video dimension hint sent to the SFU (width, height).
+    /// Preferred video dimension hint sent to the SFU (width, height). `None`
+    /// requests 1280×720 for video and screen-share.
     pub video_dimension: Option<(u32, u32)>,
 }
 

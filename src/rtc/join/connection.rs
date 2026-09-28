@@ -400,9 +400,7 @@ pub(super) async fn handle_event(
         E::ParticipantMigrationComplete(_) => {
             core.complete_migration(context.generation);
         }
-        E::CallEnded(_) => {
-            let _ = core.events_tx.send(CallEvent::CallEnded);
-        }
+        E::CallEnded(_) => core.end_call(context.generation),
         E::PublisherAnswer(_) | E::JoinResponse(_) => {
             tracing::debug!("stream.rtc.unexpected_handshake_event");
         }
