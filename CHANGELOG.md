@@ -1,5 +1,17 @@
 # Unreleased
 
+## Breaking Changes
+
+### Coordinator WebSocket URL is configured separately
+
+`ClientConfig::coordinator_ws_url` sets the coordinator connect WebSocket URL.
+It accepts only `ws` and `wss` URLs and defaults to
+`DEFAULT_COORDINATOR_WS_URL`. The URL no longer follows `base_url`: a client
+for a staging or local environment must set both fields. Code that builds
+`ClientConfig` with a struct literal must set the new field or use
+`..ClientConfig::default()`. `DEFAULT_COORDINATOR_WS_URL` moved from
+`rtc::coordinator::ws` to the crate root.
+
 ## New Features
 
 ### Video REST: advanced call statistics and reporting

@@ -189,7 +189,7 @@ async fn fake_coordinator() -> (String, tokio::task::JoinHandle<()>) {
             .expect("send connection.ok");
         while let Some(Ok(_)) = socket.next().await {}
     });
-    (format!("http://{address}"), server)
+    (format!("ws://{address}"), server)
 }
 
 /// Every request the fake SFU received until the client socket closed.
@@ -399,9 +399,9 @@ async fn leave_closes_a_connection_owned_by_a_cancelled_join() {
 
 #[tokio::test]
 async fn generation_change_closes_the_coordinator_socket() {
-    let (base_url, coordinator) = fake_coordinator().await;
+    let (coordinator_ws_url, coordinator) = fake_coordinator().await;
     let core = test_core_with_config(ClientConfig {
-        base_url,
+        coordinator_ws_url,
         ..ClientConfig::default()
     });
     let generation = prepare_joined_core(&core, "alice");
@@ -552,9 +552,9 @@ async fn leave_that_overlaps_a_new_join_keeps_the_new_join_state() {
 
 #[tokio::test]
 async fn stale_coordinator_stop_keeps_the_current_coordinator() {
-    let (base_url, coordinator) = fake_coordinator().await;
+    let (coordinator_ws_url, coordinator) = fake_coordinator().await;
     let core = test_core_with_config(ClientConfig {
-        base_url,
+        coordinator_ws_url,
         ..ClientConfig::default()
     });
     let first = prepare_joined_core(&core, "alice");

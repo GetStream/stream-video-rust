@@ -26,15 +26,13 @@ use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async_with_config};
 use url::Url;
 
-use crate::client::{DEFAULT_BASE_URL, DEFAULT_MAX_WEBSOCKET_MESSAGE_BYTES};
+use crate::client::DEFAULT_MAX_WEBSOCKET_MESSAGE_BYTES;
 
 use crate::rtc::error::{Result, RtcError, SfuTimeoutError};
 use crate::rtc::identity;
 
 type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
-/// Default coordinator connect WebSocket URL (videosdk `defaultOptions.wsURL`).
-pub const DEFAULT_COORDINATOR_WS_URL: &str = "wss://video.stream-io-api.com/api/v2/connect";
 pub(crate) const DEFAULT_COORDINATOR_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// The user identity sent in the coordinator auth message.
@@ -139,7 +137,7 @@ impl CoordinatorEvent {
 /// into a [`CoordinatorWs`] (send path), [`CoordinatorEvents`] (event stream),
 /// and the [`Connected`] handshake result.
 ///
-/// `ws_url` is usually [`DEFAULT_COORDINATOR_WS_URL`]. The `api_key`/`user_id`
+/// `ws_url` is usually [`crate::DEFAULT_COORDINATOR_WS_URL`]. The `api_key`/`user_id`
 /// are added as query params (`stream-auth-type=jwt`), matching videosdk.
 pub async fn connect(
     ws_url: &str,
@@ -310,42 +308,6 @@ async fn await_connection_ok(
     ))
 }
 
-/// Resolve the coordinator connect WebSocket URL for the configured REST
-/// environment. The default production base uses the pinned
-/// [`DEFAULT_COORDINATOR_WS_URL`]; any custom base (staging, local) derives the
-/// WebSocket URL from it so a reconfigured client never silently talks to
-/// production.
-pub(crate) fn coordinator_ws_url(base_url: &Url) -> Result<Url> {
-    let default_base = Url::parse(DEFAULT_BASE_URL)
-        .map_err(|error| RtcError::Url(format!("{DEFAULT_BASE_URL:?}: {error}")))?;
-    if base_url.scheme() == default_base.scheme()
-        && base_url.host_str() == default_base.host_str()
-        && base_url.port_or_known_default() == default_base.port_or_known_default()
-    {
-        return Url::parse(DEFAULT_COORDINATOR_WS_URL)
-            .map_err(|error| RtcError::Url(format!("{DEFAULT_COORDINATOR_WS_URL:?}: {error}")));
-    }
-
-    let mut url = base_url.clone();
-    let scheme = match url.scheme() {
-        "http" => "ws",
-        "https" => "wss",
-        "ws" => "ws",
-        "wss" => "wss",
-        other => {
-            return Err(RtcError::Url(format!(
-                "unsupported coordinator base URL scheme {other:?}"
-            )));
-        }
-    };
-    url.set_scheme(scheme)
-        .map_err(|_| RtcError::Url(format!("cannot set WebSocket scheme on {base_url}")))?;
-    url.set_path("/api/v2/connect");
-    url.set_query(None);
-    url.set_fragment(None);
-    Ok(url)
-}
-
 /// The send half of an authenticated coordinator WebSocket.
 #[derive(Debug)]
 pub struct CoordinatorWs {
@@ -464,34 +426,6 @@ mod tests {
                 actual: 65,
             }
         ));
-    }
-
-    #[test]
-    fn coordinator_url_follows_configured_rest_environment() {
-        let staging =
-            Url::parse("https://video-edge-staging.example.com/video?source=test").expect("url");
-        assert_eq!(
-            coordinator_ws_url(&staging)
-                .expect("staging coordinator URL")
-                .as_str(),
-            "wss://video-edge-staging.example.com/api/v2/connect"
-        );
-
-        let local = Url::parse("http://127.0.0.1:3030/custom").expect("url");
-        assert_eq!(
-            coordinator_ws_url(&local)
-                .expect("local coordinator URL")
-                .as_str(),
-            "ws://127.0.0.1:3030/api/v2/connect"
-        );
-
-        let production = Url::parse(DEFAULT_BASE_URL).expect("url");
-        assert_eq!(
-            coordinator_ws_url(&production)
-                .expect("production coordinator URL")
-                .as_str(),
-            DEFAULT_COORDINATOR_WS_URL
-        );
     }
 
     #[tokio::test]
