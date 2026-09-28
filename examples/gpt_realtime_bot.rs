@@ -328,6 +328,17 @@ async fn configure_openai(
             .await
             .context("add audio track to the OpenAI PeerConnection")?,
     );
+    let paced_mic = mic.clone();
+    pc.on_peer_connection_state_change(Box::new(move |state| {
+        let paced_mic = paced_mic.clone();
+        Box::pin(async move {
+            if state == RTCPeerConnectionState::Connected {
+                paced_mic.start_pacing().await;
+            } else {
+                paced_mic.pause_pacing();
+            }
+        })
+    }));
 
     let camera = LocalVideoTrack::h264().context("H264 track for OpenAI")?;
     spawn_rtcp_drain(

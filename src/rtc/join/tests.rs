@@ -3,7 +3,7 @@
 use super::*;
 use crate::client::ClientConfig;
 use crate::rtc::{
-    ClientPublishOptions, LocalAudioTrack, LocalVideoTrack, LocalVideoTrackConfig,
+    ClientPublishOptions, LocalAudioTrack, LocalVideoTrack, LocalVideoTrackConfig, PcmFrame,
     PreferredVideoCodec, publish_options::H264_FMTP,
 };
 use std::io::{Read, Write};
@@ -574,6 +574,50 @@ async fn stale_coordinator_stop_keeps_the_current_coordinator() {
         .await
         .expect("coordinator socket closed")
         .expect("fake coordinator task");
+}
+
+#[tokio::test]
+async fn published_audio_is_paced_only_while_the_publisher_is_connected() {
+    let core = test_core();
+    let generation = prepare_joined_core(&core, "alice");
+    let (connection, _sfu) = establish_fake(&core, generation).await;
+    let publisher = connection.publisher.clone();
+    *core.connection.lock().await = Some(connection);
+    let audio = LocalAudioTrack::opus().expect("opus track");
+    let tone = (0..960_u32)
+        .map(|n| {
+            (12_000.0 * (std::f64::consts::TAU * 440.0 * f64::from(n) / 48_000.0).sin()) as i16
+        })
+        .collect::<Vec<_>>()
+        .repeat(50);
+    audio
+        .write_pcm(PcmFrame::mono(tone, 48_000))
+        .await
+        .expect("one second fits the queue");
+    publisher
+        .add_track(audio.webrtc_track())
+        .await
+        .expect("add track");
+    core.media
+        .lock()
+        .await
+        .begin_publish(LocalTrack::Audio(audio.clone()), 0);
+
+    let (receiver, mut remote) = peer::connect_audio_receiver(&publisher).await;
+
+    tokio::time::timeout(Duration::from_secs(5), remote.recv())
+        .await
+        .expect("paced audio reaches the receiver")
+        .expect("remote track");
+    publisher.close().await.expect("close publisher");
+    wait_for(
+        Duration::from_secs(2),
+        || !audio.is_pacing(),
+        "closed publisher pauses pacing",
+    )
+    .await;
+    let _ = receiver.close().await;
+    core.leave("test cleanup").await.expect("leave");
 }
 
 #[tokio::test]

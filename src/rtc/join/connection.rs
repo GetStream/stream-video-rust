@@ -127,6 +127,15 @@ pub(super) fn register_connection_state(
         Box::pin(async move {
             tracing::debug!(label, ?state, "stream.rtc.pc.state");
             tracer.trace("connectionstatechange", json!(state.to_string()));
+            // Not awaited: waiting for the media lock here can block ICE
+            // state delivery. The sync reads the current publisher state, so
+            // a subscriber change applies the same state again.
+            if core.is_generation_current(generation) {
+                let sync_core = core.clone();
+                std::mem::drop(core.spawn_generation_task(generation, async move {
+                    sync_core.sync_audio_pacing().await;
+                }));
+            }
             if state == RTCPeerConnectionState::Connected {
                 ever_connected.store(true, Ordering::SeqCst);
                 let mut lifecycle = core.lifecycle.lock().unwrap_or_else(|e| e.into_inner());
