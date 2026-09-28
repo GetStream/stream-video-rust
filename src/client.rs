@@ -25,6 +25,8 @@ use crate::token;
 
 /// Default coordinator base URL (matches getstream-go's `DefaultBaseURL`).
 pub const DEFAULT_BASE_URL: &str = "https://chat.stream-io-api.com";
+/// Default coordinator connect WebSocket URL (videosdk `defaultOptions.wsURL`).
+pub const DEFAULT_COORDINATOR_WS_URL: &str = "wss://video.stream-io-api.com/api/v2/connect";
 
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -101,6 +103,9 @@ impl Default for RetryConfig {
 pub struct ClientConfig {
     /// Coordinator base URL. Defaults to [`DEFAULT_BASE_URL`].
     pub base_url: String,
+    /// Coordinator connect WebSocket URL, including the path. Only `ws` and `wss`
+    /// schemes are accepted. Defaults to [`DEFAULT_COORDINATOR_WS_URL`].
+    pub coordinator_ws_url: String,
     /// Per-request timeout. Default 30s.
     pub request_timeout: Duration,
     /// TCP + TLS connect timeout. Default 10s.
@@ -121,6 +126,7 @@ impl Default for ClientConfig {
     fn default() -> Self {
         Self {
             base_url: DEFAULT_BASE_URL.to_string(),
+            coordinator_ws_url: DEFAULT_COORDINATOR_WS_URL.to_string(),
             request_timeout: DEFAULT_REQUEST_TIMEOUT,
             connect_timeout: DEFAULT_CONNECT_TIMEOUT,
             idle_timeout: DEFAULT_IDLE_TIMEOUT,
@@ -138,6 +144,7 @@ pub(crate) struct Client {
     api_secret: Vec<u8>,
     server_token: String,
     base_url: Url,
+    coordinator_ws_url: Url,
     http: reqwest::Client,
     retry: RetryConfig,
     log_bodies: bool,
@@ -187,6 +194,18 @@ impl Client {
 
         let base_url = Url::parse(&config.base_url)
             .map_err(|e| Error::Config(format!("invalid base URL {:?}: {e}", config.base_url)))?;
+        let coordinator_ws_url = Url::parse(&config.coordinator_ws_url).map_err(|e| {
+            Error::Config(format!(
+                "invalid coordinator WebSocket URL {:?}: {e}",
+                config.coordinator_ws_url
+            ))
+        })?;
+        if !matches!(coordinator_ws_url.scheme(), "ws" | "wss") {
+            return Err(Error::Config(format!(
+                "coordinator WebSocket URL {:?} must use ws or wss",
+                config.coordinator_ws_url
+            )));
+        }
 
         let http = reqwest::Client::builder()
             .pool_max_idle_per_host(config.max_conns_per_host)
@@ -204,6 +223,7 @@ impl Client {
             api_secret: secret_bytes,
             server_token,
             base_url,
+            coordinator_ws_url,
             http,
             retry: config.retry,
             log_bodies: config.log_bodies,
@@ -221,8 +241,8 @@ impl Client {
         &self.api_secret
     }
 
-    pub(crate) fn base_url(&self) -> &Url {
-        &self.base_url
+    pub(crate) fn coordinator_ws_url(&self) -> &Url {
+        &self.coordinator_ws_url
     }
 
     /// The shared `reqwest` client (connection pool). Used by the RTC layer to
@@ -619,6 +639,17 @@ mod tests {
         let redacted = redact_json_body(b"token=must-not-leak");
         assert_eq!(redacted, "<non-JSON body omitted>");
         assert!(!redacted.contains("must-not-leak"));
+    }
+
+    #[test]
+    fn coordinator_ws_url_must_use_a_websocket_scheme() {
+        let config = ClientConfig {
+            coordinator_ws_url: "https://video.stream-io-api.com/api/v2/connect".to_owned(),
+            ..ClientConfig::default()
+        };
+        let error = Client::new("key".to_owned(), "secret".to_owned(), config)
+            .expect_err("https coordinator WebSocket URL");
+        assert!(matches!(error, Error::Config(_)));
     }
 
     #[test]

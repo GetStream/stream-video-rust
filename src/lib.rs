@@ -15,7 +15,9 @@ use std::sync::Arc;
 
 use client::Client;
 #[doc(inline)]
-pub use client::{ClientConfig, DEFAULT_BASE_URL, NetworkLimits, RetryConfig};
+pub use client::{
+    ClientConfig, DEFAULT_BASE_URL, DEFAULT_COORDINATOR_WS_URL, NetworkLimits, RetryConfig,
+};
 #[doc(inline)]
 pub use error::{ApiError, Error, Result, TokenError, WebhookError};
 #[doc(inline)]
