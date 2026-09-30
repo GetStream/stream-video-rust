@@ -1682,6 +1682,70 @@ fn call_state_snapshot_combines_join_state_and_incremental_sfu_updates() {
 }
 
 #[test]
+fn join_state_reports_only_the_participant_changes_since_the_last_join() {
+    let core = test_core();
+    let generation = core.begin_join().expect("join generation");
+    let mut events = core.subscribe();
+    let participant = |user_id: &str, session_id: &str| models::Participant {
+        user_id: user_id.to_owned(),
+        session_id: session_id.to_owned(),
+        ..Default::default()
+    };
+    let call_state = |participants| {
+        Some(models::CallState {
+            participants,
+            ..Default::default()
+        })
+    };
+    let bob = participant("bob", "session-b");
+
+    assert!(core.apply_join_call_state_if_current(
+        generation,
+        "local-1",
+        "agent",
+        call_state(vec![
+            participant("agent", "local-1"),
+            participant("alice", "session-a"),
+            bob.clone(),
+        ]),
+    ));
+    // A REJOIN: the local session changes, alice left, bob changed, carol joined.
+    assert!(core.apply_join_call_state_if_current(
+        generation,
+        "local-2",
+        "agent",
+        call_state(vec![
+            participant("agent", "local-2"),
+            models::Participant {
+                name: "Bob".to_owned(),
+                ..bob
+            },
+            participant("carol", "session-c"),
+        ]),
+    ));
+
+    let mut reported = Vec::new();
+    while let Ok(event) = events.try_recv() {
+        match event {
+            CallEvent::ParticipantJoined(p) => reported.push(("joined", p.session_id)),
+            CallEvent::ParticipantUpdated(p) => reported.push(("updated", p.session_id)),
+            CallEvent::ParticipantLeft(p) => reported.push(("left", p.session_id)),
+            _ => {}
+        }
+    }
+    assert_eq!(
+        reported,
+        [
+            ("joined", "session-a".to_owned()),
+            ("joined", "session-b".to_owned()),
+            ("updated", "session-b".to_owned()),
+            ("joined", "session-c".to_owned()),
+            ("left", "session-a".to_owned()),
+        ]
+    );
+}
+
+#[test]
 fn mute_state_builder_deduplicates_track_types() {
     let first = LocalTrack::Audio(LocalAudioTrack::opus().expect("first audio track"));
     let second = LocalTrack::Audio(LocalAudioTrack::opus().expect("second audio track"));

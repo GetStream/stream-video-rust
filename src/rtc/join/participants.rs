@@ -25,6 +25,8 @@ pub(super) struct CallStateCache {
     pub(super) current_grants: Option<models::CallGrants>,
     /// Set by the first report of the call end.
     pub(super) ended: bool,
+    /// The local session id of the last join response.
+    pub(super) local_session_id: String,
 }
 
 impl RtcCore {
@@ -86,7 +88,8 @@ impl RtcCore {
     }
 
     /// Replace the participants from an authoritative SFU join response when
-    /// its lifecycle generation is still active.
+    /// its lifecycle generation is still active, and report the participants
+    /// that joined, changed, or left since the previous join response.
     pub(super) fn apply_join_call_state_if_current(
         &self,
         generation: u64,
@@ -100,20 +103,25 @@ impl RtcCore {
         }
         let state = call_state.unwrap_or_default();
         let joined = state.participants.clone();
-        *self
-            .call_state
-            .lock()
-            .unwrap_or_else(|error| error.into_inner()) = CallStateCache {
-            participant_count: state.participant_count.unwrap_or_default(),
-            pins: state.pins,
-            started_at: state.started_at,
-            e2ee_enabled: state.e2ee_enabled,
-            current_grants: None,
-            ended: false,
-        };
-        {
+        let previous_session_id = std::mem::replace(
+            &mut *self
+                .call_state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()),
+            CallStateCache {
+                participant_count: state.participant_count.unwrap_or_default(),
+                pins: state.pins,
+                started_at: state.started_at,
+                e2ee_enabled: state.e2ee_enabled,
+                current_grants: None,
+                ended: false,
+                local_session_id: session_id.to_owned(),
+            },
+        )
+        .local_session_id;
+        let mut previous = {
             let mut participants = self.participants.lock().unwrap_or_else(|e| e.into_inner());
-            participants.clear();
+            let previous = std::mem::take(&mut *participants);
             let me = participants.entry(session_id.to_owned()).or_default();
             me.user_id = user_id.to_owned();
             me.session_id = session_id.to_owned();
@@ -139,12 +147,29 @@ impl RtcCore {
                     .published
                     .extend(participant.published_tracks.iter().copied());
             }
-        }
+            previous
+        };
+        // The local sessions, before and after a REJOIN, produce no events.
+        let is_local = |id: &str| id == session_id || id == previous_session_id;
         for participant in joined {
-            if participant.session_id != session_id {
+            let known = previous.remove(&participant.session_id);
+            if is_local(&participant.session_id) {
+                continue;
+            }
+            let event = match known {
+                None => CallEvent::ParticipantJoined(participant),
+                Some(entry) if entry.participant != participant => {
+                    CallEvent::ParticipantUpdated(participant)
+                }
+                Some(_) => continue,
+            };
+            let _ = self.events_tx.send(event);
+        }
+        for (id, entry) in previous {
+            if !is_local(&id) {
                 let _ = self
                     .events_tx
-                    .send(CallEvent::ParticipantJoined(participant));
+                    .send(CallEvent::ParticipantLeft(entry.participant));
             }
         }
         true
