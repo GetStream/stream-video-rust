@@ -265,11 +265,16 @@ impl RtcCore {
         }
     }
 
-    pub(super) fn update_participant_count(&self, participant_count: models::ParticipantCount) {
-        self.call_state
+    /// Returns whether the stored count changed.
+    pub(super) fn update_participant_count(
+        &self,
+        participant_count: models::ParticipantCount,
+    ) -> bool {
+        let mut state = self
+            .call_state
             .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .participant_count = participant_count;
+            .unwrap_or_else(|error| error.into_inner());
+        std::mem::replace(&mut state.participant_count, participant_count) != participant_count
     }
 
     pub(super) fn update_pins(&self, pins: Vec<models::Pin>) {
