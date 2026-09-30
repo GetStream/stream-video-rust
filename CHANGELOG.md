@@ -12,6 +12,14 @@ for a staging or local environment must set both fields. Code that builds
 `..ClientConfig::default()`. `DEFAULT_COORDINATOR_WS_URL` moved from
 `rtc::coordinator::ws` to the crate root.
 
+### Track and call-ended events carry the SFU data
+
+`CallEvent::TrackPublished` and `CallEvent::TrackUnpublished` give `track_type`
+as a `TrackType`, not an `i32`, and add `participant`. `TrackUnpublished` also
+adds `cause`. `CallEvent::CallEnded` is now `CallEnded { reason }`: the SFU
+reason, or `None` when the coordinator reported the end first. Patterns that
+match these variants must use the new fields or `..`.
+
 ## New Features
 
 ### Video REST: advanced call statistics and reporting
