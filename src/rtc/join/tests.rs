@@ -886,7 +886,7 @@ async fn published_audio_is_paced_only_while_the_publisher_is_connected() {
 }
 
 #[tokio::test]
-async fn remote_track_dropped_without_a_runtime_unsubscribes() {
+async fn only_the_latest_remote_track_unsubscribes_when_dropped_without_a_runtime() {
     let core = test_core();
     let generation = prepare_joined_core(&core, "alice");
     let (connection, _sfu) = establish_fake(&core, generation).await;
@@ -911,17 +911,39 @@ async fn remote_track_dropped_without_a_runtime_unsubscribes() {
         .await
         .expect("inbound track")
         .expect("inbound track channel");
-    core.clone()
-        .handle_incoming_track(
-            generation,
-            epoch,
-            reconnect_enabled,
-            inbound,
-            Arc::downgrade(&receiver),
-        )
-        .await;
-    let remote = remote_rx.recv().expect("remote track");
+    for _ in 0..2 {
+        core.clone()
+            .handle_incoming_track(
+                generation,
+                epoch,
+                reconnect_enabled.clone(),
+                inbound.clone(),
+                Arc::downgrade(&receiver),
+            )
+            .await;
+    }
+    let stale = remote_rx.recv().expect("stale remote track");
+    let remote = remote_rx.recv().expect("latest remote track");
     let key = TrackKey::new(remote.participant().session_id.clone(), remote.track_type());
+    let baseline = alive_tasks();
+
+    thread::spawn(move || drop(stale))
+        .join()
+        .expect("a drop without a runtime does not panic");
+    wait_for(
+        Duration::from_secs(2),
+        || alive_tasks() == baseline,
+        "the stale drop is handled",
+    )
+    .await;
+    assert!(
+        !core
+            .manual_unsub
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .contains(&key),
+        "a stale drop must not unsubscribe the latest track"
+    );
 
     thread::spawn(move || drop(remote))
         .join()
@@ -1567,6 +1589,7 @@ async fn stale_remote_track_drop_does_not_change_new_generation_subscriptions() 
             first,
             0,
             TrackKey::new("remote-session".to_owned(), TrackType::Audio),
+            0,
         )
         .await;
 

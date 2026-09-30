@@ -720,6 +720,10 @@ impl RtcCore {
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .clear();
+                self.delivered_tracks
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clear();
                 self.own_capabilities
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())

@@ -526,6 +526,10 @@ pub struct RtcCore {
     /// Tracks the caller explicitly dropped (unsubscribed); never re-subscribed
     /// until the publisher republishes them.
     manual_unsub: StdMutex<HashSet<TrackKey>>,
+    /// The id of the latest [`RemoteTrack`] delivered for each track. Only a
+    /// drop of that track unsubscribes.
+    delivered_tracks: StdMutex<HashMap<TrackKey, u64>>,
+    next_remote_track_id: AtomicU64,
     /// Exact per-session subscriptions, or `None` while using the coarse policy.
     manual_subscriptions: StdMutex<Option<Vec<SubscriptionTarget>>>,
     /// Known participants keyed by session id (correlation + subscription build).
@@ -590,6 +594,8 @@ impl RtcCore {
             sub_config: StdMutex::new(SubscriptionConfig::default()),
             subs_active: AtomicBool::new(false),
             manual_unsub: StdMutex::new(HashSet::new()),
+            delivered_tracks: StdMutex::new(HashMap::new()),
+            next_remote_track_id: AtomicU64::new(0),
             manual_subscriptions: StdMutex::new(None),
             participants: StdMutex::new(HashMap::new()),
             call_state: StdMutex::new(CallStateCache::default()),
