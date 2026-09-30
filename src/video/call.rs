@@ -859,7 +859,8 @@ impl Call {
     }
 
     /// Subscribe to the typed SFU event stream (participant joined/left, tracks,
-    /// errors). Subscribe before or after [`Call::join`].
+    /// errors). A receiver gets only events sent after it subscribes. Subscribe
+    /// before [`Call::join`] to get the join events, or read [`Call::participants`].
     pub fn subscribe(&self) -> tokio::sync::broadcast::Receiver<crate::rtc::CallEvent> {
         self.rtc.subscribe()
     }
