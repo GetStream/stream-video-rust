@@ -843,13 +843,20 @@ impl Call {
     /// and completes the SFU handshake. Illegal (typed error) if already
     /// `JOINING`/`JOINED`. Observe participants via [`Call::subscribe`].
     pub async fn join(&self, data: crate::rtc::JoinCallData) -> crate::rtc::RtcResult<()> {
-        let source = crate::rtc::client::UserTokenSource::ServerMinted {
-            client: self.client.clone(),
-            user_id: data.user_id.clone(),
-            call_cid: self.cid(),
-            expiration: INTERNAL_RTC_TOKEN_LIFETIME,
-        };
-        self.rtc.join_with_token_source(source, data).await
+        self.rtc().join(data).await
+    }
+
+    /// The participant session of this handle as an [`RtcCall`](crate::rtc::RtcCall).
+    /// Both share one session; its join mints the user token as [`Call::join`] does.
+    pub fn rtc(&self) -> crate::rtc::RtcCall {
+        crate::rtc::RtcCall::new(
+            self.rtc.clone(),
+            crate::rtc::client::UserTokenSource::ServerMinted {
+                client: self.client.clone(),
+                call_cid: self.cid(),
+                expiration: INTERNAL_RTC_TOKEN_LIFETIME,
+            },
+        )
     }
 
     /// Leave the call, closing the SFU connection and PeerConnections. Succeeds
