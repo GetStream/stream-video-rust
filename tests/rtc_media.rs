@@ -21,8 +21,9 @@ use getstream::models::UserRequest;
 use getstream::models::{CallRequest, DeleteCallRequest, GetOrCreateCallRequest, MemberRequest};
 use getstream::rtc::proto::models::TrackType;
 use getstream::rtc::{
-    CallEvent, ClientPublishOptions, JoinCallData, LocalAudioTrack, LocalTrack, LocalVideoTrack,
-    PcmFrame, PreferredVideoCodec, RemoteTrack, RtcError, SubscriptionConfig, VideoFrame,
+    CallEvent, CallingState, ClientPublishOptions, JoinCallData, LocalAudioTrack, LocalTrack,
+    LocalVideoTrack, PcmFrame, PreferredVideoCodec, RemoteTrack, RtcError, SubscriptionConfig,
+    VideoFrame,
 };
 use getstream::video::Call;
 use tokio::sync::mpsc::{Receiver, channel};
@@ -1351,8 +1352,11 @@ async fn loud_publisher_is_reported_speaking_and_dominant() {
 /// typed event stream: it must see A's audio `TrackPublished`, then — once A
 /// stops the track — A's audio `TrackUnpublished`, confirming the SFU accepted
 /// the request and broadcast the corrected publication state to peers.
+///
+/// A then publishes a new audio track on the same session. The publish must
+/// succeed without a reconnect, and B must hear A again.
 #[tokio::test]
-async fn stop_publish_of_sole_audio_is_accepted_and_unannounced() {
+async fn sole_audio_can_be_stopped_and_published_again() {
     let Some(client) = common::client_or_skip() else {
         return;
     };
@@ -1366,6 +1370,7 @@ async fn stop_publish_of_sole_audio_is_accepted_and_unannounced() {
         let call_a = client.video().call("default", &call_id);
         let call_b = client.video().call("default", &call_id);
 
+        let mut tracks_b = track_sink(&call_b);
         call_b
             .join(JoinCallData::new(&user_b))
             .await
@@ -1380,6 +1385,7 @@ async fn stop_publish_of_sole_audio_is_accepted_and_unannounced() {
             .join(JoinCallData::new(&user_a))
             .await
             .expect("A join");
+        let mut events_a = call_a.subscribe();
         let audio_a = LocalAudioTrack::opus().expect("opus track");
         call_a
             .publish_audio(audio_a.clone())
@@ -1399,6 +1405,14 @@ async fn stop_publish_of_sole_audio_is_accepted_and_unannounced() {
             audio_published,
             "B never received A's audio TrackPublished before the stop"
         );
+        let remote_a = recv_track(
+            &mut tracks_b,
+            &user_a,
+            TrackType::Audio,
+            Duration::from_secs(45),
+        )
+        .await
+        .expect("B never received A's audio track");
 
         // Stop the sole publication. Before the fix this renegotiated the
         // publisher with an empty track set and the SFU returned "Invalid
@@ -1422,6 +1436,42 @@ async fn stop_publish_of_sole_audio_is_accepted_and_unannounced() {
             "SFU never reported A's audio TrackUnpublished after stop_publish \
              (mute state not propagated to peers)"
         );
+
+        // Publish a new audio track on the same session, as after an unmute.
+        let audio_again = LocalAudioTrack::opus().expect("opus track");
+        call_a
+            .publish_audio(audio_again.clone())
+            .await
+            .expect("A publish_audio again on the same session");
+        let feeder_again = spawn_tone(audio_again);
+        let audio_republished = await_track_event(
+            &mut events_b,
+            &user_a,
+            TrackType::Audio,
+            true,
+            Duration::from_secs(45),
+        )
+        .await;
+        assert!(
+            audio_republished,
+            "B never received A's audio TrackPublished after the second publish"
+        );
+        let rms = drain_rms(&remote_a, FRAME_20MS * 100, Duration::from_secs(30)).await;
+        feeder_again.abort();
+        assert!(
+            rms > NON_SILENT_RMS,
+            "B got no audio after the second publish (rms={rms:.4})"
+        );
+        let mut reconnected = false;
+        while let Ok(event) = events_a.try_recv() {
+            reconnected |= matches!(
+                event,
+                CallEvent::CallingStateChanged(
+                    CallingState::Reconnecting | CallingState::Migrating
+                )
+            );
+        }
+        assert!(!reconnected, "A reconnected after the second publish");
 
         call_a.leave().await.expect("A leave");
         call_b.leave().await.expect("B leave");

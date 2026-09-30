@@ -613,6 +613,25 @@ impl LocalAudioTrack {
         self.inner.pacing_enabled.load(Ordering::SeqCst)
     }
 
+    /// Continue the RTP sequence numbers and timestamps of `previous`, whose
+    /// sender this track takes over. The SFU drops a stream whose timestamps
+    /// go back.
+    fn continue_rtp_from(&self, previous: &LocalAudioTrack) {
+        let packetizer = previous
+            .inner
+            .core
+            .packetizer
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        *self
+            .inner
+            .core
+            .packetizer
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = packetizer;
+    }
+
     /// Stop the pacer and reject further writes. Called by `stop_publish`/`leave`.
     pub(crate) fn stop(&self) {
         self.inner.core.stop();
@@ -1998,6 +2017,18 @@ impl LocalTrack {
         match self {
             LocalTrack::Audio(a) | LocalTrack::ScreenShareAudio(a) => a.stop(),
             LocalTrack::Video { track, .. } => track.stop(),
+        }
+    }
+
+    /// Continue the RTP timeline of the audio track `previous`, whose sender
+    /// this audio track takes over.
+    pub(crate) fn continue_rtp_from(&self, previous: &LocalTrack) {
+        if let (
+            LocalTrack::Audio(track) | LocalTrack::ScreenShareAudio(track),
+            LocalTrack::Audio(previous) | LocalTrack::ScreenShareAudio(previous),
+        ) = (self, previous)
+        {
+            track.continue_rtp_from(previous);
         }
     }
 

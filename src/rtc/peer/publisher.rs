@@ -232,6 +232,39 @@ pub(crate) async fn add_transceiver_for_track(
     Ok(tasks)
 }
 
+/// Put `track` on the sender that still carries the stopped track `retired`,
+/// as JS `replaceTrack` does. Returns `false` if `publisher` has no such sender.
+pub(crate) async fn replace_retired_track(
+    publisher: &Arc<RTCPeerConnection>,
+    retired: &LocalTrack,
+    track: &LocalTrack,
+    publish_options: &[PublishOption],
+) -> Result<bool> {
+    let retired_track_id = retired.track_id();
+    for transceiver in publisher.get_transceivers().await {
+        let sender = transceiver.sender().await;
+        if !sender
+            .track()
+            .await
+            .is_some_and(|bound| bound.id() == retired_track_id)
+        {
+            continue;
+        }
+        let option = publish_option(track, publish_options)?;
+        track.configure_for_publish(option)?;
+        track.continue_rtp_from(retired);
+        let physical = track.webrtc_tracks().into_iter().next().ok_or_else(|| {
+            RtcError::Media("local publication has no physical encodings".to_owned())
+        })?;
+        sender
+            .replace_track(Some(physical))
+            .await
+            .map_err(RtcError::from)?;
+        return Ok(true);
+    }
+    Ok(false)
+}
+
 fn spawn_rtcp_reader(
     sender: Arc<webrtc::rtp_transceiver::rtp_sender::RTCRtpSender>,
     rid: Option<String>,
@@ -327,7 +360,63 @@ mod tests {
     use crate::rtc::peer;
     use crate::rtc::proto::event::VideoLayerSetting;
     use crate::rtc::proto::models::{Codec, VideoDimension};
-    use crate::rtc::tracks::{LocalVideoTrack, LocalVideoTrackConfig};
+    use crate::rtc::tracks::{LocalAudioTrack, LocalVideoTrack, LocalVideoTrackConfig};
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn a_track_on_a_retired_sender_continues_its_rtp_timeline() {
+        let opus = [PublishOption {
+            track_type: TrackType::Audio as i32,
+            codec: Some(Codec {
+                name: "opus".to_owned(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }];
+        let retired = LocalTrack::Audio(LocalAudioTrack::opus().expect("first track"));
+        let publisher = peer::new_peer_connection(&[]).await.expect("publisher");
+        let rtcp_tasks = add_transceiver_for_track(&publisher, &retired, &opus)
+            .await
+            .expect("first transceiver");
+        let (receiver, mut remote_rx) = peer::connect_audio_receiver(&publisher).await;
+        retired.start_audio_pacing().await;
+        let remote = tokio::time::timeout(Duration::from_secs(5), remote_rx.recv())
+            .await
+            .expect("remote track")
+            .expect("remote track channel");
+        let (mut last, _) = remote.read_rtp().await.expect("first packet");
+        retired.pause_audio_pacing();
+        while let Ok(Ok((packet, _))) =
+            tokio::time::timeout(Duration::from_millis(200), remote.read_rtp()).await
+        {
+            last = packet;
+        }
+        retired.stop();
+
+        let track = LocalTrack::Audio(LocalAudioTrack::opus().expect("second track"));
+        assert!(
+            replace_retired_track(&publisher, &retired, &track, &opus)
+                .await
+                .expect("replace the retired track")
+        );
+        track.start_audio_pacing().await;
+        let (next, _) = remote.read_rtp().await.expect("second packet");
+
+        assert_eq!(
+            next.header.sequence_number,
+            last.header.sequence_number.wrapping_add(1)
+        );
+        assert_eq!(
+            next.header.timestamp,
+            last.header.timestamp.wrapping_add(960)
+        );
+        track.stop();
+        for task in rtcp_tasks {
+            task.abort();
+        }
+        let _ = publisher.close().await;
+        let _ = receiver.close().await;
+    }
 
     fn video_option(name: &str) -> PublishOption {
         PublishOption {
