@@ -333,8 +333,9 @@ pub(super) async fn handle_event(
                 .send(CallEvent::AudioLevelChanged(ev.audio_levels));
         }
         E::HealthCheckResponse(event) => {
-            if let Some(participant_count) = event.participant_count {
-                core.update_participant_count(participant_count);
+            if let Some(participant_count) = event.participant_count
+                && core.update_participant_count(participant_count)
+            {
                 let _ = core
                     .events_tx
                     .send(CallEvent::ParticipantCountChanged(participant_count));

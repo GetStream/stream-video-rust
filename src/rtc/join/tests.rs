@@ -558,6 +558,38 @@ async fn track_events_report_the_track_type_cause_and_participant() {
 }
 
 #[tokio::test]
+async fn participant_count_event_is_sent_only_when_the_count_changes() {
+    let core = test_core();
+    let generation = prepare_joined_core(&core, "alice");
+    let (connection, _sfu) = establish_fake(&core, generation).await;
+    let context = event_context(&core, &connection);
+    *core.connection.lock().await = Some(connection);
+    let mut events = core.subscribe();
+
+    for total in [2, 2, 3] {
+        connection::handle_event(
+            &context,
+            sfu_event::EventPayload::HealthCheckResponse(event::HealthCheckResponse {
+                participant_count: Some(models::ParticipantCount {
+                    total,
+                    anonymous: 0,
+                }),
+            }),
+        )
+        .await
+        .expect("handle health check response");
+    }
+
+    let mut totals = Vec::new();
+    while let Ok(event) = events.try_recv() {
+        if let CallEvent::ParticipantCountChanged(count) = event {
+            totals.push(count.total);
+        }
+    }
+    assert_eq!(totals, vec![2, 3]);
+}
+
+#[tokio::test]
 async fn dropped_join_allows_a_new_join() {
     let (coordinator_ws_url, coordinator) = fake_coordinator().await;
     // Accepts connections but never answers, so the coordinator join call waits.
