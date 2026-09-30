@@ -30,6 +30,14 @@ get the join events and tracks. `Call::rtc` gives the same `RtcCall` type for a
 client with an API secret; both handles share one session. `RtcCall` also adds
 `update_publish_options` and `set_disconnection_timeout`.
 
+### Stable call event names
+
+`CallEvent::name` returns a stable name for each event: the `SfuEvent` field
+name of its SFU source (for example `participant_joined`), `call_ended` from
+both sources, the coordinator `type` of a `Coordinator` event (for example
+`call.created`), and `calling_state_changed` or `participant_count_changed` for
+the events of the SDK itself.
+
 ### Video REST: advanced call statistics and reporting
 
 Application-level stats on `VideoClient` (`get_active_calls_status`,
