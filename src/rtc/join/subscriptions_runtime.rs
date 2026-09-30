@@ -229,6 +229,11 @@ impl RtcCore {
             return;
         }
         let key = TrackKey::new(participant.session_id.clone(), track_type);
+        let track_id = self.next_remote_track_id.fetch_add(1, Ordering::SeqCst);
+        self.delivered_tracks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(key.clone(), track_id);
         let weak = Arc::downgrade(&self);
         // The caller can drop the track on a thread without a runtime.
         let runtime = tokio::runtime::Handle::current();
@@ -238,7 +243,7 @@ impl RtcCore {
                 let task_core = core.clone();
                 std::mem::drop(core.spawn_generation_task(generation, async move {
                     task_core
-                        .on_remote_track_dropped(generation, connection_epoch, key)
+                        .on_remote_track_dropped(generation, connection_epoch, key, track_id)
                         .await;
                 }));
             }
@@ -253,6 +258,7 @@ impl RtcCore {
         generation: u64,
         connection_epoch: u64,
         key: TrackKey,
+        track_id: u64,
     ) {
         {
             let connection = self.connection.lock().await;
@@ -261,6 +267,15 @@ impl RtcCore {
             }) {
                 return;
             }
+            let mut delivered = self
+                .delivered_tracks
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if delivered.get(&key) != Some(&track_id) {
+                return;
+            }
+            delivered.remove(&key);
+            drop(delivered);
             self.manual_unsub
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
