@@ -1682,6 +1682,100 @@ fn call_state_snapshot_combines_join_state_and_incremental_sfu_updates() {
 }
 
 #[test]
+fn every_call_event_has_its_stable_name() {
+    let events = [
+        (
+            CallEvent::ParticipantJoined(models::Participant::default()),
+            "participant_joined",
+        ),
+        (
+            CallEvent::ParticipantLeft(models::Participant::default()),
+            "participant_left",
+        ),
+        (
+            CallEvent::ParticipantUpdated(models::Participant::default()),
+            "participant_updated",
+        ),
+        (
+            CallEvent::Coordinator(CoordinatorEvent {
+                event_type: "call.created".to_owned(),
+                raw: json!({ "type": "call.created" }),
+            }),
+            "call.created",
+        ),
+        (
+            CallEvent::TrackPublished {
+                user_id: String::new(),
+                session_id: String::new(),
+                track_type: TrackType::Audio,
+                participant: None,
+            },
+            "track_published",
+        ),
+        (
+            CallEvent::TrackUnpublished {
+                user_id: String::new(),
+                session_id: String::new(),
+                track_type: TrackType::Audio,
+                cause: models::TrackUnpublishReason::UserMuted,
+                participant: None,
+            },
+            "track_unpublished",
+        ),
+        (
+            CallEvent::DominantSpeakerChanged {
+                user_id: String::new(),
+                session_id: String::new(),
+            },
+            "dominant_speaker_changed",
+        ),
+        (
+            CallEvent::AudioLevelChanged(Vec::new()),
+            "audio_level_changed",
+        ),
+        (
+            CallEvent::ConnectionQualityChanged(Vec::new()),
+            "connection_quality_changed",
+        ),
+        (
+            CallEvent::ParticipantCountChanged(models::ParticipantCount::default()),
+            "participant_count_changed",
+        ),
+        (CallEvent::PinsUpdated(Vec::new()), "pins_updated"),
+        (
+            CallEvent::InboundStateChanged(Vec::new()),
+            "inbound_state_notification",
+        ),
+        (
+            CallEvent::PublishOptionsChanged {
+                publish_options: Vec::new(),
+                reason: String::new(),
+            },
+            "change_publish_options",
+        ),
+        (
+            CallEvent::PublishQualityChanged(event::ChangePublishQuality::default()),
+            "change_publish_quality",
+        ),
+        (
+            CallEvent::CallGrantsUpdated(event::CallGrantsUpdated::default()),
+            "call_grants_updated",
+        ),
+        (CallEvent::IceRestarted(PeerType::Subscriber), "ice_restart"),
+        (CallEvent::Error(SfuJoinError::from_event(None, 0)), "error"),
+        (CallEvent::CallEnded { reason: None }, "call_ended"),
+        (
+            CallEvent::CallingStateChanged(CallingState::Joined),
+            "calling_state_changed",
+        ),
+    ];
+
+    for (event, name) in &events {
+        assert_eq!(event.name(), *name, "{event:?}");
+    }
+}
+
+#[test]
 fn join_state_reports_only_the_participant_changes_since_the_last_join() {
     let core = test_core();
     let generation = core.begin_join().expect("join generation");

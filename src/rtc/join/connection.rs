@@ -2,6 +2,41 @@
 
 use super::*;
 
+impl CallEvent {
+    /// The stable name of this event. The names are public API and do not
+    /// change.
+    ///
+    /// An event from the SFU has the `SfuEvent` field name of its source, for
+    /// example `participant_joined` or `change_publish_quality`.
+    /// [`CallEvent::CallEnded`] is `call_ended` from both sources, and a
+    /// [`CallEvent::Coordinator`] event has its coordinator `type`, for example
+    /// `call.created`. The events of the SDK itself are `calling_state_changed`
+    /// and `participant_count_changed`.
+    pub fn name(&self) -> &str {
+        match self {
+            Self::ParticipantJoined(_) => "participant_joined",
+            Self::ParticipantLeft(_) => "participant_left",
+            Self::ParticipantUpdated(_) => "participant_updated",
+            Self::Coordinator(event) => &event.event_type,
+            Self::TrackPublished { .. } => "track_published",
+            Self::TrackUnpublished { .. } => "track_unpublished",
+            Self::DominantSpeakerChanged { .. } => "dominant_speaker_changed",
+            Self::AudioLevelChanged(_) => "audio_level_changed",
+            Self::ConnectionQualityChanged(_) => "connection_quality_changed",
+            Self::ParticipantCountChanged(_) => "participant_count_changed",
+            Self::PinsUpdated(_) => "pins_updated",
+            Self::InboundStateChanged(_) => "inbound_state_notification",
+            Self::PublishOptionsChanged { .. } => "change_publish_options",
+            Self::PublishQualityChanged(_) => "change_publish_quality",
+            Self::CallGrantsUpdated(_) => "call_grants_updated",
+            Self::IceRestarted(_) => "ice_restart",
+            Self::Error(_) => "error",
+            Self::CallEnded { .. } => "call_ended",
+            Self::CallingStateChanged(_) => "calling_state_changed",
+        }
+    }
+}
+
 /// Build the SFU signaling WebSocket URL from `ws_endpoint`, appending the
 /// informational query params JS attaches (`attempt`, `user_id`, `api_key`,
 /// `user_session_id`, `cid`). Ported from JS `StreamSfuClient.createWebSocket`.
