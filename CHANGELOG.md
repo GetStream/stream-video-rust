@@ -22,6 +22,14 @@ match these variants must use the new fields or `..`.
 
 ## New Features
 
+### A token-only client can prepare a call before the join
+
+`RtcClient::call` returns an `RtcCall` that is not joined yet, and
+`RtcCall::join` joins it. Register `on_track` and subscribe before the join to
+get the join events and tracks. `Call::rtc` gives the same `RtcCall` type for a
+client with an API secret; both handles share one session. `RtcCall` also adds
+`update_publish_options` and `set_disconnection_timeout`.
+
 ### Video REST: advanced call statistics and reporting
 
 Application-level stats on `VideoClient` (`get_active_calls_status`,

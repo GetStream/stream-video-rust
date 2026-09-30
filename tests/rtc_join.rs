@@ -13,7 +13,7 @@ use std::time::Duration;
 use getstream::TokenOptions;
 use getstream::models::UserRequest;
 use getstream::models::{CallRequest, DeleteCallRequest, GetOrCreateCallRequest, MemberRequest};
-use getstream::rtc::{CallEvent, JoinCallData, RtcClient};
+use getstream::rtc::{CallEvent, CallingState, JoinCallData, RtcClient};
 use tokio::sync::broadcast::Receiver;
 
 /// Wait (up to `timeout`) for a `ParticipantJoined` whose `user_id` matches
@@ -96,7 +96,8 @@ async fn two_sessions_join_and_observe_each_other() {
     // The whole join/observe/leave dance must finish well within a minute.
     let outcome = tokio::time::timeout(Duration::from_secs(90), async {
         let call_a = client.video().call("default", &call_id);
-        let call_b = client.video().call("default", &call_id);
+        // Session B joins through the `RtcCall` view of a server-client call.
+        let call_b = client.video().call("default", &call_id).rtc();
 
         // Subscribe BEFORE joining so no participant event is missed.
         let rx_a = call_a.subscribe();
@@ -191,9 +192,11 @@ async fn provider_backed_client_loads_token_and_joins() {
 }
 
 /// Local decoding is not sufficient proof of authenticity: Stream must reject
-/// a validly shaped participant token whose HS256 signature was altered.
+/// a validly shaped participant token whose HS256 signature was altered. A
+/// valid pre-minted token joins a call handle made before the join, and a
+/// receiver subscribed before the join gets the join states.
 #[tokio::test]
-async fn participant_token_signature_is_enforced() {
+async fn preminted_token_client_gets_join_events_and_signature_is_enforced() {
     let Some(client) = common::client_or_skip() else {
         return;
     };
@@ -232,9 +235,22 @@ async fn participant_token_signature_is_enforced() {
     let outcome: Result<(), String> = tokio::time::timeout(Duration::from_secs(120), async {
         let allowed = RtcClient::new(client.api_key(), token)
             .map_err(|error| format!("build RTC client: {error}"))?
-            .join("default", &call_id, JoinCallData::new(&user_id))
+            .call("default", &call_id);
+        let mut events = allowed.subscribe();
+        allowed
+            .join(JoinCallData::new(&user_id))
             .await
             .map_err(|error| format!("valid token failed to join: {error}"))?;
+        let mut states = Vec::new();
+        while let Ok(event) = events.try_recv() {
+            if let CallEvent::CallingStateChanged(state) = event {
+                states.push(state);
+            }
+        }
+        if states != [CallingState::Joining, CallingState::Joined] {
+            let _ = allowed.leave().await;
+            return Err(format!("join states seen before the join: {states:?}"));
+        }
         allowed
             .leave()
             .await
