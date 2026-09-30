@@ -243,7 +243,9 @@ pub struct RtcCall {
 }
 
 impl RtcCall {
-    /// Subscribe to the typed SFU event stream.
+    /// Subscribe to the typed SFU event stream. A receiver gets only events sent
+    /// after it subscribes, and [`RtcClient::join`] returns this handle after the
+    /// join. Read [`Self::participants`] and [`Self::call_state`] for earlier state.
     pub fn subscribe(&self) -> tokio::sync::broadcast::Receiver<CallEvent> {
         self.core.subscribe()
     }
