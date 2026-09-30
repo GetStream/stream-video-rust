@@ -673,7 +673,11 @@ impl RtcCore {
 
     /// The SFU or the coordinator reported the end of the call: send
     /// [`CallEvent::CallEnded`] once and leave the call.
-    pub(super) fn end_call(self: &Arc<Self>, generation: u64) {
+    pub(super) fn end_call(
+        self: &Arc<Self>,
+        generation: u64,
+        reason: Option<models::CallEndedReason>,
+    ) {
         if !self.is_generation_current(generation) {
             return;
         }
@@ -688,7 +692,7 @@ impl RtcCore {
         if already_ended {
             return;
         }
-        let _ = self.events_tx.send(CallEvent::CallEnded);
+        let _ = self.events_tx.send(CallEvent::CallEnded { reason });
         let this = self.clone();
         // Not a generation task: `leave` ends the generation.
         std::mem::drop(self.spawn_runtime_task(async move {
@@ -819,7 +823,7 @@ impl RtcCore {
                         let ended = event.event_type == "call.ended";
                         let _ = sender.send(CallEvent::Coordinator(event));
                         if ended {
-                            event_core.end_call(generation);
+                            event_core.end_call(generation, None);
                         }
                     }
                     Ok(Some(_)) => {}

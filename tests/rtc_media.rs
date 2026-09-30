@@ -380,7 +380,6 @@ async fn await_track_event(
     timeout: Duration,
 ) -> bool {
     use tokio::sync::broadcast::error::RecvError;
-    let want = track_type as i32;
     let deadline = tokio::time::sleep(timeout);
     tokio::pin!(deadline);
     loop {
@@ -388,9 +387,9 @@ async fn await_track_event(
             () = &mut deadline => return false,
             recv = events.recv() => match recv {
                 Ok(CallEvent::TrackPublished { user_id, track_type: tt, .. })
-                    if published && user_id == user && tt == want => return true,
+                    if published && user_id == user && tt == track_type => return true,
                 Ok(CallEvent::TrackUnpublished { user_id, track_type: tt, .. })
-                    if !published && user_id == user && tt == want => return true,
+                    if !published && user_id == user && tt == track_type => return true,
                 Ok(_) | Err(RecvError::Lagged(_)) => {}
                 Err(RecvError::Closed) => return false,
             }

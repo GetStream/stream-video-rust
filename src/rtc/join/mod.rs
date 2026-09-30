@@ -194,8 +194,10 @@ pub enum CallEvent {
         user_id: String,
         /// The publisher's session id.
         session_id: String,
-        /// The `TrackType` value.
-        track_type: i32,
+        /// The published track type.
+        track_type: TrackType,
+        /// The publisher, sent by the SFU only in large calls.
+        participant: Option<models::Participant>,
     },
     /// A track was unpublished.
     TrackUnpublished {
@@ -203,8 +205,12 @@ pub enum CallEvent {
         user_id: String,
         /// The publisher's session id.
         session_id: String,
-        /// The `TrackType` value.
-        track_type: i32,
+        /// The unpublished track type.
+        track_type: TrackType,
+        /// Why the track was unpublished.
+        cause: models::TrackUnpublishReason,
+        /// The publisher, sent by the SFU only in large calls.
+        participant: Option<models::Participant>,
     },
     /// The dominant speaker changed.
     DominantSpeakerChanged {
@@ -238,13 +244,16 @@ pub enum CallEvent {
     PublishQualityChanged(event::ChangePublishQuality),
     /// The current participant's publishing grants changed.
     CallGrantsUpdated(event::CallGrantsUpdated),
-    /// An SFU-directed ICE restart completed for a peer connection.
+    /// The SFU requested an ICE restart. The SDK restarts only the publisher.
     IceRestarted(PeerType),
     /// The SFU reported an error for this participant.
     Error(SfuJoinError),
     /// The call ended: the SFU or the coordinator (`call.ended`) reported it.
     /// Sent once, after which the SDK leaves the call.
-    CallEnded,
+    CallEnded {
+        /// The SFU reason, or `None` when the coordinator reported the end first.
+        reason: Option<models::CallEndedReason>,
+    },
     /// The connection state changed.
     CallingStateChanged(CallingState),
 }

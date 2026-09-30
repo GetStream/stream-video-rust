@@ -418,7 +418,7 @@ async fn call_ended_from_the_coordinator_is_reported_once_and_leaves_the_call() 
         .expect("coordinator events");
     tokio::time::timeout(Duration::from_secs(2), async {
         loop {
-            if let Ok(CallEvent::CallEnded) = events.recv().await {
+            if let Ok(CallEvent::CallEnded { reason: None }) = events.recv().await {
                 return;
             }
         }
@@ -440,7 +440,7 @@ async fn call_ended_from_the_coordinator_is_reported_once_and_leaves_the_call() 
     .await;
     let mut repeated = 0;
     while let Ok(event) = events.try_recv() {
-        if matches!(event, CallEvent::CallEnded) {
+        if matches!(event, CallEvent::CallEnded { .. }) {
             repeated += 1;
         }
     }
@@ -465,7 +465,9 @@ async fn call_ended_twice_before_the_leave_is_reported_once() {
     for _ in 0..2 {
         connection::handle_event(
             &context,
-            sfu_event::EventPayload::CallEnded(event::CallEnded::default()),
+            sfu_event::EventPayload::CallEnded(event::CallEnded {
+                reason: models::CallEndedReason::Kicked as i32,
+            }),
         )
         .await
         .expect("handle SFU call ended");
@@ -479,11 +481,80 @@ async fn call_ended_twice_before_the_leave_is_reported_once() {
     .await;
     let mut reported = 0;
     while let Ok(event) = events.try_recv() {
-        if matches!(event, CallEvent::CallEnded) {
+        if matches!(
+            event,
+            CallEvent::CallEnded {
+                reason: Some(models::CallEndedReason::Kicked)
+            }
+        ) {
             reported += 1;
         }
     }
     assert_eq!(reported, 1);
+}
+
+#[tokio::test]
+async fn track_events_report_the_track_type_cause_and_participant() {
+    let core = test_core();
+    let generation = prepare_joined_core(&core, "alice");
+    let (connection, _sfu) = establish_fake(&core, generation).await;
+    let context = event_context(&core, &connection);
+    *core.connection.lock().await = Some(connection);
+    let mut events = core.subscribe();
+    let bob = models::Participant {
+        user_id: "bob".to_owned(),
+        session_id: "bob-session".to_owned(),
+        ..Default::default()
+    };
+
+    connection::handle_event(
+        &context,
+        sfu_event::EventPayload::TrackPublished(event::TrackPublished {
+            user_id: "bob".to_owned(),
+            session_id: "bob-session".to_owned(),
+            r#type: TrackType::Audio as i32,
+            participant: Some(bob.clone()),
+        }),
+    )
+    .await
+    .expect("handle track published");
+
+    let Ok(CallEvent::TrackPublished {
+        track_type,
+        participant,
+        ..
+    }) = events.try_recv()
+    else {
+        panic!("expected a track published event");
+    };
+    assert_eq!(track_type, TrackType::Audio);
+    assert_eq!(participant.as_ref(), Some(&bob));
+
+    connection::handle_event(
+        &context,
+        sfu_event::EventPayload::TrackUnpublished(event::TrackUnpublished {
+            user_id: "bob".to_owned(),
+            session_id: "bob-session".to_owned(),
+            r#type: TrackType::Audio as i32,
+            cause: models::TrackUnpublishReason::Moderation as i32,
+            participant: Some(bob.clone()),
+        }),
+    )
+    .await
+    .expect("handle track unpublished");
+
+    let Ok(CallEvent::TrackUnpublished {
+        track_type,
+        cause,
+        participant,
+        ..
+    }) = events.try_recv()
+    else {
+        panic!("expected a track unpublished event");
+    };
+    assert_eq!(track_type, TrackType::Audio);
+    assert_eq!(cause, models::TrackUnpublishReason::Moderation);
+    assert_eq!(participant, Some(bob));
 }
 
 #[tokio::test]

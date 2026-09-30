@@ -302,7 +302,8 @@ pub(super) async fn handle_event(
             let _ = core.events_tx.send(CallEvent::TrackPublished {
                 user_id: ev.user_id,
                 session_id: ev.session_id,
-                track_type: ev.r#type,
+                track_type: TrackType::try_from(ev.r#type).unwrap_or(TrackType::Unspecified),
+                participant: ev.participant,
             });
         }
         E::TrackUnpublished(ev) => {
@@ -312,7 +313,10 @@ pub(super) async fn handle_event(
             let _ = core.events_tx.send(CallEvent::TrackUnpublished {
                 user_id: ev.user_id,
                 session_id: ev.session_id,
-                track_type: ev.r#type,
+                track_type: TrackType::try_from(ev.r#type).unwrap_or(TrackType::Unspecified),
+                cause: models::TrackUnpublishReason::try_from(ev.cause)
+                    .unwrap_or(models::TrackUnpublishReason::Unspecified),
+                participant: ev.participant,
             });
         }
         E::DominantSpeakerChanged(ev) => {
@@ -400,7 +404,13 @@ pub(super) async fn handle_event(
         E::ParticipantMigrationComplete(_) => {
             core.complete_migration(context.generation);
         }
-        E::CallEnded(_) => core.end_call(context.generation),
+        E::CallEnded(event) => core.end_call(
+            context.generation,
+            Some(
+                models::CallEndedReason::try_from(event.reason)
+                    .unwrap_or(models::CallEndedReason::Unspecified),
+            ),
+        ),
         E::PublisherAnswer(_) | E::JoinResponse(_) => {
             tracing::debug!("stream.rtc.unexpected_handshake_event");
         }
