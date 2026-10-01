@@ -176,18 +176,33 @@ pub enum CallingState {
     Left,
 }
 
-/// A typed SFU event delivered on the [`Call`](crate::Call) event stream.
+/// An event delivered on the [`Call`](crate::Call) event stream, grouped by its
+/// source.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
+// `Sfu` carries `Participant` data (about 304 bytes), and the other variants are
+// small. A `Box` would allocate for every SFU event and prevent nested
+// `CallEvent::Sfu(SfuCallEvent::..)` patterns.
+#[allow(clippy::large_enum_variant)]
 pub enum CallEvent {
+    /// An event from the SFU.
+    Sfu(SfuCallEvent),
+    /// A call-scoped coordinator WebSocket event.
+    Coordinator(CoordinatorEvent),
+    /// An event that the SDK itself produces.
+    Client(ClientCallEvent),
+}
+
+/// An event from the SFU.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub enum SfuCallEvent {
     /// A participant joined the call.
     ParticipantJoined(models::Participant),
     /// A participant left the call.
     ParticipantLeft(models::Participant),
     /// A participant's user data changed.
     ParticipantUpdated(models::Participant),
-    /// A call-scoped coordinator WebSocket event.
-    Coordinator(CoordinatorEvent),
     /// A track was published (audio/video/screenshare).
     TrackPublished {
         /// The publisher's user id.
@@ -248,6 +263,12 @@ pub enum CallEvent {
     IceRestarted(PeerType),
     /// The SFU reported an error for this participant.
     Error(SfuJoinError),
+}
+
+/// An event that the SDK itself produces.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub enum ClientCallEvent {
     /// The call ended: the SFU or the coordinator (`call.ended`) reported it.
     /// Sent once, after which the SDK leaves the call.
     CallEnded {
@@ -294,7 +315,9 @@ impl Lifecycle {
     fn set_state(&mut self, next: CallingState, events: &broadcast::Sender<CallEvent>) {
         if self.state != next {
             self.state = next;
-            let _ = events.send(CallEvent::CallingStateChanged(next));
+            let _ = events.send(CallEvent::Client(ClientCallEvent::CallingStateChanged(
+                next,
+            )));
         }
     }
 }

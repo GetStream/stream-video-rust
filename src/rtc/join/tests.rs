@@ -418,7 +418,9 @@ async fn call_ended_from_the_coordinator_is_reported_once_and_leaves_the_call() 
         .expect("coordinator events");
     tokio::time::timeout(Duration::from_secs(2), async {
         loop {
-            if let Ok(CallEvent::CallEnded { reason: None }) = events.recv().await {
+            if let Ok(CallEvent::Client(ClientCallEvent::CallEnded { reason: None })) =
+                events.recv().await
+            {
                 return;
             }
         }
@@ -440,7 +442,7 @@ async fn call_ended_from_the_coordinator_is_reported_once_and_leaves_the_call() 
     .await;
     let mut repeated = 0;
     while let Ok(event) = events.try_recv() {
-        if matches!(event, CallEvent::CallEnded { .. }) {
+        if matches!(event, CallEvent::Client(ClientCallEvent::CallEnded { .. })) {
             repeated += 1;
         }
     }
@@ -483,9 +485,9 @@ async fn call_ended_twice_before_the_leave_is_reported_once() {
     while let Ok(event) = events.try_recv() {
         if matches!(
             event,
-            CallEvent::CallEnded {
+            CallEvent::Client(ClientCallEvent::CallEnded {
                 reason: Some(models::CallEndedReason::Kicked)
-            }
+            })
         ) {
             reported += 1;
         }
@@ -519,11 +521,11 @@ async fn track_events_report_the_track_type_cause_and_participant() {
     .await
     .expect("handle track published");
 
-    let Ok(CallEvent::TrackPublished {
+    let Ok(CallEvent::Sfu(SfuCallEvent::TrackPublished {
         track_type,
         participant,
         ..
-    }) = events.try_recv()
+    })) = events.try_recv()
     else {
         panic!("expected a track published event");
     };
@@ -543,12 +545,12 @@ async fn track_events_report_the_track_type_cause_and_participant() {
     .await
     .expect("handle track unpublished");
 
-    let Ok(CallEvent::TrackUnpublished {
+    let Ok(CallEvent::Sfu(SfuCallEvent::TrackUnpublished {
         track_type,
         cause,
         participant,
         ..
-    }) = events.try_recv()
+    })) = events.try_recv()
     else {
         panic!("expected a track unpublished event");
     };
@@ -582,7 +584,7 @@ async fn participant_count_event_is_sent_only_when_the_count_changes() {
 
     let mut totals = Vec::new();
     while let Ok(event) = events.try_recv() {
-        if let CallEvent::ParticipantCountChanged(count) = event {
+        if let CallEvent::Sfu(SfuCallEvent::ParticipantCountChanged(count)) = event {
             totals.push(count.total);
         }
     }
@@ -1141,7 +1143,7 @@ fn state_events_arrive_in_the_order_of_the_state_changes() {
         barrier.wait();
         let mut last = None;
         while let Ok(event) = events.try_recv() {
-            if let CallEvent::CallingStateChanged(state) = event {
+            if let CallEvent::Client(ClientCallEvent::CallingStateChanged(state)) = event {
                 last = Some(state);
             }
         }
@@ -1163,7 +1165,9 @@ fn setting_the_same_state_again_sends_no_event() {
 
     assert!(matches!(
         events.try_recv(),
-        Ok(CallEvent::CallingStateChanged(CallingState::Reconnecting))
+        Ok(CallEvent::Client(ClientCallEvent::CallingStateChanged(
+            CallingState::Reconnecting
+        )))
     ));
     assert!(events.try_recv().is_err());
 }
@@ -1177,7 +1181,9 @@ fn join_start_sends_joining() {
 
     assert!(matches!(
         events.try_recv(),
-        Ok(CallEvent::CallingStateChanged(CallingState::Joining))
+        Ok(CallEvent::Client(ClientCallEvent::CallingStateChanged(
+            CallingState::Joining
+        )))
     ));
 }
 
@@ -1199,7 +1205,7 @@ async fn state_during_leave_matches_the_last_state_event() {
 
     let mut last = None;
     while let Ok(event) = events.try_recv() {
-        if let CallEvent::CallingStateChanged(state) = event {
+        if let CallEvent::Client(ClientCallEvent::CallingStateChanged(state)) = event {
             last = Some(state);
         }
     }
@@ -1683,28 +1689,21 @@ fn call_state_snapshot_combines_join_state_and_incremental_sfu_updates() {
 
 #[test]
 fn every_call_event_has_its_stable_name() {
-    let events = [
+    let sfu = [
         (
-            CallEvent::ParticipantJoined(models::Participant::default()),
+            SfuCallEvent::ParticipantJoined(models::Participant::default()),
             "participant_joined",
         ),
         (
-            CallEvent::ParticipantLeft(models::Participant::default()),
+            SfuCallEvent::ParticipantLeft(models::Participant::default()),
             "participant_left",
         ),
         (
-            CallEvent::ParticipantUpdated(models::Participant::default()),
+            SfuCallEvent::ParticipantUpdated(models::Participant::default()),
             "participant_updated",
         ),
         (
-            CallEvent::Coordinator(CoordinatorEvent {
-                event_type: "call.created".to_owned(),
-                raw: json!({ "type": "call.created" }),
-            }),
-            "call.created",
-        ),
-        (
-            CallEvent::TrackPublished {
+            SfuCallEvent::TrackPublished {
                 user_id: String::new(),
                 session_id: String::new(),
                 track_type: TrackType::Audio,
@@ -1713,7 +1712,7 @@ fn every_call_event_has_its_stable_name() {
             "track_published",
         ),
         (
-            CallEvent::TrackUnpublished {
+            SfuCallEvent::TrackUnpublished {
                 user_id: String::new(),
                 session_id: String::new(),
                 track_type: TrackType::Audio,
@@ -1723,55 +1722,73 @@ fn every_call_event_has_its_stable_name() {
             "track_unpublished",
         ),
         (
-            CallEvent::DominantSpeakerChanged {
+            SfuCallEvent::DominantSpeakerChanged {
                 user_id: String::new(),
                 session_id: String::new(),
             },
             "dominant_speaker_changed",
         ),
         (
-            CallEvent::AudioLevelChanged(Vec::new()),
+            SfuCallEvent::AudioLevelChanged(Vec::new()),
             "audio_level_changed",
         ),
         (
-            CallEvent::ConnectionQualityChanged(Vec::new()),
+            SfuCallEvent::ConnectionQualityChanged(Vec::new()),
             "connection_quality_changed",
         ),
         (
-            CallEvent::ParticipantCountChanged(models::ParticipantCount::default()),
+            SfuCallEvent::ParticipantCountChanged(models::ParticipantCount::default()),
             "participant_count_changed",
         ),
-        (CallEvent::PinsUpdated(Vec::new()), "pins_updated"),
+        (SfuCallEvent::PinsUpdated(Vec::new()), "pins_updated"),
         (
-            CallEvent::InboundStateChanged(Vec::new()),
+            SfuCallEvent::InboundStateChanged(Vec::new()),
             "inbound_state_notification",
         ),
         (
-            CallEvent::PublishOptionsChanged {
+            SfuCallEvent::PublishOptionsChanged {
                 publish_options: Vec::new(),
                 reason: String::new(),
             },
             "change_publish_options",
         ),
         (
-            CallEvent::PublishQualityChanged(event::ChangePublishQuality::default()),
+            SfuCallEvent::PublishQualityChanged(event::ChangePublishQuality::default()),
             "change_publish_quality",
         ),
         (
-            CallEvent::CallGrantsUpdated(event::CallGrantsUpdated::default()),
+            SfuCallEvent::CallGrantsUpdated(event::CallGrantsUpdated::default()),
             "call_grants_updated",
         ),
-        (CallEvent::IceRestarted(PeerType::Subscriber), "ice_restart"),
-        (CallEvent::Error(SfuJoinError::from_event(None, 0)), "error"),
-        (CallEvent::CallEnded { reason: None }, "call_ended"),
         (
-            CallEvent::CallingStateChanged(CallingState::Joined),
+            SfuCallEvent::IceRestarted(PeerType::Subscriber),
+            "ice_restart",
+        ),
+        (
+            SfuCallEvent::Error(SfuJoinError::from_event(None, 0)),
+            "error",
+        ),
+    ]
+    .map(|(event, name)| (CallEvent::Sfu(event), name));
+    let client = [
+        (ClientCallEvent::CallEnded { reason: None }, "call_ended"),
+        (
+            ClientCallEvent::CallingStateChanged(CallingState::Joined),
             "calling_state_changed",
         ),
-    ];
+    ]
+    .map(|(event, name)| (CallEvent::Client(event), name));
+    let coordinator = (
+        CallEvent::Coordinator(CoordinatorEvent {
+            event_type: "call.created".to_owned(),
+            raw: json!({ "type": "call.created" }),
+        }),
+        "call.created",
+    );
+    let events = sfu.into_iter().chain(client).chain([coordinator]);
 
-    for (event, name) in &events {
-        assert_eq!(event.name(), *name, "{event:?}");
+    for (event, name) in events {
+        assert_eq!(event.name(), name, "{event:?}");
     }
 }
 
@@ -1821,9 +1838,15 @@ fn join_state_reports_only_the_participant_changes_since_the_last_join() {
     let mut reported = Vec::new();
     while let Ok(event) = events.try_recv() {
         match event {
-            CallEvent::ParticipantJoined(p) => reported.push(("joined", p.session_id)),
-            CallEvent::ParticipantUpdated(p) => reported.push(("updated", p.session_id)),
-            CallEvent::ParticipantLeft(p) => reported.push(("left", p.session_id)),
+            CallEvent::Sfu(SfuCallEvent::ParticipantJoined(p)) => {
+                reported.push(("joined", p.session_id));
+            }
+            CallEvent::Sfu(SfuCallEvent::ParticipantUpdated(p)) => {
+                reported.push(("updated", p.session_id));
+            }
+            CallEvent::Sfu(SfuCallEvent::ParticipantLeft(p)) => {
+                reported.push(("left", p.session_id));
+            }
             _ => {}
         }
     }

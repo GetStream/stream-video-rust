@@ -12,13 +12,23 @@ for a staging or local environment must set both fields. Code that builds
 `..ClientConfig::default()`. `DEFAULT_COORDINATOR_WS_URL` moved from
 `rtc::coordinator::ws` to the crate root.
 
+### Call events are grouped by their source
+
+`CallEvent` has three variants: `Sfu(SfuCallEvent)` for the events from the
+SFU, `Coordinator(CoordinatorEvent)` as before, and `Client(ClientCallEvent)`
+for the events that the SDK itself produces (`CallingStateChanged` and
+`CallEnded`). The SFU and client variants did not change; only their path did.
+A pattern such as `CallEvent::ParticipantJoined(p)` becomes
+`CallEvent::Sfu(SfuCallEvent::ParticipantJoined(p))`.
+
 ### Track and call-ended events carry the SFU data
 
-`CallEvent::TrackPublished` and `CallEvent::TrackUnpublished` give `track_type`
-as a `TrackType`, not an `i32`, and add `participant`. `TrackUnpublished` also
-adds `cause`. `CallEvent::CallEnded` is now `CallEnded { reason }`: the SFU
-reason, or `None` when the coordinator reported the end first. Patterns that
-match these variants must use the new fields or `..`.
+`SfuCallEvent::TrackPublished` and `SfuCallEvent::TrackUnpublished` give
+`track_type` as a `TrackType`, not an `i32`, and add `participant`.
+`TrackUnpublished` also adds `cause`. `ClientCallEvent::CallEnded` is now
+`CallEnded { reason }`: the SFU reason, or `None` when the coordinator reported
+the end first. Patterns that match these variants must use the new fields or
+`..`.
 
 ## New Features
 
@@ -32,11 +42,12 @@ client with an API secret; both handles share one session. `RtcCall` also adds
 
 ### Stable call event names
 
-`CallEvent::name` returns a stable name for each event: the `SfuEvent` field
-name of its SFU source (for example `participant_joined`), `call_ended` from
-both sources, the coordinator `type` of a `Coordinator` event (for example
-`call.created`), and `calling_state_changed` or `participant_count_changed` for
-the events of the SDK itself.
+`CallEvent::name` returns a stable name for each event. `SfuCallEvent::name`
+gives the `SfuEvent` field name of the source event (for example
+`participant_joined`), and `participant_count_changed`.
+`ClientCallEvent::name` gives `call_ended` (from both sources) or
+`calling_state_changed`. A `Coordinator` event has its coordinator `type` (for
+example `call.created`).
 
 ### Video REST: advanced call statistics and reporting
 

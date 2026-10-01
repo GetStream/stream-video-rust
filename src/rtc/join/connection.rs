@@ -4,20 +4,27 @@ use super::*;
 
 impl CallEvent {
     /// The stable name of this event. The names are public API and do not
-    /// change.
-    ///
-    /// An event from the SFU has the `SfuEvent` field name of its source, for
-    /// example `participant_joined` or `change_publish_quality`.
-    /// [`CallEvent::CallEnded`] is `call_ended` from both sources, and a
+    /// change: see [`SfuCallEvent::name`] and [`ClientCallEvent::name`]. A
     /// [`CallEvent::Coordinator`] event has its coordinator `type`, for example
-    /// `call.created`. The events of the SDK itself are `calling_state_changed`
-    /// and `participant_count_changed`.
+    /// `call.created`.
     pub fn name(&self) -> &str {
+        match self {
+            Self::Sfu(event) => event.name(),
+            Self::Coordinator(event) => &event.event_type,
+            Self::Client(event) => event.name(),
+        }
+    }
+}
+
+impl SfuCallEvent {
+    /// The stable `SfuEvent` field name of the source event, for example
+    /// `participant_joined` or `change_publish_quality`.
+    /// [`SfuCallEvent::ParticipantCountChanged`] is `participant_count_changed`.
+    pub fn name(&self) -> &'static str {
         match self {
             Self::ParticipantJoined(_) => "participant_joined",
             Self::ParticipantLeft(_) => "participant_left",
             Self::ParticipantUpdated(_) => "participant_updated",
-            Self::Coordinator(event) => &event.event_type,
             Self::TrackPublished { .. } => "track_published",
             Self::TrackUnpublished { .. } => "track_unpublished",
             Self::DominantSpeakerChanged { .. } => "dominant_speaker_changed",
@@ -31,6 +38,15 @@ impl CallEvent {
             Self::CallGrantsUpdated(_) => "call_grants_updated",
             Self::IceRestarted(_) => "ice_restart",
             Self::Error(_) => "error",
+        }
+    }
+}
+
+impl ClientCallEvent {
+    /// The stable name of this event: `call_ended` (from both sources) or
+    /// `calling_state_changed`.
+    pub fn name(&self) -> &'static str {
+        match self {
             Self::CallEnded { .. } => "call_ended",
             Self::CallingStateChanged(_) => "calling_state_changed",
         }
@@ -297,16 +313,20 @@ pub(super) async fn handle_event(
         }
         E::ConnectionQualityChanged(event) => {
             core.update_connection_quality(&event.connection_quality_updates);
-            let _ = core.events_tx.send(CallEvent::ConnectionQualityChanged(
-                event.connection_quality_updates,
-            ));
+            let _ = core
+                .events_tx
+                .send(CallEvent::Sfu(SfuCallEvent::ConnectionQualityChanged(
+                    event.connection_quality_updates,
+                )));
         }
         E::ParticipantJoined(ev) => {
             if let Some(p) = ev.participant {
                 core.upsert_participant(&p);
                 core.recompute_subscriptions_for_generation(context.generation)
                     .await?;
-                let _ = core.events_tx.send(CallEvent::ParticipantJoined(p));
+                let _ = core
+                    .events_tx
+                    .send(CallEvent::Sfu(SfuCallEvent::ParticipantJoined(p)));
             }
         }
         E::ParticipantLeft(ev) => {
@@ -314,7 +334,9 @@ pub(super) async fn handle_event(
                 core.remove_participant(&p.session_id);
                 core.recompute_subscriptions_for_generation(context.generation)
                     .await?;
-                let _ = core.events_tx.send(CallEvent::ParticipantLeft(p));
+                let _ = core
+                    .events_tx
+                    .send(CallEvent::Sfu(SfuCallEvent::ParticipantLeft(p)));
             }
         }
         E::ParticipantUpdated(ev) => {
@@ -322,7 +344,9 @@ pub(super) async fn handle_event(
                 core.upsert_participant(&p);
                 core.recompute_subscriptions_for_generation(context.generation)
                     .await?;
-                let _ = core.events_tx.send(CallEvent::ParticipantUpdated(p));
+                let _ = core
+                    .events_tx
+                    .send(CallEvent::Sfu(SfuCallEvent::ParticipantUpdated(p)));
             }
         }
         E::TrackPublished(ev) => {
@@ -334,38 +358,46 @@ pub(super) async fn handle_event(
             );
             core.recompute_subscriptions_for_generation(context.generation)
                 .await?;
-            let _ = core.events_tx.send(CallEvent::TrackPublished {
-                user_id: ev.user_id,
-                session_id: ev.session_id,
-                track_type: TrackType::try_from(ev.r#type).unwrap_or(TrackType::Unspecified),
-                participant: ev.participant,
-            });
+            let _ = core
+                .events_tx
+                .send(CallEvent::Sfu(SfuCallEvent::TrackPublished {
+                    user_id: ev.user_id,
+                    session_id: ev.session_id,
+                    track_type: TrackType::try_from(ev.r#type).unwrap_or(TrackType::Unspecified),
+                    participant: ev.participant,
+                }));
         }
         E::TrackUnpublished(ev) => {
             core.remove_published_track(&ev.session_id, ev.r#type);
             core.recompute_subscriptions_for_generation(context.generation)
                 .await?;
-            let _ = core.events_tx.send(CallEvent::TrackUnpublished {
-                user_id: ev.user_id,
-                session_id: ev.session_id,
-                track_type: TrackType::try_from(ev.r#type).unwrap_or(TrackType::Unspecified),
-                cause: models::TrackUnpublishReason::try_from(ev.cause)
-                    .unwrap_or(models::TrackUnpublishReason::Unspecified),
-                participant: ev.participant,
-            });
+            let _ = core
+                .events_tx
+                .send(CallEvent::Sfu(SfuCallEvent::TrackUnpublished {
+                    user_id: ev.user_id,
+                    session_id: ev.session_id,
+                    track_type: TrackType::try_from(ev.r#type).unwrap_or(TrackType::Unspecified),
+                    cause: models::TrackUnpublishReason::try_from(ev.cause)
+                        .unwrap_or(models::TrackUnpublishReason::Unspecified),
+                    participant: ev.participant,
+                }));
         }
         E::DominantSpeakerChanged(ev) => {
             core.update_dominant_speaker(&ev.session_id);
-            let _ = core.events_tx.send(CallEvent::DominantSpeakerChanged {
-                user_id: ev.user_id,
-                session_id: ev.session_id,
-            });
+            let _ = core
+                .events_tx
+                .send(CallEvent::Sfu(SfuCallEvent::DominantSpeakerChanged {
+                    user_id: ev.user_id,
+                    session_id: ev.session_id,
+                }));
         }
         E::AudioLevelChanged(ev) => {
             core.update_audio_levels(&ev.audio_levels);
             let _ = core
                 .events_tx
-                .send(CallEvent::AudioLevelChanged(ev.audio_levels));
+                .send(CallEvent::Sfu(SfuCallEvent::AudioLevelChanged(
+                    ev.audio_levels,
+                )));
         }
         E::HealthCheckResponse(event) => {
             if let Some(participant_count) = event.participant_count
@@ -373,30 +405,40 @@ pub(super) async fn handle_event(
             {
                 let _ = core
                     .events_tx
-                    .send(CallEvent::ParticipantCountChanged(participant_count));
+                    .send(CallEvent::Sfu(SfuCallEvent::ParticipantCountChanged(
+                        participant_count,
+                    )));
             }
         }
         E::PinsUpdated(event) => {
             core.update_pins(event.pins.clone());
-            let _ = core.events_tx.send(CallEvent::PinsUpdated(event.pins));
+            let _ = core
+                .events_tx
+                .send(CallEvent::Sfu(SfuCallEvent::PinsUpdated(event.pins)));
         }
         E::InboundStateNotification(event) => {
             core.update_inbound_state(&event.inbound_video_states);
             let _ = core
                 .events_tx
-                .send(CallEvent::InboundStateChanged(event.inbound_video_states));
+                .send(CallEvent::Sfu(SfuCallEvent::InboundStateChanged(
+                    event.inbound_video_states,
+                )));
         }
         E::ChangePublishOptions(event) => {
             core.apply_publish_options(context.generation, event.publish_options.clone())
                 .await?;
-            let _ = core.events_tx.send(CallEvent::PublishOptionsChanged {
-                publish_options: event.publish_options,
-                reason: event.reason,
-            });
+            let _ = core
+                .events_tx
+                .send(CallEvent::Sfu(SfuCallEvent::PublishOptionsChanged {
+                    publish_options: event.publish_options,
+                    reason: event.reason,
+                }));
         }
         E::ChangePublishQuality(event) => {
             core.apply_publish_quality(&event).await;
-            let _ = core.events_tx.send(CallEvent::PublishQualityChanged(event));
+            let _ = core
+                .events_tx
+                .send(CallEvent::Sfu(SfuCallEvent::PublishQualityChanged(event)));
         }
         E::CallGrantsUpdated(event) => {
             core.update_call_grants(event.current_grants);
@@ -412,7 +454,9 @@ pub(super) async fn handle_event(
                     }
                 }
             }
-            let _ = core.events_tx.send(CallEvent::CallGrantsUpdated(event));
+            let _ = core
+                .events_tx
+                .send(CallEvent::Sfu(SfuCallEvent::CallGrantsUpdated(event)));
         }
         E::IceRestart(event) => {
             let peer_type =
@@ -420,12 +464,16 @@ pub(super) async fn handle_event(
             if peer_type == PeerType::PublisherUnspecified {
                 core.restart_publisher_ice().await?;
             }
-            let _ = core.events_tx.send(CallEvent::IceRestarted(peer_type));
+            let _ = core
+                .events_tx
+                .send(CallEvent::Sfu(SfuCallEvent::IceRestarted(peer_type)));
         }
         E::Error(err) => {
             let join_err = SfuJoinError::from_event(err.error, err.reconnect_strategy);
             let strategy = ReconnectStrategy::from_proto(err.reconnect_strategy);
-            let _ = core.events_tx.send(CallEvent::Error(join_err.clone()));
+            let _ = core
+                .events_tx
+                .send(CallEvent::Sfu(SfuCallEvent::Error(join_err.clone())));
             if let Some(strategy) = strategy {
                 core.trigger_reconnect(context.generation, strategy, join_err.message.clone());
             }
