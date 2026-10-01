@@ -43,19 +43,26 @@ impl RtcCore {
 
     /// Enable or disable incoming video for every remote participant.
     pub async fn set_incoming_video_enabled(&self, enabled: bool) -> Result<()> {
-        let config = {
-            let mut config = self.sub_config.lock().unwrap_or_else(|e| e.into_inner());
-            config.video = enabled;
-            config.video_dimension = None;
-            *config
-        };
+        {
+            let mut guard = self.sub_config.lock().unwrap_or_else(|e| e.into_inner());
+            let config = &mut *guard;
+            for rule in std::iter::once(&mut config.default).chain(config.role_filters.values_mut())
+            {
+                rule.track_types
+                    .retain(|track_type| *track_type != TrackType::Video);
+                if enabled {
+                    rule.track_types.push(TrackType::Video);
+                }
+                rule.video_dimension = DEFAULT_VIDEO_DIMENSION;
+            }
+        }
         *self
             .manual_subscriptions
             .lock()
             .unwrap_or_else(|error| error.into_inner()) = None;
         self.subs_active.store(true, Ordering::SeqCst);
         self.recompute_subscriptions().await?;
-        tracing::debug!(enabled = config.video, "stream.rtc.incoming_video_updated");
+        tracing::debug!(enabled, "stream.rtc.incoming_video_updated");
         Ok(())
     }
 
@@ -85,7 +92,11 @@ impl RtcCore {
             }
         };
 
-        let config = *self.sub_config.lock().unwrap_or_else(|e| e.into_inner());
+        let config = self
+            .sub_config
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
         let targets = self
             .manual_subscriptions
             .lock()
@@ -124,32 +135,13 @@ impl RtcCore {
                     });
                 }
             } else {
-                for entry in participants.values() {
-                    if entry.session_id == session_id {
-                        continue;
-                    }
-                    for &tt_i in &entry.published {
-                        let Ok(track_type) = TrackType::try_from(tt_i) else {
-                            continue;
-                        };
-                        if !config.matches(track_type)
-                            || manual.contains(&TrackKey::new(entry.session_id.clone(), track_type))
-                        {
-                            continue;
-                        }
-                        let dimension = is_video_type(track_type).then(|| {
-                            let (width, height) =
-                                config.video_dimension.unwrap_or(DEFAULT_VIDEO_DIMENSION);
-                            models::VideoDimension { width, height }
-                        });
-                        tracks.push(signal::TrackSubscriptionDetails {
-                            user_id: entry.user_id.clone(),
-                            session_id: entry.session_id.clone(),
-                            track_type: tt_i,
-                            dimension,
-                        });
-                    }
-                }
+                tracks = config.track_subscriptions(
+                    participants
+                        .values()
+                        .map(|entry| &entry.participant)
+                        .filter(|participant| participant.session_id != session_id),
+                    &manual,
+                );
             }
         }
         tracks.sort_by(|a, b| {

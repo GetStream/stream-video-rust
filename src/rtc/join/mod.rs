@@ -36,6 +36,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering}
 use std::sync::{Arc, Mutex as StdMutex, Weak};
 use std::time::{Duration, Instant};
 
+use indexmap::IndexMap;
 use tokio::sync::{Mutex as TokioMutex, Notify, broadcast};
 use tokio::task::JoinHandle;
 use url::Url;
@@ -539,8 +540,9 @@ pub struct RtcCore {
     next_remote_track_id: AtomicU64,
     /// Exact per-session subscriptions, or `None` while using the coarse policy.
     manual_subscriptions: StdMutex<Option<Vec<SubscriptionTarget>>>,
-    /// Known participants keyed by session id (correlation + subscription build).
-    participants: StdMutex<HashMap<String, ParticipantState>>,
+    /// Known participants keyed by session id (correlation + subscription build),
+    /// in the order the call learned about them.
+    participants: StdMutex<IndexMap<String, ParticipantState>>,
     /// Call-level state supplied by join and incremental SFU events.
     call_state: StdMutex<CallStateCache>,
     /// Serialized publisher negotiation and retryable local publication state.
@@ -605,7 +607,7 @@ impl RtcCore {
             delivered_tracks: StdMutex::new(HashMap::new()),
             next_remote_track_id: AtomicU64::new(0),
             manual_subscriptions: StdMutex::new(None),
-            participants: StdMutex::new(HashMap::new()),
+            participants: StdMutex::new(IndexMap::new()),
             call_state: StdMutex::new(CallStateCache::default()),
             media: TokioMutex::new(MediaState::default()),
             active_subs: StdMutex::new(Vec::new()),
