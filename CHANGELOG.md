@@ -82,6 +82,14 @@ client with an API secret; both handles share one session. `RtcCall` also adds
 `calling_state_changed`. A `CoordinatorEvent` has its coordinator `event_type`
 (for example `call.created`).
 
+### Configurable call event buffer
+
+`ClientConfig::call_event_capacity` sets how many events each call event
+stream keeps for a slow receiver. The default stays 256. A larger value makes a
+lag less likely, but each call allocates all slots of its three streams. Code
+that builds `ClientConfig` with a struct literal must set the new field or use
+`..ClientConfig::default()`.
+
 ### Video REST: advanced call statistics and reporting
 
 Application-level stats on `VideoClient` (`get_active_calls_status`,
