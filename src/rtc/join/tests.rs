@@ -1649,6 +1649,28 @@ fn participant_refresh_replaces_published_track_state() {
 }
 
 #[test]
+fn participants_keep_the_order_in_which_the_call_learned_them() {
+    let core = test_core();
+    let participant = |session_id: &str, user_id: &str| models::Participant {
+        user_id: user_id.to_owned(),
+        session_id: session_id.to_owned(),
+        ..Default::default()
+    };
+    for session_id in ["h", "c", "f", "a", "g", "b", "e", "d"] {
+        core.upsert_participant(&participant(session_id, "user"));
+    }
+    core.remove_participant("f");
+    core.upsert_participant(&participant("c", "changed"));
+
+    let order: Vec<_> = core
+        .participants()
+        .into_iter()
+        .map(|participant| participant.session_id)
+        .collect();
+    assert_eq!(order, ["h", "c", "a", "g", "b", "e", "d"]);
+}
+
+#[test]
 fn call_state_snapshot_combines_join_state_and_incremental_sfu_updates() {
     let core = test_core();
     let generation = core.begin_join().expect("join generation");

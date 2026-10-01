@@ -1149,6 +1149,7 @@ dependencies = [
  "flate2",
  "futures-util",
  "hmac 0.13.0",
+ "indexmap",
  "openh264",
  "opus",
  "prost",

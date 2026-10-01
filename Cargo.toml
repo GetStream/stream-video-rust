@@ -56,6 +56,7 @@ base64 = "0.23.1"
 bytes = "1.12.1"
 futures-util = "0.3.34"
 hmac = "0.13.0"
+indexmap = "2.14.2"
 prost = "0.14.4"
 prost-types = "0.14.4"
 reqwest = { version = "0.13.4", default-features = false, features = ["rustls", "json", "charset", "http2", "stream"] }

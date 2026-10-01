@@ -31,8 +31,9 @@ pub(super) struct CallStateCache {
 
 impl RtcCore {
     /// A snapshot of the participants currently known in the call (including this
-    /// session), built from the SFU participant state. Updated as
-    /// `ParticipantJoined` / `ParticipantLeft` events arrive.
+    /// session), built from the SFU participant state, in the order the call
+    /// learned about them. Updated as `ParticipantJoined` / `ParticipantLeft`
+    /// events arrive.
     pub fn participants(&self) -> Vec<RemoteParticipant> {
         let participants = self.participants.lock().unwrap_or_else(|e| e.into_inner());
         participants
@@ -152,7 +153,7 @@ impl RtcCore {
         // The local sessions, before and after a REJOIN, produce no events.
         let is_local = |id: &str| id == session_id || id == previous_session_id;
         for participant in joined {
-            let known = previous.remove(&participant.session_id);
+            let known = previous.shift_remove(&participant.session_id);
             if is_local(&participant.session_id) {
                 continue;
             }
@@ -196,7 +197,7 @@ impl RtcCore {
         self.participants
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .remove(session_id);
+            .shift_remove(session_id);
     }
 
     /// Record a newly-published track for a participant, learning the
