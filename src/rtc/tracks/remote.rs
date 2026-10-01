@@ -214,7 +214,10 @@ struct VideoDecode {
 struct AudioDecode {
     decoder: opus::Decoder,
     last_seq: Option<u16>,
-    ready: VecDeque<Vec<i16>>,
+    ready: VecDeque<PcmFrame>,
+    /// The RTP timestamp right after the last queued frame. A frame rebuilt
+    /// for a lost packet starts here.
+    next_pts: u32,
     /// Length of the last frame decoded from a real packet. libopus makes a
     /// rebuilt frame as long as the output buffer. A lost packet states no
     /// length, so the stream's own frame size is the best value to use.
@@ -362,7 +365,8 @@ impl RemoteTrack {
         }
     }
 
-    /// Decode and return the next audio frame as 48 kHz mono s16 PCM.
+    /// Decode and return the next audio frame as 48 kHz mono s16 PCM, with
+    /// [`PcmFrame::pts`] set to the RTP timestamp of its first sample.
     ///
     /// Skips empty/comfort-noise packets and returns `None` only when the track
     /// ends. Returns `None` immediately for non-audio tracks. Concurrent reads
@@ -373,17 +377,21 @@ impl RemoteTrack {
         };
         let _read_guard = self.read_gate.lock().await;
         loop {
-            if let Some(samples) = state.lock().unwrap_or_else(|e| e.into_inner()).take_frame() {
-                return Some(PcmFrame::mono(samples, OPUS_SAMPLE_RATE));
+            if let Some(frame) = state.lock().unwrap_or_else(|e| e.into_inner()).take_frame() {
+                return Some(frame);
             }
             let pkt = self.read_rtp_inner().await?;
             if pkt.payload.is_empty() {
                 continue;
             }
             let mut state = state.lock().unwrap_or_else(|e| e.into_inner());
-            state.push_packet(pkt.header.sequence_number, &pkt.payload);
-            if let Some(samples) = state.take_frame() {
-                return Some(PcmFrame::mono(samples, OPUS_SAMPLE_RATE));
+            state.push_packet(
+                pkt.header.sequence_number,
+                pkt.header.timestamp,
+                &pkt.payload,
+            );
+            if let Some(frame) = state.take_frame() {
+                return Some(frame);
             }
         }
     }
@@ -516,6 +524,7 @@ impl AudioDecode {
             decoder,
             last_seq: None,
             ready: VecDeque::new(),
+            next_pts: 0,
             frame_samples: FRAME_SAMPLES_20MS,
             scratch: vec![0; MAX_OPUS_FRAME_SAMPLES],
         }
@@ -531,7 +540,7 @@ impl AudioDecode {
     /// Only the frame directly before `sequence_number` can be rebuilt from real
     /// audio: in-band FEC puts a low-quality copy of a frame into the *next*
     /// packet, so anything lost earlier had its copy in a lost packet too.
-    fn push_packet(&mut self, sequence_number: u16, payload: &[u8]) {
+    fn push_packet(&mut self, sequence_number: u16, rtp_timestamp: u32, payload: &[u8]) {
         let missing = match self.last_seq {
             None => 0,
             Some(last) => {
@@ -553,18 +562,19 @@ impl AudioDecode {
         self.last_seq = Some(sequence_number);
 
         for _ in 1..missing {
-            self.decode_frame(&[], false);
+            self.decode_frame(&[], false, self.next_pts);
         }
         if missing > 0 {
-            self.decode_frame(payload, true);
+            self.decode_frame(payload, true, self.next_pts);
         }
-        self.decode_frame(payload, false);
+        self.decode_frame(payload, false, rtp_timestamp);
     }
 
-    /// Decode one frame and queue it. An empty `payload` makes libopus build a
-    /// replacement for a lost frame. `fec` takes the copy of the previous frame
-    /// out of `payload` instead of decoding `payload` itself.
-    fn decode_frame(&mut self, payload: &[u8], fec: bool) {
+    /// Decode one frame that starts at RTP timestamp `pts` and queue it. An
+    /// empty `payload` makes libopus build a replacement for a lost frame.
+    /// `fec` takes the copy of the previous frame out of `payload` instead of
+    /// decoding `payload` itself.
+    fn decode_frame(&mut self, payload: &[u8], fec: bool, pts: u32) {
         let rebuilt = fec || payload.is_empty();
         // A real packet states its own length and the buffer is only an upper
         // bound. For a rebuilt frame the buffer length is the length libopus
@@ -585,7 +595,10 @@ impl AudioDecode {
                 if !rebuilt {
                     self.frame_samples = samples;
                 }
-                self.ready.push_back(self.scratch[..samples].to_vec());
+                let mut frame = PcmFrame::mono(self.scratch[..samples].to_vec(), OPUS_SAMPLE_RATE);
+                frame.pts = Some(pts);
+                self.ready.push_back(frame);
+                self.next_pts = pts.wrapping_add(samples as u32);
             }
             Err(error) => {
                 tracing::debug!(error = %error, "stream.rtc.remote.opus_decode_failed");
@@ -593,7 +606,7 @@ impl AudioDecode {
         }
     }
 
-    fn take_frame(&mut self) -> Option<Vec<i16>> {
+    fn take_frame(&mut self) -> Option<PcmFrame> {
         self.ready.pop_front()
     }
 }
@@ -811,18 +824,25 @@ mod tests {
             .unwrap_or(0)
     }
 
+    /// The RTP timestamp of packet `sequence_number` in a 20 ms stream.
+    fn rtp(sequence_number: u16) -> u32 {
+        u32::from(sequence_number) * FRAME_SAMPLES_20MS as u32
+    }
+
     #[test]
     fn an_unbroken_sequence_yields_one_frame_per_packet() {
         let packets = tone_packets(4, true);
         let mut state = audio_decode();
 
         for (index, packet) in packets.iter().enumerate() {
-            state.push_packet(index as u16, packet);
+            state.push_packet(index as u16, rtp(index as u16), packet);
+            let frame = state.take_frame();
             assert_eq!(
-                state.take_frame().map(|frame| frame.len()),
+                frame.as_ref().map(|frame| frame.samples.len()),
                 Some(FRAME_SAMPLES_20MS),
                 "packet {index} should yield exactly one frame"
             );
+            assert_eq!(frame.and_then(|frame| frame.pts), Some(rtp(index as u16)));
             assert!(
                 state.take_frame().is_none(),
                 "packet {index} queued extra frames"
@@ -835,10 +855,10 @@ mod tests {
         let packets = tone_packets(1, true);
         let mut state = audio_decode();
 
-        state.push_packet(0, &packets[0]);
+        state.push_packet(0, rtp(0), &packets[0]);
 
         let frame = state.take_frame().expect("decoded frame");
-        assert_eq!(frame.capacity(), frame.len());
+        assert_eq!(frame.samples.capacity(), frame.samples.len());
     }
 
     #[test]
@@ -846,20 +866,41 @@ mod tests {
         let packets = tone_packets(3, true);
         let mut state = audio_decode();
 
-        state.push_packet(0, &packets[0]);
+        state.push_packet(0, rtp(0), &packets[0]);
         assert!(state.take_frame().is_some());
         // Packet 1 never arrives; packet 2 carries a copy of frame 1.
-        state.push_packet(2, &packets[2]);
+        state.push_packet(2, rtp(2), &packets[2]);
 
         let rebuilt = state.take_frame().expect("rebuilt frame");
         let current = state.take_frame().expect("current frame");
         assert!(state.take_frame().is_none(), "only two frames are owed");
-        assert_eq!(rebuilt.len(), FRAME_SAMPLES_20MS);
-        assert_eq!(current.len(), FRAME_SAMPLES_20MS);
+        assert_eq!(rebuilt.samples.len(), FRAME_SAMPLES_20MS);
+        assert_eq!(current.samples.len(), FRAME_SAMPLES_20MS);
+        assert_eq!((rebuilt.pts, current.pts), (Some(rtp(1)), Some(rtp(2))));
         assert!(
-            peak(&rebuilt) > 1_000,
+            peak(&rebuilt.samples) > 1_000,
             "rebuilt frame is silent (peak {})",
-            peak(&rebuilt)
+            peak(&rebuilt.samples)
+        );
+    }
+
+    #[test]
+    fn timestamps_continue_over_a_lost_packet_and_the_rtp_wrap() {
+        let packets = tone_packets(3, true);
+        let mut state = audio_decode();
+        let first = u32::MAX - (FRAME_SAMPLES_20MS as u32 - 1);
+
+        state.push_packet(0, first, &packets[0]);
+        // Packet 1 is lost; its timestamp wraps to 0.
+        state.push_packet(2, first.wrapping_add(rtp(2)), &packets[2]);
+
+        let mut timestamps = Vec::new();
+        while let Some(frame) = state.take_frame() {
+            timestamps.push(frame.pts);
+        }
+        assert_eq!(
+            timestamps,
+            [Some(first), Some(0), Some(FRAME_SAMPLES_20MS as u32)]
         );
     }
 
@@ -868,14 +909,14 @@ mod tests {
         let packets = tone_packets(3, false);
         let mut state = audio_decode();
 
-        state.push_packet(0, &packets[0]);
+        state.push_packet(0, rtp(0), &packets[0]);
         assert!(state.take_frame().is_some());
-        state.push_packet(2, &packets[2]);
+        state.push_packet(2, rtp(2), &packets[2]);
 
         assert_eq!(
             (
-                state.take_frame().map(|frame| frame.len()),
-                state.take_frame().map(|frame| frame.len())
+                state.take_frame().map(|frame| frame.samples.len()),
+                state.take_frame().map(|frame| frame.samples.len())
             ),
             (Some(FRAME_SAMPLES_20MS), Some(FRAME_SAMPLES_20MS)),
             "a lost packet still owes two frames without FEC"
@@ -896,13 +937,13 @@ mod tests {
         let packets = tone_packets(4, true);
         let mut state = audio_decode();
 
-        state.push_packet(0, &packets[0]);
+        state.push_packet(0, rtp(0), &packets[0]);
         // Packet 1 is overtaken by 2, so its frame is rebuilt here.
-        state.push_packet(2, &packets[2]);
+        state.push_packet(2, rtp(2), &packets[2]);
         let before_late = drain(&mut state);
-        state.push_packet(1, &packets[1]);
+        state.push_packet(1, rtp(1), &packets[1]);
         let late = drain(&mut state);
-        state.push_packet(3, &packets[3]);
+        state.push_packet(3, rtp(3), &packets[3]);
         let after_late = drain(&mut state);
 
         assert_eq!(late, 0, "a late packet must not repeat a frame");
@@ -918,9 +959,9 @@ mod tests {
         let packets = tone_packets(1, true);
         let mut state = audio_decode();
 
-        state.push_packet(7, &packets[0]);
+        state.push_packet(7, rtp(7), &packets[0]);
         let first = drain(&mut state);
-        state.push_packet(7, &packets[0]);
+        state.push_packet(7, rtp(7), &packets[0]);
         let second = drain(&mut state);
 
         assert_eq!((first, second), (1, 0));
@@ -931,10 +972,10 @@ mod tests {
         let packets = tone_packets(5, true);
         let mut state = audio_decode();
 
-        state.push_packet(0, &packets[0]);
+        state.push_packet(0, rtp(0), &packets[0]);
         assert!(state.take_frame().is_some());
         // Packets 1, 2 and 3 are lost.
-        state.push_packet(4, &packets[4]);
+        state.push_packet(4, rtp(4), &packets[4]);
 
         let mut frames = 0;
         while state.take_frame().is_some() {
@@ -948,9 +989,10 @@ mod tests {
         let packets = tone_packets(2, true);
         let mut state = audio_decode();
 
-        state.push_packet(0, &packets[0]);
+        state.push_packet(0, rtp(0), &packets[0]);
         assert!(state.take_frame().is_some());
-        state.push_packet(AUDIO_MAX_FILLED_PACKETS + 2, &packets[1]);
+        let far = AUDIO_MAX_FILLED_PACKETS + 2;
+        state.push_packet(far, rtp(far), &packets[1]);
 
         assert!(state.take_frame().is_some(), "the arriving packet decodes");
         assert!(
@@ -964,9 +1006,9 @@ mod tests {
         let packets = tone_packets(3, true);
         let mut state = audio_decode();
 
-        state.push_packet(9, &packets[0]);
+        state.push_packet(9, rtp(9), &packets[0]);
         assert_eq!(drain(&mut state), 1);
-        state.push_packet(4, &packets[1]);
+        state.push_packet(4, rtp(4), &packets[1]);
 
         assert_eq!(drain(&mut state), 0);
     }
@@ -975,7 +1017,7 @@ mod tests {
     fn a_corrupt_payload_queues_nothing() {
         let mut state = audio_decode();
 
-        state.push_packet(0, &[0xff; 4]);
+        state.push_packet(0, rtp(0), &[0xff; 4]);
 
         assert!(state.take_frame().is_none());
     }

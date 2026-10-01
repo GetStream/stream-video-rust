@@ -20,6 +20,11 @@ pub struct PcmFrame {
     pub sample_rate: u32,
     /// Channel count (1 = mono, 2 = stereo).
     pub channels: u16,
+    /// The RTP timestamp of the first sample, in units of 1/48000 s (the Opus
+    /// RTP clock), wrapping like RTP. Set on frames from
+    /// [`RemoteTrack::next_pcm`](crate::rtc::RemoteTrack::next_pcm); `None` on
+    /// frames that the application or a conversion builds.
+    pub pts: Option<u32>,
 }
 
 impl PcmFrame {
@@ -29,6 +34,7 @@ impl PcmFrame {
             samples,
             sample_rate,
             channels: channels.max(1),
+            pts: None,
         }
     }
 
