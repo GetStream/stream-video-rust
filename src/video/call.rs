@@ -841,7 +841,7 @@ impl Call {
     /// Mints a finite, call-CID-scoped user token internally from the server secret, runs the
     /// coordinator join, establishes the publisher/subscriber PeerConnections,
     /// and completes the SFU handshake. Illegal (typed error) if already
-    /// `JOINING`/`JOINED`. Observe participants via [`Call::subscribe`].
+    /// `JOINING`/`JOINED`. Observe participants via [`Call::sfu_events`].
     pub async fn join(&self, data: crate::rtc::JoinCallData) -> crate::rtc::RtcResult<()> {
         self.rtc().join(data).await
     }
@@ -865,24 +865,25 @@ impl Call {
         self.rtc.leave("user requested leave").await
     }
 
-    /// Subscribe to the typed SFU event stream (participant joined/left, tracks,
+    /// Subscribe to the events from the SFU (participant joined/left, tracks,
     /// errors). A receiver gets only events sent after it subscribes. Subscribe
     /// before [`Call::join`] to get the join events, or read [`Call::participants`].
-    pub fn subscribe(&self) -> tokio::sync::broadcast::Receiver<crate::rtc::CallEvent> {
-        self.rtc.subscribe()
+    pub fn sfu_events(&self) -> tokio::sync::broadcast::Receiver<crate::rtc::SfuCallEvent> {
+        self.rtc.sfu_events()
     }
 
-    /// Register a callback for typed call events.
-    pub fn on<F>(&self, callback: F) -> tokio::task::AbortHandle
-    where
-        F: Fn(crate::rtc::CallEvent) + Send + 'static,
-    {
-        self.rtc.on(callback)
+    /// Subscribe to the call-scoped coordinator events. A receiver gets only
+    /// events sent after it subscribes.
+    pub fn coordinator_events(
+        &self,
+    ) -> tokio::sync::broadcast::Receiver<crate::rtc::CoordinatorEvent> {
+        self.rtc.coordinator_events()
     }
 
-    /// Remove a callback registered with [`Call::on`].
-    pub fn off(&self, handler: &tokio::task::AbortHandle) {
-        self.rtc.off(handler);
+    /// Subscribe to the events that the SDK itself produces. See
+    /// [`RtcCore::client_events`](crate::rtc::RtcCore::client_events).
+    pub fn client_events(&self) -> tokio::sync::broadcast::Receiver<crate::rtc::ClientCallEvent> {
+        self.rtc.client_events()
     }
 
     /// The current calling state (`Idle` / `Joining` / `Joined` / …).

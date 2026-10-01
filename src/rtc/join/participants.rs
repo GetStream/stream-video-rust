@@ -163,15 +163,13 @@ impl RtcCore {
                 }
                 Some(_) => continue,
             };
-            let _ = self.events_tx.send(CallEvent::Sfu(event));
+            let _ = self.sfu_events_tx.send(event);
         }
         for (id, entry) in previous {
             if !is_local(&id) {
                 let _ = self
-                    .events_tx
-                    .send(CallEvent::Sfu(SfuCallEvent::ParticipantLeft(
-                        entry.participant,
-                    )));
+                    .sfu_events_tx
+                    .send(SfuCallEvent::ParticipantLeft(entry.participant));
             }
         }
         true

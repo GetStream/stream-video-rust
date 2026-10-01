@@ -397,7 +397,7 @@ async fn leave_tears_down_the_stored_connection() {
 }
 
 #[tokio::test]
-async fn call_ended_from_the_coordinator_is_reported_once_and_leaves_the_call() {
+async fn call_ended_from_the_coordinator_is_forwarded_and_leaves_the_call() {
     let (coordinator_ws_url, _coordinator) = fake_coordinator_sending(vec![
         json!({ "type": "call.ended", "call_cid": "default:test-call" }),
     ])
@@ -408,9 +408,8 @@ async fn call_ended_from_the_coordinator_is_reported_once_and_leaves_the_call() 
     });
     let generation = prepare_joined_core(&core, "alice");
     let (connection, sfu) = establish_fake(&core, generation).await;
-    let context = event_context(&core, &connection);
     *core.connection.lock().await = Some(connection);
-    let mut events = core.subscribe();
+    let mut events = core.coordinator_events();
     let token = core.current_user_token().expect("user token");
 
     core.connect_coordinator_events(generation, &token, "alice")
@@ -418,21 +417,15 @@ async fn call_ended_from_the_coordinator_is_reported_once_and_leaves_the_call() 
         .expect("coordinator events");
     tokio::time::timeout(Duration::from_secs(2), async {
         loop {
-            if let Ok(CallEvent::Client(ClientCallEvent::CallEnded { reason: None })) =
-                events.recv().await
+            if let Ok(event) = events.recv().await
+                && event.event_type == "call.ended"
             {
                 return;
             }
         }
     })
     .await
-    .expect("call ended event");
-    connection::handle_event(
-        &context,
-        sfu_event::EventPayload::CallEnded(event::CallEnded::default()),
-    )
-    .await
-    .expect("handle SFU call ended");
+    .expect("call.ended event");
 
     wait_for(
         Duration::from_secs(2),
@@ -440,13 +433,6 @@ async fn call_ended_from_the_coordinator_is_reported_once_and_leaves_the_call() 
         "the ended call is left",
     )
     .await;
-    let mut repeated = 0;
-    while let Ok(event) = events.try_recv() {
-        if matches!(event, CallEvent::Client(ClientCallEvent::CallEnded { .. })) {
-            repeated += 1;
-        }
-    }
-    assert_eq!(repeated, 0, "call ended is reported once");
     let requests = requests_until_close(sfu).await;
     assert!(requests.iter().any(|request| matches!(
         request.request_payload,
@@ -455,13 +441,13 @@ async fn call_ended_from_the_coordinator_is_reported_once_and_leaves_the_call() 
 }
 
 #[tokio::test]
-async fn call_ended_twice_before_the_leave_is_reported_once() {
+async fn sfu_call_ended_is_forwarded_with_its_reason_and_leaves_once() {
     let core = test_core();
     let generation = prepare_joined_core(&core, "alice");
-    let (connection, _sfu) = establish_fake(&core, generation).await;
+    let (connection, sfu) = establish_fake(&core, generation).await;
     let context = event_context(&core, &connection);
     *core.connection.lock().await = Some(connection);
-    let mut events = core.subscribe();
+    let mut events = core.sfu_events();
 
     // Neither call yields, so the spawned leave cannot run between them.
     for _ in 0..2 {
@@ -481,18 +467,60 @@ async fn call_ended_twice_before_the_leave_is_reported_once() {
         "the ended call is left",
     )
     .await;
-    let mut reported = 0;
+    let mut forwarded = 0;
     while let Ok(event) = events.try_recv() {
         if matches!(
             event,
-            CallEvent::Client(ClientCallEvent::CallEnded {
-                reason: Some(models::CallEndedReason::Kicked)
-            })
+            SfuCallEvent::CallEnded {
+                reason: models::CallEndedReason::Kicked
+            }
         ) {
-            reported += 1;
+            forwarded += 1;
         }
     }
-    assert_eq!(reported, 1);
+    assert_eq!(forwarded, 2, "each SFU call_ended is forwarded");
+    let leaves = requests_until_close(sfu)
+        .await
+        .into_iter()
+        .filter(|request| {
+            matches!(
+                request.request_payload,
+                Some(event::sfu_request::RequestPayload::LeaveCallRequest(_))
+            )
+        })
+        .count();
+    assert_eq!(leaves, 1, "the call is left once");
+}
+
+#[tokio::test]
+async fn each_event_goes_only_to_the_stream_of_its_source() {
+    let core = test_core();
+    let generation = prepare_joined_core(&core, "alice");
+    let (connection, _sfu) = establish_fake(&core, generation).await;
+    let context = event_context(&core, &connection);
+    *core.connection.lock().await = Some(connection);
+    let mut sfu = core.sfu_events();
+    let mut client = core.client_events();
+    let mut coordinator = core.coordinator_events();
+
+    connection::handle_event(
+        &context,
+        sfu_event::EventPayload::PinsUpdated(event::PinsChanged::default()),
+    )
+    .await
+    .expect("handle pins");
+    assert!(core.set_state_if_current(generation, CallingState::Reconnecting));
+
+    assert!(matches!(sfu.try_recv(), Ok(SfuCallEvent::PinsUpdated(_))));
+    assert!(sfu.try_recv().is_err());
+    assert!(matches!(
+        client.try_recv(),
+        Ok(ClientCallEvent::CallingStateChanged(
+            CallingState::Reconnecting
+        ))
+    ));
+    assert!(client.try_recv().is_err());
+    assert!(coordinator.try_recv().is_err());
 }
 
 #[tokio::test]
@@ -502,7 +530,7 @@ async fn track_events_report_the_track_type_cause_and_participant() {
     let (connection, _sfu) = establish_fake(&core, generation).await;
     let context = event_context(&core, &connection);
     *core.connection.lock().await = Some(connection);
-    let mut events = core.subscribe();
+    let mut events = core.sfu_events();
     let bob = models::Participant {
         user_id: "bob".to_owned(),
         session_id: "bob-session".to_owned(),
@@ -521,11 +549,11 @@ async fn track_events_report_the_track_type_cause_and_participant() {
     .await
     .expect("handle track published");
 
-    let Ok(CallEvent::Sfu(SfuCallEvent::TrackPublished {
+    let Ok(SfuCallEvent::TrackPublished {
         track_type,
         participant,
         ..
-    })) = events.try_recv()
+    }) = events.try_recv()
     else {
         panic!("expected a track published event");
     };
@@ -545,12 +573,12 @@ async fn track_events_report_the_track_type_cause_and_participant() {
     .await
     .expect("handle track unpublished");
 
-    let Ok(CallEvent::Sfu(SfuCallEvent::TrackUnpublished {
+    let Ok(SfuCallEvent::TrackUnpublished {
         track_type,
         cause,
         participant,
         ..
-    })) = events.try_recv()
+    }) = events.try_recv()
     else {
         panic!("expected a track unpublished event");
     };
@@ -566,7 +594,7 @@ async fn participant_count_event_is_sent_only_when_the_count_changes() {
     let (connection, _sfu) = establish_fake(&core, generation).await;
     let context = event_context(&core, &connection);
     *core.connection.lock().await = Some(connection);
-    let mut events = core.subscribe();
+    let mut events = core.sfu_events();
 
     for total in [2, 2, 3] {
         connection::handle_event(
@@ -584,7 +612,7 @@ async fn participant_count_event_is_sent_only_when_the_count_changes() {
 
     let mut totals = Vec::new();
     while let Ok(event) = events.try_recv() {
-        if let CallEvent::Sfu(SfuCallEvent::ParticipantCountChanged(count)) = event {
+        if let SfuCallEvent::ParticipantCountChanged(count) = event {
             totals.push(count.total);
         }
     }
@@ -1123,7 +1151,7 @@ async fn leave_cancels_reconnect_task_before_next_generation() {
 fn state_events_arrive_in_the_order_of_the_state_changes() {
     let core = test_core();
     let generation = core.begin_join().expect("join generation");
-    let mut events = core.subscribe();
+    let mut events = core.client_events();
     let rounds = 20_000;
     let barrier = Arc::new(std::sync::Barrier::new(3));
     let workers = [CallingState::Joined, CallingState::Reconnecting].map(|state| {
@@ -1142,10 +1170,8 @@ fn state_events_arrive_in_the_order_of_the_state_changes() {
         barrier.wait();
         barrier.wait();
         let mut last = None;
-        while let Ok(event) = events.try_recv() {
-            if let CallEvent::Client(ClientCallEvent::CallingStateChanged(state)) = event {
-                last = Some(state);
-            }
+        while let Ok(ClientCallEvent::CallingStateChanged(state)) = events.try_recv() {
+            last = Some(state);
         }
         assert_eq!(last, Some(core.state()), "round {round}");
     }
@@ -1158,16 +1184,16 @@ fn state_events_arrive_in_the_order_of_the_state_changes() {
 fn setting_the_same_state_again_sends_no_event() {
     let core = test_core();
     let generation = core.begin_join().expect("join generation");
-    let mut events = core.subscribe();
+    let mut events = core.client_events();
 
     assert!(core.set_state_if_current(generation, CallingState::Reconnecting));
     assert!(core.set_state_if_current(generation, CallingState::Reconnecting));
 
     assert!(matches!(
         events.try_recv(),
-        Ok(CallEvent::Client(ClientCallEvent::CallingStateChanged(
+        Ok(ClientCallEvent::CallingStateChanged(
             CallingState::Reconnecting
-        )))
+        ))
     ));
     assert!(events.try_recv().is_err());
 }
@@ -1175,22 +1201,20 @@ fn setting_the_same_state_again_sends_no_event() {
 #[test]
 fn join_start_sends_joining() {
     let core = test_core();
-    let mut events = core.subscribe();
+    let mut events = core.client_events();
 
     core.begin_join().expect("join generation");
 
     assert!(matches!(
         events.try_recv(),
-        Ok(CallEvent::Client(ClientCallEvent::CallingStateChanged(
-            CallingState::Joining
-        )))
+        Ok(ClientCallEvent::CallingStateChanged(CallingState::Joining))
     ));
 }
 
 #[tokio::test]
 async fn state_during_leave_matches_the_last_state_event() {
     let core = test_core();
-    let mut events = core.subscribe();
+    let mut events = core.client_events();
     core.begin_join().expect("join generation");
     let connection_slot = core.connection.lock().await;
     let generation = core.generation();
@@ -1204,10 +1228,8 @@ async fn state_during_leave_matches_the_last_state_event() {
     .await;
 
     let mut last = None;
-    while let Ok(event) = events.try_recv() {
-        if let CallEvent::Client(ClientCallEvent::CallingStateChanged(state)) = event {
-            last = Some(state);
-        }
+    while let Ok(ClientCallEvent::CallingStateChanged(state)) = events.try_recv() {
+        last = Some(state);
     }
     assert_eq!(last, Some(core.state()));
     drop(connection_slot);
@@ -1768,35 +1790,28 @@ fn every_call_event_has_its_stable_name() {
             SfuCallEvent::Error(SfuJoinError::from_event(None, 0)),
             "error",
         ),
-    ]
-    .map(|(event, name)| (CallEvent::Sfu(event), name));
-    let client = [
-        (ClientCallEvent::CallEnded { reason: None }, "call_ended"),
         (
-            ClientCallEvent::CallingStateChanged(CallingState::Joined),
-            "calling_state_changed",
+            SfuCallEvent::CallEnded {
+                reason: models::CallEndedReason::Ended,
+            },
+            "call_ended",
         ),
-    ]
-    .map(|(event, name)| (CallEvent::Client(event), name));
-    let coordinator = (
-        CallEvent::Coordinator(CoordinatorEvent {
-            event_type: "call.created".to_owned(),
-            raw: json!({ "type": "call.created" }),
-        }),
-        "call.created",
-    );
-    let events = sfu.into_iter().chain(client).chain([coordinator]);
+    ];
 
-    for (event, name) in events {
+    for (event, name) in sfu {
         assert_eq!(event.name(), name, "{event:?}");
     }
+    assert_eq!(
+        ClientCallEvent::CallingStateChanged(CallingState::Joined).name(),
+        "calling_state_changed"
+    );
 }
 
 #[test]
 fn join_state_reports_only_the_participant_changes_since_the_last_join() {
     let core = test_core();
     let generation = core.begin_join().expect("join generation");
-    let mut events = core.subscribe();
+    let mut events = core.sfu_events();
     let participant = |user_id: &str, session_id: &str| models::Participant {
         user_id: user_id.to_owned(),
         session_id: session_id.to_owned(),
@@ -1838,15 +1853,9 @@ fn join_state_reports_only_the_participant_changes_since_the_last_join() {
     let mut reported = Vec::new();
     while let Ok(event) = events.try_recv() {
         match event {
-            CallEvent::Sfu(SfuCallEvent::ParticipantJoined(p)) => {
-                reported.push(("joined", p.session_id));
-            }
-            CallEvent::Sfu(SfuCallEvent::ParticipantUpdated(p)) => {
-                reported.push(("updated", p.session_id));
-            }
-            CallEvent::Sfu(SfuCallEvent::ParticipantLeft(p)) => {
-                reported.push(("left", p.session_id));
-            }
+            SfuCallEvent::ParticipantJoined(p) => reported.push(("joined", p.session_id)),
+            SfuCallEvent::ParticipantUpdated(p) => reported.push(("updated", p.session_id)),
+            SfuCallEvent::ParticipantLeft(p) => reported.push(("left", p.session_id)),
             _ => {}
         }
     }
