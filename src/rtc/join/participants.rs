@@ -157,19 +157,21 @@ impl RtcCore {
                 continue;
             }
             let event = match known {
-                None => CallEvent::ParticipantJoined(participant),
+                None => SfuCallEvent::ParticipantJoined(participant),
                 Some(entry) if entry.participant != participant => {
-                    CallEvent::ParticipantUpdated(participant)
+                    SfuCallEvent::ParticipantUpdated(participant)
                 }
                 Some(_) => continue,
             };
-            let _ = self.events_tx.send(event);
+            let _ = self.events_tx.send(CallEvent::Sfu(event));
         }
         for (id, entry) in previous {
             if !is_local(&id) {
                 let _ = self
                     .events_tx
-                    .send(CallEvent::ParticipantLeft(entry.participant));
+                    .send(CallEvent::Sfu(SfuCallEvent::ParticipantLeft(
+                        entry.participant,
+                    )));
             }
         }
         true

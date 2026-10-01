@@ -21,9 +21,9 @@ use getstream::models::UserRequest;
 use getstream::models::{CallRequest, DeleteCallRequest, GetOrCreateCallRequest, MemberRequest};
 use getstream::rtc::proto::models::TrackType;
 use getstream::rtc::{
-    CallEvent, CallingState, ClientPublishOptions, JoinCallData, LocalAudioTrack, LocalTrack,
-    LocalVideoTrack, PcmFrame, PreferredVideoCodec, RemoteTrack, RtcError, SubscriptionConfig,
-    VideoFrame,
+    CallEvent, CallingState, ClientCallEvent, ClientPublishOptions, JoinCallData, LocalAudioTrack,
+    LocalTrack, LocalVideoTrack, PcmFrame, PreferredVideoCodec, RemoteTrack, RtcError,
+    SfuCallEvent, SubscriptionConfig, VideoFrame,
 };
 use getstream::video::Call;
 use tokio::sync::mpsc::{Receiver, channel};
@@ -387,9 +387,9 @@ async fn await_track_event(
         tokio::select! {
             () = &mut deadline => return false,
             recv = events.recv() => match recv {
-                Ok(CallEvent::TrackPublished { user_id, track_type: tt, .. })
+                Ok(CallEvent::Sfu(SfuCallEvent::TrackPublished { user_id, track_type: tt, .. }))
                     if published && user_id == user && tt == track_type => return true,
-                Ok(CallEvent::TrackUnpublished { user_id, track_type: tt, .. })
+                Ok(CallEvent::Sfu(SfuCallEvent::TrackUnpublished { user_id, track_type: tt, .. }))
                     if !published && user_id == user && tt == track_type => return true,
                 Ok(_) | Err(RecvError::Lagged(_)) => {}
                 Err(RecvError::Closed) => return false,
@@ -1232,7 +1232,7 @@ async fn await_speaking(
         tokio::select! {
             () = &mut deadline => return (level_seen, dominant_seen),
             received = events.recv() => match received {
-                Ok(CallEvent::AudioLevelChanged(levels)) => {
+                Ok(CallEvent::Sfu(SfuCallEvent::AudioLevelChanged(levels))) => {
                     if levels
                         .iter()
                         .any(|l| l.session_id == session && l.is_speaking)
@@ -1240,7 +1240,7 @@ async fn await_speaking(
                         level_seen = true;
                     }
                 }
-                Ok(CallEvent::DominantSpeakerChanged { session_id, .. }) => {
+                Ok(CallEvent::Sfu(SfuCallEvent::DominantSpeakerChanged { session_id, .. })) => {
                     if session_id == session {
                         dominant_seen = true;
                     }
@@ -1466,9 +1466,9 @@ async fn sole_audio_can_be_stopped_and_published_again() {
         while let Ok(event) = events_a.try_recv() {
             reconnected |= matches!(
                 event,
-                CallEvent::CallingStateChanged(
+                CallEvent::Client(ClientCallEvent::CallingStateChanged(
                     CallingState::Reconnecting | CallingState::Migrating
-                )
+                ))
             );
         }
         assert!(!reconnected, "A reconnected after the second publish");

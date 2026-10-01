@@ -13,7 +13,9 @@ use std::time::Duration;
 use getstream::TokenOptions;
 use getstream::models::UserRequest;
 use getstream::models::{CallRequest, DeleteCallRequest, GetOrCreateCallRequest, MemberRequest};
-use getstream::rtc::{CallEvent, CallingState, JoinCallData, RtcClient};
+use getstream::rtc::{
+    CallEvent, CallingState, ClientCallEvent, JoinCallData, RtcClient, SfuCallEvent,
+};
 use tokio::sync::broadcast::Receiver;
 
 /// Wait (up to `timeout`) for a `ParticipantJoined` whose `user_id` matches
@@ -29,7 +31,9 @@ async fn observe_participant(
         tokio::select! {
             () = &mut deadline => return false,
             event = rx.recv() => match event {
-                Ok(CallEvent::ParticipantJoined(p)) if p.user_id == other => return true,
+                Ok(CallEvent::Sfu(SfuCallEvent::ParticipantJoined(p))) if p.user_id == other => {
+                    return true;
+                }
                 Ok(_) => continue,
                 // Lagged: keep waiting; the join event may still arrive.
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
@@ -243,7 +247,7 @@ async fn preminted_token_client_gets_join_events_and_signature_is_enforced() {
             .map_err(|error| format!("valid token failed to join: {error}"))?;
         let mut states = Vec::new();
         while let Ok(event) = events.try_recv() {
-            if let CallEvent::CallingStateChanged(state) = event {
+            if let CallEvent::Client(ClientCallEvent::CallingStateChanged(state)) = event {
                 states.push(state);
             }
         }
