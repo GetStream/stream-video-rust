@@ -8,7 +8,8 @@
 //!   backoff, unrecoverable abort, and SFU switching via `migrating_from`;
 //! - the SFU WebSocket handshake (`JoinRequest` → `JoinResponse`), subscriber
 //!   answer negotiation, and ICE trickle;
-//! - a typed [`CallEvent`] broadcast stream (participant joined/left, tracks, …);
+//! - typed broadcast streams by source: [`SfuCallEvent`], coordinator events,
+//!   and [`ClientCallEvent`];
 //! - the reconnect state machine (`RtcCore::run_reconnect`) driven by the pure
 //!   decision logic in [`super::reconnect`], with dedup, the rejoin rate limiter,
 //!   the ICE / negotiation limits, the disconnection timeout, and the
@@ -176,24 +177,7 @@ pub enum CallingState {
     Left,
 }
 
-/// An event delivered on the [`Call`](crate::Call) event stream, grouped by its
-/// source.
-#[derive(Debug, Clone)]
-#[non_exhaustive]
-// `Sfu` carries `Participant` data (about 304 bytes), and the other variants are
-// small. A `Box` would allocate for every SFU event and prevent nested
-// `CallEvent::Sfu(SfuCallEvent::..)` patterns.
-#[allow(clippy::large_enum_variant)]
-pub enum CallEvent {
-    /// An event from the SFU.
-    Sfu(SfuCallEvent),
-    /// A call-scoped coordinator WebSocket event.
-    Coordinator(CoordinatorEvent),
-    /// An event that the SDK itself produces.
-    Client(ClientCallEvent),
-}
-
-/// An event from the SFU.
+/// An event from the SFU, delivered by [`RtcCore::sfu_events`].
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub enum SfuCallEvent {
@@ -263,18 +247,18 @@ pub enum SfuCallEvent {
     IceRestarted(PeerType),
     /// The SFU reported an error for this participant.
     Error(SfuJoinError),
+    /// The SFU ended the call. The SDK then leaves the call.
+    CallEnded {
+        /// Why the call ended.
+        reason: models::CallEndedReason,
+    },
 }
 
-/// An event that the SDK itself produces.
+/// An event that the SDK itself produces, delivered by
+/// [`RtcCore::client_events`].
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub enum ClientCallEvent {
-    /// The call ended: the SFU or the coordinator (`call.ended`) reported it.
-    /// Sent once, after which the SDK leaves the call.
-    CallEnded {
-        /// The SFU reason, or `None` when the coordinator reported the end first.
-        reason: Option<models::CallEndedReason>,
-    },
     /// The connection state changed.
     CallingStateChanged(CallingState),
 }
@@ -312,12 +296,10 @@ struct Lifecycle {
 impl Lifecycle {
     /// Call with the lifecycle lock held, so events arrive in the order of the
     /// state changes.
-    fn set_state(&mut self, next: CallingState, events: &broadcast::Sender<CallEvent>) {
+    fn set_state(&mut self, next: CallingState, events: &broadcast::Sender<ClientCallEvent>) {
         if self.state != next {
             self.state = next;
-            let _ = events.send(CallEvent::Client(ClientCallEvent::CallingStateChanged(
-                next,
-            )));
+            let _ = events.send(ClientCallEvent::CallingStateChanged(next));
         }
     }
 }
@@ -523,7 +505,9 @@ pub struct RtcCore {
     api_key: String,
     call_type: String,
     call_id: String,
-    events_tx: broadcast::Sender<CallEvent>,
+    sfu_events_tx: broadcast::Sender<SfuCallEvent>,
+    coordinator_events_tx: broadcast::Sender<CoordinatorEvent>,
+    client_events_tx: broadcast::Sender<ClientCallEvent>,
     lifecycle: StdMutex<Lifecycle>,
     lifecycle_changed: Notify,
     connection: TokioMutex<Option<Connection>>,
@@ -584,7 +568,6 @@ impl Drop for ReconnectClaim {
 impl RtcCore {
     /// Build a fresh (idle) core for a call handle.
     pub(crate) fn new(client: Arc<Client>, call_type: String, call_id: String) -> Arc<Self> {
-        let (events_tx, _rx) = broadcast::channel(256);
         Arc::new(Self {
             api_key: client.api_key().to_owned(),
             client,
@@ -593,7 +576,9 @@ impl RtcCore {
             token_refresh: TokioMutex::new(()),
             call_type,
             call_id,
-            events_tx,
+            sfu_events_tx: broadcast::channel(256).0,
+            coordinator_events_tx: broadcast::channel(256).0,
+            client_events_tx: broadcast::channel(256).0,
             lifecycle: StdMutex::new(Lifecycle {
                 state: CallingState::Idle,
                 generation: 0,
@@ -706,7 +691,7 @@ impl RtcCore {
         if guard.generation != generation {
             return false;
         }
-        guard.set_state(next, &self.events_tx);
+        guard.set_state(next, &self.client_events_tx);
         true
     }
 
@@ -765,7 +750,7 @@ impl RtcCore {
             match guard.state {
                 CallingState::Idle | CallingState::Left => {
                     guard.generation = guard.generation.wrapping_add(1);
-                    guard.set_state(CallingState::Joining, &self.events_tx);
+                    guard.set_state(CallingState::Joining, &self.client_events_tx);
                     guard.generation_publish_options = guard.publish_options;
                     guard.failure_limits = FailureLimits::default();
                     guard.rate_limiter = SlidingWindowRateLimiter::rejoin_default();
@@ -914,9 +899,26 @@ impl RtcCore {
         Ok(())
     }
 
-    /// Subscribe to the typed event stream.
-    pub fn subscribe(&self) -> broadcast::Receiver<CallEvent> {
-        self.events_tx.subscribe()
+    /// Subscribe to the events from the SFU. A receiver gets only events sent
+    /// after it subscribes; subscribe before the join to get the join events.
+    pub fn sfu_events(&self) -> broadcast::Receiver<SfuCallEvent> {
+        self.sfu_events_tx.subscribe()
+    }
+
+    /// Subscribe to the call-scoped coordinator events. A receiver gets only
+    /// events sent after it subscribes.
+    pub fn coordinator_events(&self) -> broadcast::Receiver<CoordinatorEvent> {
+        self.coordinator_events_tx.subscribe()
+    }
+
+    /// Subscribe to the events that the SDK itself produces. A receiver gets
+    /// only events sent after it subscribes.
+    ///
+    /// `CallingStateChanged(Left)` is the reliable end of the call: the SDK
+    /// leaves on the SFU `call_ended` or the coordinator `call.ended`, and the
+    /// other one may then not arrive.
+    pub fn client_events(&self) -> broadcast::Receiver<ClientCallEvent> {
+        self.client_events_tx.subscribe()
     }
 
     fn user_request_query(&self) -> Option<Vec<(String, String)>> {
@@ -951,34 +953,6 @@ impl RtcCore {
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         (!token.is_empty()).then(|| (token.clone(), query))
-    }
-
-    /// Register a callback for typed call events.
-    ///
-    /// Rust callers receive the full [`CallEvent`] enum and can pattern-match
-    /// the variants they need. Pass the returned handle to [`Self::off`].
-    pub fn on<F>(&self, callback: F) -> tokio::task::AbortHandle
-    where
-        F: Fn(CallEvent) + Send + 'static,
-    {
-        let mut events = self.subscribe();
-        tokio::spawn(async move {
-            loop {
-                match events.recv().await {
-                    Ok(event) => callback(event),
-                    Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                        tracing::warn!(skipped, "stream.rtc.event_handler_lagged");
-                    }
-                    Err(broadcast::error::RecvError::Closed) => break,
-                }
-            }
-        })
-        .abort_handle()
-    }
-
-    /// Remove an event callback registered with [`Self::on`].
-    pub fn off(&self, handler: &tokio::task::AbortHandle) {
-        handler.abort();
     }
 
     /// The cached stats options from the last coordinator join.

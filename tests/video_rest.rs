@@ -13,7 +13,7 @@ use getstream::models::{
     StartClosedCaptionsRequest, StartFrameRecordingRequest, StopClosedCaptionsRequest,
     UpdateCallMembersRequest, UserRequest,
 };
-use getstream::rtc::{CallEvent, JoinCallData, LocalAudioTrack, LocalTrack, RtcError};
+use getstream::rtc::{CoordinatorEvent, JoinCallData, LocalAudioTrack, LocalTrack, RtcError};
 use std::time::Duration;
 
 /// End-to-end call lifecycle: create → get → update members → query → end → delete.
@@ -192,7 +192,7 @@ async fn audio_room_send_audio_permission_controls_publishing() {
         .expect("take permission test audio room live");
     let participant = client.video().call("audio_room", &call_id);
     let outcome: Result<(), String> = tokio::time::timeout(Duration::from_secs(120), async {
-        let mut events = participant.subscribe();
+        let mut events = participant.coordinator_events();
         participant
             .join(JoinCallData::new(&publisher_id))
             .await
@@ -247,7 +247,7 @@ async fn audio_room_send_audio_permission_controls_publishing() {
 }
 
 async fn wait_for_audio_permission(
-    events: &mut tokio::sync::broadcast::Receiver<CallEvent>,
+    events: &mut tokio::sync::broadcast::Receiver<CoordinatorEvent>,
     expected: bool,
 ) -> Result<(), String> {
     let mut last_update = None;
@@ -257,9 +257,6 @@ async fn wait_for_audio_permission(
                 .recv()
                 .await
                 .map_err(|error| format!("permission event stream closed: {error}"))?;
-            let CallEvent::Coordinator(event) = event else {
-                continue;
-            };
             if event.event_type != "call.permissions_updated" {
                 continue;
             }
@@ -332,10 +329,7 @@ async fn scoped_participant_service_lifecycle() {
             .await
             .map_err(|error| format!("enable incoming video failed: {error}"))?;
 
-        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
-        let handler = call.on(move |event| {
-            let _ = event_tx.send(event);
-        });
+        let mut events = call.coordinator_events();
         let mut custom = getstream::models::CustomData::new();
         custom.insert("source".to_owned(), serde_json::json!("rust-live-test"));
         server_call
@@ -347,9 +341,8 @@ async fn scoped_participant_service_lifecycle() {
             .await
             .map_err(|error| format!("send_custom_event failed: {error}"))?;
         let custom_event = tokio::time::timeout(Duration::from_secs(10), async {
-            while let Some(event) = event_rx.recv().await {
-                if let getstream::rtc::CallEvent::Coordinator(event) = event
-                    && event.event_type == "custom"
+            while let Ok(event) = events.recv().await {
+                if event.event_type == "custom"
                     && event
                         .raw
                         .pointer("/custom/source")
@@ -359,7 +352,7 @@ async fn scoped_participant_service_lifecycle() {
                     return Ok(());
                 }
             }
-            Err("call event handler closed before receiving custom event".to_owned())
+            Err("coordinator event stream ended before the custom event".to_owned())
         })
         .await
         .map_err(|_| "timed out waiting for custom coordinator event".to_owned())
@@ -382,9 +375,8 @@ async fn scoped_participant_service_lifecycle() {
                 .await
                 .map_err(|error| format!("send_closed_caption failed: {error}"))?;
             tokio::time::timeout(Duration::from_secs(10), async {
-                while let Some(event) = event_rx.recv().await {
-                    if let getstream::rtc::CallEvent::Coordinator(event) = event
-                        && event.event_type == "call.closed_caption"
+                while let Ok(event) = events.recv().await {
+                    if event.event_type == "call.closed_caption"
                         && event
                             .raw
                             .pointer("/closed_caption/text")
@@ -394,14 +386,13 @@ async fn scoped_participant_service_lifecycle() {
                         return Ok(());
                     }
                 }
-                Err("call event handler closed before receiving closed caption".to_owned())
+                Err("coordinator event stream ended before the closed caption".to_owned())
             })
             .await
             .map_err(|_| "timed out waiting for closed caption event".to_owned())
             .and_then(|result| result)
         }
         .await;
-        call.off(&handler);
         caption_result?;
 
         call.send_reaction(SendVideoReactionRequest {

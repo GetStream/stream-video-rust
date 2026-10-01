@@ -21,9 +21,9 @@ use getstream::models::UserRequest;
 use getstream::models::{CallRequest, DeleteCallRequest, GetOrCreateCallRequest, MemberRequest};
 use getstream::rtc::proto::models::TrackType;
 use getstream::rtc::{
-    CallEvent, CallingState, ClientCallEvent, ClientPublishOptions, JoinCallData, LocalAudioTrack,
-    LocalTrack, LocalVideoTrack, PcmFrame, PreferredVideoCodec, RemoteTrack, RtcError,
-    SfuCallEvent, SubscriptionConfig, VideoFrame,
+    CallingState, ClientCallEvent, ClientPublishOptions, JoinCallData, LocalAudioTrack, LocalTrack,
+    LocalVideoTrack, PcmFrame, PreferredVideoCodec, RemoteTrack, RtcError, SfuCallEvent,
+    SubscriptionConfig, VideoFrame,
 };
 use getstream::video::Call;
 use tokio::sync::mpsc::{Receiver, channel};
@@ -374,7 +374,7 @@ async fn drain_rms(remote: &RemoteTrack, target: usize, overall: Duration) -> f6
 /// `TrackUnpublished` (`published == false`) event for `user`/`track_type`,
 /// draining unrelated events. Returns whether the event was observed.
 async fn await_track_event(
-    events: &mut tokio::sync::broadcast::Receiver<CallEvent>,
+    events: &mut tokio::sync::broadcast::Receiver<SfuCallEvent>,
     user: &str,
     track_type: TrackType,
     published: bool,
@@ -387,9 +387,9 @@ async fn await_track_event(
         tokio::select! {
             () = &mut deadline => return false,
             recv = events.recv() => match recv {
-                Ok(CallEvent::Sfu(SfuCallEvent::TrackPublished { user_id, track_type: tt, .. }))
+                Ok(SfuCallEvent::TrackPublished { user_id, track_type: tt, .. })
                     if published && user_id == user && tt == track_type => return true,
-                Ok(CallEvent::Sfu(SfuCallEvent::TrackUnpublished { user_id, track_type: tt, .. }))
+                Ok(SfuCallEvent::TrackUnpublished { user_id, track_type: tt, .. })
                     if !published && user_id == user && tt == track_type => return true,
                 Ok(_) | Err(RecvError::Lagged(_)) => {}
                 Err(RecvError::Closed) => return false,
@@ -1218,7 +1218,7 @@ async fn publish_h264_video_b_decodes_i420_frame() {
 /// Await both an `AudioLevelChanged` naming `session` as speaking and a
 /// `DominantSpeakerChanged` naming it, within `timeout`.
 async fn await_speaking(
-    events: &mut tokio::sync::broadcast::Receiver<CallEvent>,
+    events: &mut tokio::sync::broadcast::Receiver<SfuCallEvent>,
     session: &str,
     timeout: Duration,
 ) -> (bool, bool) {
@@ -1232,7 +1232,7 @@ async fn await_speaking(
         tokio::select! {
             () = &mut deadline => return (level_seen, dominant_seen),
             received = events.recv() => match received {
-                Ok(CallEvent::Sfu(SfuCallEvent::AudioLevelChanged(levels))) => {
+                Ok(SfuCallEvent::AudioLevelChanged(levels)) => {
                     if levels
                         .iter()
                         .any(|l| l.session_id == session && l.is_speaking)
@@ -1240,7 +1240,7 @@ async fn await_speaking(
                         level_seen = true;
                     }
                 }
-                Ok(CallEvent::Sfu(SfuCallEvent::DominantSpeakerChanged { session_id, .. })) => {
+                Ok(SfuCallEvent::DominantSpeakerChanged { session_id, .. }) => {
                     if session_id == session {
                         dominant_seen = true;
                     }
@@ -1281,7 +1281,7 @@ async fn loud_publisher_is_reported_speaking_and_dominant() {
         // Join and subscribe before any participant publishes audio. A speaker
         // selected before B joins is present in JoinResponse, and the SFU does
         // not replay the earlier DominantSpeakerChanged event to B.
-        let mut events_b = call_b.subscribe();
+        let mut events_b = call_b.sfu_events();
         call_b
             .join(JoinCallData::new(&user_b))
             .await
@@ -1379,13 +1379,13 @@ async fn sole_audio_can_be_stopped_and_published_again() {
             .update_subscriptions(SubscriptionConfig::audio_all())
             .await
             .expect("B update_subscriptions");
-        let mut events_b = call_b.subscribe();
+        let mut events_b = call_b.sfu_events();
 
         call_a
             .join(JoinCallData::new(&user_a))
             .await
             .expect("A join");
-        let mut events_a = call_a.subscribe();
+        let mut events_a = call_a.client_events();
         let audio_a = LocalAudioTrack::opus().expect("opus track");
         call_a
             .publish_audio(audio_a.clone())
@@ -1466,9 +1466,9 @@ async fn sole_audio_can_be_stopped_and_published_again() {
         while let Ok(event) = events_a.try_recv() {
             reconnected |= matches!(
                 event,
-                CallEvent::Client(ClientCallEvent::CallingStateChanged(
+                ClientCallEvent::CallingStateChanged(
                     CallingState::Reconnecting | CallingState::Migrating
-                ))
+                )
             );
         }
         assert!(!reconnected, "A reconnected after the second publish");

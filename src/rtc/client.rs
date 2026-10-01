@@ -14,8 +14,11 @@ use crate::client::{Client, ClientConfig, NetworkLimits};
 use crate::error::Result as CrateResult;
 use crate::token::{self, TokenOptions};
 
+use super::coordinator::ws::CoordinatorEvent;
 use super::error::{Result, RtcError};
-use super::join::{CallEvent, CallStateSnapshot, CallingState, JoinCallData, RtcCore};
+use super::join::{
+    CallStateSnapshot, CallingState, ClientCallEvent, JoinCallData, RtcCore, SfuCallEvent,
+};
 use super::proto::models::TrackType;
 use super::publish_options::ClientPublishOptions;
 use super::subscriptions::{SubscriptionConfig, SubscriptionTarget};
@@ -278,24 +281,23 @@ impl RtcCall {
         self.core.update_publish_options(options);
     }
 
-    /// Subscribe to the typed SFU event stream. A receiver gets only events sent
+    /// Subscribe to the events from the SFU. A receiver gets only events sent
     /// after it subscribes. Subscribe before [`Self::join`] to get the join
     /// events, or read [`Self::participants`] and [`Self::call_state`].
-    pub fn subscribe(&self) -> tokio::sync::broadcast::Receiver<CallEvent> {
-        self.core.subscribe()
+    pub fn sfu_events(&self) -> tokio::sync::broadcast::Receiver<SfuCallEvent> {
+        self.core.sfu_events()
     }
 
-    /// Register a callback for typed call events.
-    pub fn on<F>(&self, callback: F) -> tokio::task::AbortHandle
-    where
-        F: Fn(CallEvent) + Send + 'static,
-    {
-        self.core.on(callback)
+    /// Subscribe to the call-scoped coordinator events. A receiver gets only
+    /// events sent after it subscribes.
+    pub fn coordinator_events(&self) -> tokio::sync::broadcast::Receiver<CoordinatorEvent> {
+        self.core.coordinator_events()
     }
 
-    /// Remove a callback registered with [`Self::on`].
-    pub fn off(&self, handler: &tokio::task::AbortHandle) {
-        self.core.off(handler);
+    /// Subscribe to the events that the SDK itself produces. See
+    /// [`RtcCore::client_events`].
+    pub fn client_events(&self) -> tokio::sync::broadcast::Receiver<ClientCallEvent> {
+        self.core.client_events()
     }
 
     /// The current calling state.
