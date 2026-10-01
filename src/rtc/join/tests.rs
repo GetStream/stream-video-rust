@@ -523,6 +523,28 @@ async fn each_event_goes_only_to_the_stream_of_its_source() {
     assert!(coordinator.try_recv().is_err());
 }
 
+#[test]
+fn a_call_event_stream_keeps_the_configured_number_of_events() {
+    let core = test_core_with_config(ClientConfig {
+        call_event_capacity: 2,
+        ..ClientConfig::default()
+    });
+    let generation = core.begin_join().expect("test generation");
+    let mut events = core.client_events();
+    for state in [
+        CallingState::Joined,
+        CallingState::Reconnecting,
+        CallingState::Joined,
+    ] {
+        assert!(core.set_state_if_current(generation, state));
+    }
+
+    assert!(matches!(
+        events.try_recv(),
+        Err(broadcast::error::TryRecvError::Lagged(1))
+    ));
+}
+
 #[tokio::test]
 async fn track_events_report_the_track_type_cause_and_participant() {
     let core = test_core();

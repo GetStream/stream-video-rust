@@ -570,6 +570,7 @@ impl Drop for ReconnectClaim {
 impl RtcCore {
     /// Build a fresh (idle) core for a call handle.
     pub(crate) fn new(client: Arc<Client>, call_type: String, call_id: String) -> Arc<Self> {
+        let event_capacity = client.call_event_capacity();
         Arc::new(Self {
             api_key: client.api_key().to_owned(),
             client,
@@ -578,9 +579,9 @@ impl RtcCore {
             token_refresh: TokioMutex::new(()),
             call_type,
             call_id,
-            sfu_events_tx: broadcast::channel(256).0,
-            coordinator_events_tx: broadcast::channel(256).0,
-            client_events_tx: broadcast::channel(256).0,
+            sfu_events_tx: broadcast::channel(event_capacity).0,
+            coordinator_events_tx: broadcast::channel(event_capacity).0,
+            client_events_tx: broadcast::channel(event_capacity).0,
             lifecycle: StdMutex::new(Lifecycle {
                 state: CallingState::Idle,
                 generation: 0,

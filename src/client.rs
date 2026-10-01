@@ -32,6 +32,7 @@ const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(55);
 const DEFAULT_MAX_CONNS_PER_HOST: usize = 5;
+const DEFAULT_CALL_EVENT_CAPACITY: usize = 256;
 /// Default maximum body accepted from coordinator HTTP endpoints (16 MiB).
 pub const DEFAULT_MAX_RESPONSE_BODY_BYTES: usize = 16 * 1024 * 1024;
 /// Default maximum inbound SFU/coordinator WebSocket frame and message size (4 MiB).
@@ -120,6 +121,11 @@ pub struct ClientConfig {
     /// and known secret keys are redacted regardless. Other fields, including
     /// PII and secrets stored under custom keys, remain visible when enabled.
     pub log_bodies: bool,
+    /// Events that each call event stream (`sfu_events`, `coordinator_events`,
+    /// `client_events`) keeps for a slow receiver, rounded up to a power of two.
+    /// A receiver that falls further behind loses the oldest events. Each call
+    /// allocates all slots. Must be at least 1. Default 256.
+    pub call_event_capacity: usize,
 }
 
 impl Default for ClientConfig {
@@ -133,6 +139,7 @@ impl Default for ClientConfig {
             max_conns_per_host: DEFAULT_MAX_CONNS_PER_HOST,
             retry: RetryConfig::default(),
             log_bodies: false,
+            call_event_capacity: DEFAULT_CALL_EVENT_CAPACITY,
         }
     }
 }
@@ -148,6 +155,7 @@ pub(crate) struct Client {
     http: reqwest::Client,
     retry: RetryConfig,
     log_bodies: bool,
+    call_event_capacity: usize,
     max_response_body_bytes: usize,
     max_websocket_message_bytes: usize,
     stream_client_header: String,
@@ -206,6 +214,14 @@ impl Client {
                 config.coordinator_ws_url
             )));
         }
+        // tokio broadcast channels panic outside this range.
+        if config.call_event_capacity == 0 || config.call_event_capacity > usize::MAX >> 1 {
+            return Err(Error::Config(format!(
+                "call event capacity {} must be between 1 and {}",
+                config.call_event_capacity,
+                usize::MAX >> 1
+            )));
+        }
 
         let http = reqwest::Client::builder()
             .pool_max_idle_per_host(config.max_conns_per_host)
@@ -227,6 +243,7 @@ impl Client {
             http,
             retry: config.retry,
             log_bodies: config.log_bodies,
+            call_event_capacity: config.call_event_capacity,
             max_response_body_bytes: limits.max_response_body_bytes,
             max_websocket_message_bytes: limits.max_websocket_message_bytes,
             stream_client_header: format!("stream-rust-{}", env!("CARGO_PKG_VERSION")),
@@ -243,6 +260,10 @@ impl Client {
 
     pub(crate) fn coordinator_ws_url(&self) -> &Url {
         &self.coordinator_ws_url
+    }
+
+    pub(crate) fn call_event_capacity(&self) -> usize {
+        self.call_event_capacity
     }
 
     /// The shared `reqwest` client (connection pool). Used by the RTC layer to
@@ -649,6 +670,17 @@ mod tests {
         };
         let error = Client::new("key".to_owned(), "secret".to_owned(), config)
             .expect_err("https coordinator WebSocket URL");
+        assert!(matches!(error, Error::Config(_)));
+    }
+
+    #[test]
+    fn call_event_capacity_must_be_at_least_one() {
+        let config = ClientConfig {
+            call_event_capacity: 0,
+            ..ClientConfig::default()
+        };
+        let error = Client::new("key".to_owned(), "secret".to_owned(), config)
+            .expect_err("zero call event capacity");
         assert!(matches!(error, Error::Config(_)));
     }
 
