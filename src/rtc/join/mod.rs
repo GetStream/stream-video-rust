@@ -746,13 +746,16 @@ impl RtcCore {
     }
 
     /// Guard against a double join (JS "call.join() shall be called only once").
-    /// Transitions `Idle`/`Left` → `Joining` and starts a new generation.
+    /// Transitions `Idle`/`Left` → `Joining` and starts a new generation with
+    /// an empty call state.
     fn begin_join(&self) -> Result<u64> {
         let generation = {
             let mut guard = self.lifecycle.lock().unwrap_or_else(|e| e.into_inner());
             match guard.state {
                 CallingState::Idle | CallingState::Left => {
                     guard.generation = guard.generation.wrapping_add(1);
+                    // A dropped or failed join does not clear its call state.
+                    self.clear_call_state();
                     guard.set_state(CallingState::Joining, &self.client_events_tx);
                     guard.generation_publish_options = guard.publish_options;
                     guard.failure_limits = FailureLimits::default();
@@ -767,10 +770,6 @@ impl RtcCore {
             }
         };
         self.lifecycle_changed.notify_waiters();
-        *self
-            .reconnect_generation
-            .lock()
-            .unwrap_or_else(|e| e.into_inner()) = None;
         self.reconnect_attempts.store(0, Ordering::SeqCst);
         Ok(generation)
     }

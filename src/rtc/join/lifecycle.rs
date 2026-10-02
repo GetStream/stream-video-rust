@@ -718,33 +718,40 @@ impl RtcCore {
             // A join that started during the leave owns these fields.
             let lifecycle = self.lifecycle.lock().unwrap_or_else(|e| e.into_inner());
             if lifecycle.generation == generation {
-                self.participants
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .clear();
-                *self
-                    .call_state
-                    .lock()
-                    .unwrap_or_else(|error| error.into_inner()) = CallStateCache::default();
-                self.active_subs
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .clear();
-                self.delivered_tracks
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .clear();
-                self.own_capabilities
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .clear();
-                *self
-                    .reconnect_generation
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner()) = None;
+                self.clear_call_state();
             }
         }
         self.set_state_if_current(generation, CallingState::Left);
+    }
+
+    /// Clear the state of one join: participants, call state, subscriptions,
+    /// capabilities, and the reconnect claim. The caller holds the lifecycle
+    /// lock.
+    pub(super) fn clear_call_state(&self) {
+        self.participants
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        *self
+            .call_state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = CallStateCache::default();
+        self.active_subs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        self.delivered_tracks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        self.own_capabilities
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        *self
+            .reconnect_generation
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = None;
     }
 }
 
