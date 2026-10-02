@@ -2066,6 +2066,50 @@ fn speaking_and_quality_events_do_not_mark_a_participant_updated_after_a_rejoin(
 }
 
 #[test]
+fn a_join_after_a_failed_join_reports_only_its_own_participants() {
+    let core = test_core();
+    let call_state = |user_id: &str, session_id: &str| {
+        Some(models::CallState {
+            participants: vec![models::Participant {
+                user_id: user_id.to_owned(),
+                session_id: session_id.to_owned(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        })
+    };
+    let failed = core.begin_join().expect("first join");
+    assert!(core.apply_join_call_state_if_current(
+        failed,
+        "local-1",
+        "agent",
+        call_state("alice", "session-a"),
+    ));
+    // The join fails after its join response.
+    assert!(core.set_state_if_current(failed, CallingState::Idle));
+
+    let mut events = core.sfu_events();
+    let generation = core.begin_join().expect("second join");
+    assert!(core.apply_join_call_state_if_current(
+        generation,
+        "local-2",
+        "agent",
+        call_state("bob", "session-b"),
+    ));
+
+    let mut reported = Vec::new();
+    while let Ok(event) = events.try_recv() {
+        match event {
+            SfuCallEvent::ParticipantJoined(p) => reported.push(("joined", p.session_id)),
+            SfuCallEvent::ParticipantUpdated(p) => reported.push(("updated", p.session_id)),
+            SfuCallEvent::ParticipantLeft(p) => reported.push(("left", p.session_id)),
+            _ => {}
+        }
+    }
+    assert_eq!(reported, [("joined", "session-b".to_owned())]);
+}
+
+#[test]
 fn mute_state_builder_deduplicates_track_types() {
     let first = LocalTrack::Audio(LocalAudioTrack::opus().expect("first audio track"));
     let second = LocalTrack::Audio(LocalAudioTrack::opus().expect("second audio track"));
