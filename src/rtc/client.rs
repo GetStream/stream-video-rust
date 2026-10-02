@@ -406,7 +406,8 @@ impl RtcCall {
         self.core.set_incoming_video_enabled(enabled).await
     }
 
-    /// Leave the call, closing the SFU connection and PeerConnections.
+    /// Leave the call, closing the SFU connection and PeerConnections. The
+    /// published tracks stop; a later join needs new tracks.
     pub async fn leave(&self) -> Result<()> {
         self.core.leave("user requested leave").await
     }

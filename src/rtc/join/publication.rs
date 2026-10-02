@@ -110,6 +110,14 @@ impl MediaState {
         Some(track)
     }
 
+    /// Stop the track of every publication and clear the state. The retired
+    /// tracks are already stopped.
+    pub(super) fn stop_all(&mut self) {
+        for publication in std::mem::take(self).publications {
+            publication.track.stop();
+        }
+    }
+
     /// Take the stopped track of the latest sender that [`Self::retire`] kept
     /// for this kind of track.
     pub(super) fn take_retired(

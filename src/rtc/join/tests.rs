@@ -703,6 +703,56 @@ async fn dropped_leave_still_leaves_the_call() {
 }
 
 #[tokio::test]
+async fn leave_stops_the_published_tracks() {
+    let core = test_core();
+    let generation = prepare_joined_core(&core, "alice");
+    let (connection, _sfu) = establish_fake(&core, generation).await;
+    *core.connection.lock().await = Some(connection);
+    let audio = LocalAudioTrack::opus().expect("opus track");
+    core.media
+        .lock()
+        .await
+        .begin_publish(LocalTrack::Audio(audio.clone()), 0);
+
+    core.leave("test leave").await.expect("leave");
+
+    let write = audio.write_pcm(PcmFrame::mono(vec![0; 960], 48_000)).await;
+    assert!(
+        matches!(write, Err(RtcError::IllegalState(_))),
+        "a track published before leave is stopped: {write:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_dropped_leave_keeps_the_tracks_of_a_later_join() {
+    let core = test_core();
+    prepare_joined_core(&core, "alice");
+    let connection_slot = core.connection.lock().await;
+    let leave = tokio::time::timeout(Duration::from_millis(50), core.leave("dropped leave")).await;
+    assert!(leave.is_err(), "leave waits for the connection lock");
+
+    core.begin_join().expect("a new join can start");
+    let audio = LocalAudioTrack::opus().expect("opus track");
+    core.media
+        .lock()
+        .await
+        .begin_publish(LocalTrack::Audio(audio.clone()), 0);
+    let (_, _, completed) = core.runtime_task_snapshot();
+    drop(connection_slot);
+    wait_for(
+        Duration::from_secs(2),
+        || core.runtime_task_snapshot().2 > completed,
+        "the leave task",
+    )
+    .await;
+
+    audio
+        .write_pcm(PcmFrame::mono(vec![0; 960], 48_000))
+        .await
+        .expect("the later join keeps its track");
+}
+
+#[tokio::test]
 async fn a_dropped_leave_keeps_the_connection_of_a_later_join() {
     let core = test_core();
     prepare_joined_core(&core, "alice");

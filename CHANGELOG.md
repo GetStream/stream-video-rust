@@ -68,6 +68,12 @@ Before an `update_subscriptions` call, `set_incoming_video_enabled(true)` now
 subscribes to video only (it was audio and video), and `false` subscribes to
 nothing (it was audio).
 
+### Leave stops the published tracks
+
+`leave` stops every published local track, as JS does with `stopOnLeave`. A
+write to a stopped track returns `RtcError::IllegalState`, so a later join must
+publish new tracks.
+
 ## New Features
 
 ### A token-only client can prepare a call before the join

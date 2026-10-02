@@ -643,7 +643,8 @@ impl RtcCore {
 
 impl RtcCore {
     /// Leave the call: send `leave`, close the PeerConnections and WebSocket,
-    /// abort background tasks. Succeeds from any state, including `Joining`
+    /// abort background tasks, and stop the published tracks (JS
+    /// `stopOnLeave`). Succeeds from any state, including `Joining`
     /// (JS: force to a leaving state rather than waiting for `JOINED`). The
     /// teardown runs in a runtime task, so it finishes when this future is
     /// dropped.
@@ -674,6 +675,12 @@ impl RtcCore {
                     let _ = sender.close().await;
                 }
                 connection.teardown().await;
+            }
+            // A `publish` in progress holds the media lock until it ends. A
+            // join that starts after a dropped leave owns the later tracks.
+            let mut media = core.media.lock().await;
+            if core.is_generation_current(generation) {
+                media.stop_all();
             }
         });
         if let Err(error) = teardown.await

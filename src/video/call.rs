@@ -860,7 +860,8 @@ impl Call {
     }
 
     /// Leave the call, closing the SFU connection and PeerConnections. Succeeds
-    /// from any state, including `JOINING`.
+    /// from any state, including `JOINING`. The published tracks stop; a later
+    /// join needs new tracks.
     pub async fn leave(&self) -> crate::rtc::RtcResult<()> {
         self.rtc.leave("user requested leave").await
     }
