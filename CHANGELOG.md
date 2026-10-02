@@ -63,7 +63,10 @@ field. Code that builds `PcmFrame` with a struct literal must set `pts` or use
 dimension is now 1920×1080 (it was 1280×720), also for a `SubscriptionTarget`
 without a dimension. `Call::participants` gives the participants in the order
 the call learned about them. `set_incoming_video_enabled` keeps the configured
-video dimension.
+video dimension and changes only the video track type of the current config.
+Before an `update_subscriptions` call, `set_incoming_video_enabled(true)` now
+subscribes to video only (it was audio and video), and `false` subscribes to
+nothing (it was audio).
 
 ## New Features
 
