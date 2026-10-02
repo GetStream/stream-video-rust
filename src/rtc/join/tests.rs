@@ -2021,6 +2021,51 @@ fn join_state_reports_only_the_participant_changes_since_the_last_join() {
 }
 
 #[test]
+fn speaking_and_quality_events_do_not_mark_a_participant_updated_after_a_rejoin() {
+    let core = test_core();
+    let generation = core.begin_join().expect("join generation");
+    let mut events = core.sfu_events();
+    let bob = models::Participant {
+        user_id: "bob".to_owned(),
+        session_id: "session-b".to_owned(),
+        ..Default::default()
+    };
+    let call_state = || {
+        Some(models::CallState {
+            participants: vec![bob.clone()],
+            ..Default::default()
+        })
+    };
+
+    assert!(core.apply_join_call_state_if_current(generation, "local-1", "agent", call_state()));
+    core.update_audio_levels(&[event::AudioLevel {
+        user_id: "bob".to_owned(),
+        session_id: "session-b".to_owned(),
+        level: 0.37,
+        is_speaking: true,
+    }]);
+    core.update_connection_quality(&[event::ConnectionQualityInfo {
+        user_id: "bob".to_owned(),
+        session_id: "session-b".to_owned(),
+        connection_quality: models::ConnectionQuality::Excellent as i32,
+    }]);
+    core.update_dominant_speaker("session-b");
+    // A REJOIN: bob has not changed.
+    assert!(core.apply_join_call_state_if_current(generation, "local-2", "agent", call_state()));
+
+    let mut reported = Vec::new();
+    while let Ok(event) = events.try_recv() {
+        match event {
+            SfuCallEvent::ParticipantJoined(p) => reported.push(("joined", p.session_id)),
+            SfuCallEvent::ParticipantUpdated(p) => reported.push(("updated", p.session_id)),
+            SfuCallEvent::ParticipantLeft(p) => reported.push(("left", p.session_id)),
+            _ => {}
+        }
+    }
+    assert_eq!(reported, [("joined", "session-b".to_owned())]);
+}
+
+#[test]
 fn mute_state_builder_deduplicates_track_types() {
     let first = LocalTrack::Audio(LocalAudioTrack::opus().expect("first audio track"));
     let second = LocalTrack::Audio(LocalAudioTrack::opus().expect("second audio track"));

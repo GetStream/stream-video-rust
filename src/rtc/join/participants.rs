@@ -170,10 +170,21 @@ impl RtcCore {
             }
             let event = match known {
                 None => SfuCallEvent::ParticipantJoined(participant),
-                Some(entry) if entry.participant != participant => {
+                Some(ParticipantState {
+                    participant: mut known,
+                    ..
+                }) => {
+                    // Their own SFU events report these fields, not
+                    // `ParticipantUpdated`.
+                    known.audio_level = participant.audio_level;
+                    known.is_speaking = participant.is_speaking;
+                    known.connection_quality = participant.connection_quality;
+                    known.is_dominant_speaker = participant.is_dominant_speaker;
+                    if known == participant {
+                        continue;
+                    }
                     SfuCallEvent::ParticipantUpdated(participant)
                 }
-                Some(_) => continue,
             };
             let _ = self.sfu_events_tx.send(event);
         }
