@@ -352,7 +352,8 @@ pub struct LocalAudioTrackConfig {
     /// Discontinuous transmission: stop emitting packets during silence.
     pub dtx: bool,
     /// Maximum PCM that [`LocalAudioTrack::write_pcm`] queues for the pacer. A
-    /// write above it drops the oldest queued samples.
+    /// write above it drops the oldest queued samples. The minimum is one 20 ms
+    /// frame.
     pub pcm_queue_capacity: Duration,
 }
 
@@ -451,6 +452,12 @@ impl LocalAudioTrack {
         encoder.set_dtx(config.dtx)?;
         let pcm_capacity_samples =
             (config.pcm_queue_capacity.as_secs_f64() * f64::from(OPUS_SAMPLE_RATE)) as usize;
+        if pcm_capacity_samples < FRAME_SAMPLES_20MS {
+            return Err(RtcError::Media(format!(
+                "pcm queue capacity below one 20 ms frame: {:?}",
+                config.pcm_queue_capacity
+            )));
+        }
         Ok(Self {
             inner: Arc::new(AudioInner {
                 core,
@@ -2310,6 +2317,23 @@ mod tests {
             })
         ));
         track.stop();
+    }
+
+    #[test]
+    fn a_pcm_queue_shorter_than_one_frame_is_rejected() {
+        let with_capacity = |capacity| {
+            LocalAudioTrack::opus_with_config(
+                LocalAudioTrackConfig::default().with_pcm_queue_capacity(capacity),
+            )
+        };
+
+        for capacity in [Duration::ZERO, Duration::from_millis(19)] {
+            assert!(
+                matches!(with_capacity(capacity), Err(RtcError::Media(_))),
+                "{capacity:?} holds less than one 20 ms frame"
+            );
+        }
+        assert!(with_capacity(Duration::from_millis(20)).is_ok());
     }
 
     #[tokio::test]
