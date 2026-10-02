@@ -43,19 +43,25 @@ impl RtcCore {
 
     /// Enable or disable incoming video for every remote participant.
     pub async fn set_incoming_video_enabled(&self, enabled: bool) -> Result<()> {
-        let config = {
-            let mut config = self.sub_config.lock().unwrap_or_else(|e| e.into_inner());
-            config.video = enabled;
-            config.video_dimension = None;
-            *config
-        };
+        {
+            let mut guard = self.sub_config.lock().unwrap_or_else(|e| e.into_inner());
+            let config = &mut *guard;
+            for rule in std::iter::once(&mut config.default).chain(config.role_filters.values_mut())
+            {
+                rule.track_types
+                    .retain(|track_type| *track_type != TrackType::Video);
+                if enabled {
+                    rule.track_types.push(TrackType::Video);
+                }
+            }
+        }
         *self
             .manual_subscriptions
             .lock()
             .unwrap_or_else(|error| error.into_inner()) = None;
         self.subs_active.store(true, Ordering::SeqCst);
         self.recompute_subscriptions().await?;
-        tracing::debug!(enabled = config.video, "stream.rtc.incoming_video_updated");
+        tracing::debug!(enabled, "stream.rtc.incoming_video_updated");
         Ok(())
     }
 
@@ -85,7 +91,11 @@ impl RtcCore {
             }
         };
 
-        let config = *self.sub_config.lock().unwrap_or_else(|e| e.into_inner());
+        let config = self
+            .sub_config
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
         let targets = self
             .manual_subscriptions
             .lock()
@@ -116,41 +126,21 @@ impl RtcCore {
                         user_id: entry.user_id.clone(),
                         session_id: entry.session_id.clone(),
                         track_type: target.track_type as i32,
-                        dimension: target.dimension.and_then(|(width, height)| {
-                            is_video_type(target.track_type)
-                                .then_some(models::VideoDimension { width, height })
+                        dimension: is_video_type(target.track_type).then(|| {
+                            let (width, height) =
+                                target.dimension.unwrap_or(DEFAULT_VIDEO_DIMENSION);
+                            models::VideoDimension { width, height }
                         }),
                     });
                 }
             } else {
-                for entry in participants.values() {
-                    if entry.session_id == session_id {
-                        continue;
-                    }
-                    for &tt_i in &entry.published {
-                        let Ok(track_type) = TrackType::try_from(tt_i) else {
-                            continue;
-                        };
-                        if !config.matches(track_type)
-                            || manual.contains(&TrackKey::new(entry.session_id.clone(), track_type))
-                        {
-                            continue;
-                        }
-                        let dimension = if is_video_type(track_type) {
-                            config
-                                .video_dimension
-                                .map(|(width, height)| models::VideoDimension { width, height })
-                        } else {
-                            None
-                        };
-                        tracks.push(signal::TrackSubscriptionDetails {
-                            user_id: entry.user_id.clone(),
-                            session_id: entry.session_id.clone(),
-                            track_type: tt_i,
-                            dimension,
-                        });
-                    }
-                }
+                tracks = config.track_subscriptions(
+                    participants
+                        .values()
+                        .map(|entry| &entry.participant)
+                        .filter(|participant| participant.session_id != session_id),
+                    &manual,
+                );
             }
         }
         tracks.sort_by(|a, b| {
@@ -230,13 +220,21 @@ impl RtcCore {
             return;
         }
         let key = TrackKey::new(participant.session_id.clone(), track_type);
+        let track_id = self.next_remote_track_id.fetch_add(1, Ordering::SeqCst);
+        self.delivered_tracks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(key.clone(), track_id);
         let weak = Arc::downgrade(&self);
+        // The caller can drop the track on a thread without a runtime.
+        let runtime = tokio::runtime::Handle::current();
         let on_drop = Box::new(move || {
             if let Some(core) = weak.upgrade() {
+                let _runtime = runtime.enter();
                 let task_core = core.clone();
                 std::mem::drop(core.spawn_generation_task(generation, async move {
                     task_core
-                        .on_remote_track_dropped(generation, connection_epoch, key)
+                        .on_remote_track_dropped(generation, connection_epoch, key, track_id)
                         .await;
                 }));
             }
@@ -251,6 +249,7 @@ impl RtcCore {
         generation: u64,
         connection_epoch: u64,
         key: TrackKey,
+        track_id: u64,
     ) {
         {
             let connection = self.connection.lock().await;
@@ -259,6 +258,15 @@ impl RtcCore {
             }) {
                 return;
             }
+            let mut delivered = self
+                .delivered_tracks
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if delivered.get(&key) != Some(&track_id) {
+                return;
+            }
+            delivered.remove(&key);
+            drop(delivered);
             self.manual_unsub
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())

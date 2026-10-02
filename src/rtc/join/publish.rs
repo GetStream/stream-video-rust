@@ -63,9 +63,31 @@ impl RtcCore {
         };
         let mut publisher_rtcp_tasks = Vec::new();
         if status.is_none() {
-            publisher_rtcp_tasks =
-                match publisher::add_transceiver_for_track(&publisher, &track, &publish_options)
-                    .await
+            // Reuse the audio sender that `stop_publish` kept, as JS `replaceTrack`
+            // does: a second audio m-line fails the SFU negotiation. Video RTCP
+            // readers keep the old track, and simulcast cannot be replaced.
+            let retired = if matches!(
+                track.track_type(),
+                TrackType::Audio | TrackType::ScreenShareAudio
+            ) {
+                media.take_retired(track.track_type(), publish_option_id)
+            } else {
+                None
+            };
+            let reused = match retired {
+                Some(retired) => {
+                    publisher::replace_retired_track(&publisher, &retired, &track, &publish_options)
+                        .await?
+                }
+                None => false,
+            };
+            if !reused {
+                publisher_rtcp_tasks = match publisher::add_transceiver_for_track(
+                    &publisher,
+                    &track,
+                    &publish_options,
+                )
+                .await
                 {
                     Ok(tasks) => tasks,
                     Err(error) => {
@@ -77,7 +99,11 @@ impl RtcCore {
                         return Err(error);
                     }
                 };
+            }
             media.begin_publish(track.clone(), publish_option_id);
+            if reused {
+                media.set_status(&track_id, PublicationStatus::PendingPublishMute);
+            }
             if let Some(layers) = media
                 .publish_quality
                 .get(&(publish_option_id, track.track_type() as i32))
@@ -123,7 +149,9 @@ impl RtcCore {
             .user_id
             .clone();
         self.add_published_track(&user_id, &session_id, track.track_type() as i32, None);
-        track.start_media();
+        if publisher.connection_state() == RTCPeerConnectionState::Connected {
+            track.start_audio_pacing().await;
+        }
         signal
             .update_mute_states(signal::UpdateMuteStatesRequest {
                 session_id: session_id.clone(),
@@ -136,6 +164,24 @@ impl RtcCore {
         media.set_status(&track_id, PublicationStatus::Published);
         tracing::info!(cid = %self.cid(), "stream.rtc.published");
         Ok(())
+    }
+
+    /// Pace the published audio only while the current publisher is connected.
+    pub(super) async fn sync_audio_pacing(&self) {
+        let media = self.media.lock().await;
+        let connected = self
+            .publisher_handles()
+            .await
+            .is_some_and(|(publisher, ..)| {
+                publisher.connection_state() == RTCPeerConnectionState::Connected
+            });
+        for track in media.active_tracks() {
+            if connected {
+                track.start_audio_pacing().await;
+            } else {
+                track.pause_audio_pacing();
+            }
+        }
     }
 
     pub(super) async fn register_publisher_tasks(&self, tasks: Vec<JoinHandle<()>>) {
@@ -198,7 +244,7 @@ impl RtcCore {
         if muted {
             self.remove_published_track(&session_id, track_type as i32);
         }
-        if let Some(removed) = media.remove(&track_id) {
+        if let Some(removed) = media.retire(&track_id) {
             removed.stop();
         }
         Ok(())

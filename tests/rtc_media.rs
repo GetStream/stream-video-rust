@@ -21,8 +21,9 @@ use getstream::models::UserRequest;
 use getstream::models::{CallRequest, DeleteCallRequest, GetOrCreateCallRequest, MemberRequest};
 use getstream::rtc::proto::models::TrackType;
 use getstream::rtc::{
-    CallEvent, ClientPublishOptions, JoinCallData, LocalAudioTrack, LocalTrack, LocalVideoTrack,
-    PcmFrame, PreferredVideoCodec, RemoteTrack, RtcError, SubscriptionConfig, VideoFrame,
+    CallingState, ClientCallEvent, ClientPublishOptions, JoinCallData, LocalAudioTrack, LocalTrack,
+    LocalVideoTrack, PcmFrame, PreferredVideoCodec, RemoteTrack, RtcError, SfuCallEvent,
+    SubscriptionConfig, SubscriptionTarget, TrackSubscriptionConfig, VideoFrame,
 };
 use getstream::video::Call;
 use tokio::sync::mpsc::{Receiver, channel};
@@ -373,24 +374,23 @@ async fn drain_rms(remote: &RemoteTrack, target: usize, overall: Duration) -> f6
 /// `TrackUnpublished` (`published == false`) event for `user`/`track_type`,
 /// draining unrelated events. Returns whether the event was observed.
 async fn await_track_event(
-    events: &mut tokio::sync::broadcast::Receiver<CallEvent>,
+    events: &mut tokio::sync::broadcast::Receiver<SfuCallEvent>,
     user: &str,
     track_type: TrackType,
     published: bool,
     timeout: Duration,
 ) -> bool {
     use tokio::sync::broadcast::error::RecvError;
-    let want = track_type as i32;
     let deadline = tokio::time::sleep(timeout);
     tokio::pin!(deadline);
     loop {
         tokio::select! {
             () = &mut deadline => return false,
             recv = events.recv() => match recv {
-                Ok(CallEvent::TrackPublished { user_id, track_type: tt, .. })
-                    if published && user_id == user && tt == want => return true,
-                Ok(CallEvent::TrackUnpublished { user_id, track_type: tt, .. })
-                    if !published && user_id == user && tt == want => return true,
+                Ok(SfuCallEvent::TrackPublished { user_id, track_type: tt, .. })
+                    if published && user_id == user && tt == track_type => return true,
+                Ok(SfuCallEvent::TrackUnpublished { user_id, track_type: tt, .. })
+                    if !published && user_id == user && tt == track_type => return true,
                 Ok(_) | Err(RecvError::Lagged(_)) => {}
                 Err(RecvError::Closed) => return false,
             }
@@ -914,6 +914,62 @@ async fn publish_blue_video_reaches_raw_rtp_and_i420_decoder() {
     outcome.expect("VP9 RTP/decode test timed out");
 }
 
+/// A video target without a dimension hint is accepted and delivers video.
+#[tokio::test]
+async fn video_target_without_a_dimension_receives_video() {
+    let Some(client) = common::client_or_skip() else {
+        return;
+    };
+    init_tracing();
+
+    let user_a = common::unique_id("a");
+    let user_b = common::unique_id("b");
+    let (admin, call_id) = setup_call(&client, &[&user_a, &user_b]).await;
+
+    let outcome = tokio::time::timeout(Duration::from_secs(120), async {
+        let call_a = client.video().call("default", &call_id);
+        let call_b = client.video().call("default", &call_id);
+
+        call_a
+            .join(JoinCallData::new(&user_a))
+            .await
+            .expect("A join");
+        let video_a = LocalVideoTrack::vp9().expect("vp9 track");
+        call_a
+            .publish_video(video_a.clone())
+            .await
+            .expect("A publish_video");
+        let feeder = spawn_blue_video(video_a);
+
+        let mut rx_b = track_sink(&call_b);
+        call_b
+            .join(JoinCallData::new(&user_b))
+            .await
+            .expect("B join");
+        let session_a = call_a.session_id().await.expect("A session id");
+        call_b
+            .update_subscription_targets(vec![SubscriptionTarget::new(session_a, TrackType::Video)])
+            .await
+            .expect("B update_subscription_targets without a dimension");
+        recv_track(
+            &mut rx_b,
+            &user_a,
+            TrackType::Video,
+            Duration::from_secs(60),
+        )
+        .await
+        .expect("B did not receive A's video track");
+
+        feeder.abort();
+        call_a.leave().await.expect("A leave");
+        call_b.leave().await.expect("B leave");
+    })
+    .await;
+
+    let _ = admin.delete(DeleteCallRequest { hard: Some(true) }).await;
+    outcome.expect("dimensionless video subscription test timed out");
+}
+
 #[tokio::test]
 async fn vp9_svc_preserves_one_ssrc_and_adapts_all_spatial_layers() {
     let Some(client) = common::client_or_skip() else {
@@ -995,10 +1051,12 @@ async fn vp9_svc_preserves_one_ssrc_and_adapts_all_spatial_layers() {
         // transition accidentally.
         call_b
             .update_subscriptions(SubscriptionConfig {
-                audio: false,
-                video: true,
-                screen_share: false,
-                video_dimension: Some((320, 180)),
+                default: TrackSubscriptionConfig {
+                    track_types: vec![TrackType::Video],
+                    video_dimension: (320, 180),
+                    ..Default::default()
+                },
+                ..Default::default()
             })
             .await
             .map_err(|error| format!("VP9 SVC low-quality subscription failed: {error}"))?;
@@ -1016,10 +1074,12 @@ async fn vp9_svc_preserves_one_ssrc_and_adapts_all_spatial_layers() {
         // picture with truthful SS dimensions after the encoder reconfiguration.
         call_b
             .update_subscriptions(SubscriptionConfig {
-                audio: false,
-                video: true,
-                screen_share: false,
-                video_dimension: Some((1280, 720)),
+                default: TrackSubscriptionConfig {
+                    track_types: vec![TrackType::Video],
+                    video_dimension: (1280, 720),
+                    ..Default::default()
+                },
+                ..Default::default()
             })
             .await
             .map_err(|error| format!("VP9 SVC high-quality subscription failed: {error}"))?;
@@ -1160,7 +1220,7 @@ async fn publish_h264_video_b_decodes_i420_frame() {
 /// Await both an `AudioLevelChanged` naming `session` as speaking and a
 /// `DominantSpeakerChanged` naming it, within `timeout`.
 async fn await_speaking(
-    events: &mut tokio::sync::broadcast::Receiver<CallEvent>,
+    events: &mut tokio::sync::broadcast::Receiver<SfuCallEvent>,
     session: &str,
     timeout: Duration,
 ) -> (bool, bool) {
@@ -1174,7 +1234,7 @@ async fn await_speaking(
         tokio::select! {
             () = &mut deadline => return (level_seen, dominant_seen),
             received = events.recv() => match received {
-                Ok(CallEvent::AudioLevelChanged(levels)) => {
+                Ok(SfuCallEvent::AudioLevelChanged(levels)) => {
                     if levels
                         .iter()
                         .any(|l| l.session_id == session && l.is_speaking)
@@ -1182,7 +1242,7 @@ async fn await_speaking(
                         level_seen = true;
                     }
                 }
-                Ok(CallEvent::DominantSpeakerChanged { session_id, .. }) => {
+                Ok(SfuCallEvent::DominantSpeakerChanged { session_id, .. }) => {
                     if session_id == session {
                         dominant_seen = true;
                     }
@@ -1223,7 +1283,7 @@ async fn loud_publisher_is_reported_speaking_and_dominant() {
         // Join and subscribe before any participant publishes audio. A speaker
         // selected before B joins is present in JoinResponse, and the SFU does
         // not replay the earlier DominantSpeakerChanged event to B.
-        let mut events_b = call_b.subscribe();
+        let mut events_b = call_b.sfu_events();
         call_b
             .join(JoinCallData::new(&user_b))
             .await
@@ -1294,8 +1354,11 @@ async fn loud_publisher_is_reported_speaking_and_dominant() {
 /// typed event stream: it must see A's audio `TrackPublished`, then — once A
 /// stops the track — A's audio `TrackUnpublished`, confirming the SFU accepted
 /// the request and broadcast the corrected publication state to peers.
+///
+/// A then publishes a new audio track on the same session. The publish must
+/// succeed without a reconnect, and B must hear A again.
 #[tokio::test]
-async fn stop_publish_of_sole_audio_is_accepted_and_unannounced() {
+async fn sole_audio_can_be_stopped_and_published_again() {
     let Some(client) = common::client_or_skip() else {
         return;
     };
@@ -1309,6 +1372,7 @@ async fn stop_publish_of_sole_audio_is_accepted_and_unannounced() {
         let call_a = client.video().call("default", &call_id);
         let call_b = client.video().call("default", &call_id);
 
+        let mut tracks_b = track_sink(&call_b);
         call_b
             .join(JoinCallData::new(&user_b))
             .await
@@ -1317,12 +1381,13 @@ async fn stop_publish_of_sole_audio_is_accepted_and_unannounced() {
             .update_subscriptions(SubscriptionConfig::audio_all())
             .await
             .expect("B update_subscriptions");
-        let mut events_b = call_b.subscribe();
+        let mut events_b = call_b.sfu_events();
 
         call_a
             .join(JoinCallData::new(&user_a))
             .await
             .expect("A join");
+        let mut events_a = call_a.client_events();
         let audio_a = LocalAudioTrack::opus().expect("opus track");
         call_a
             .publish_audio(audio_a.clone())
@@ -1342,6 +1407,14 @@ async fn stop_publish_of_sole_audio_is_accepted_and_unannounced() {
             audio_published,
             "B never received A's audio TrackPublished before the stop"
         );
+        let remote_a = recv_track(
+            &mut tracks_b,
+            &user_a,
+            TrackType::Audio,
+            Duration::from_secs(45),
+        )
+        .await
+        .expect("B never received A's audio track");
 
         // Stop the sole publication. Before the fix this renegotiated the
         // publisher with an empty track set and the SFU returned "Invalid
@@ -1365,6 +1438,42 @@ async fn stop_publish_of_sole_audio_is_accepted_and_unannounced() {
             "SFU never reported A's audio TrackUnpublished after stop_publish \
              (mute state not propagated to peers)"
         );
+
+        // Publish a new audio track on the same session, as after an unmute.
+        let audio_again = LocalAudioTrack::opus().expect("opus track");
+        call_a
+            .publish_audio(audio_again.clone())
+            .await
+            .expect("A publish_audio again on the same session");
+        let feeder_again = spawn_tone(audio_again);
+        let audio_republished = await_track_event(
+            &mut events_b,
+            &user_a,
+            TrackType::Audio,
+            true,
+            Duration::from_secs(45),
+        )
+        .await;
+        assert!(
+            audio_republished,
+            "B never received A's audio TrackPublished after the second publish"
+        );
+        let rms = drain_rms(&remote_a, FRAME_20MS * 100, Duration::from_secs(30)).await;
+        feeder_again.abort();
+        assert!(
+            rms > NON_SILENT_RMS,
+            "B got no audio after the second publish (rms={rms:.4})"
+        );
+        let mut reconnected = false;
+        while let Ok(event) = events_a.try_recv() {
+            reconnected |= matches!(
+                event,
+                ClientCallEvent::CallingStateChanged(
+                    CallingState::Reconnecting | CallingState::Migrating
+                )
+            );
+        }
+        assert!(!reconnected, "A reconnected after the second publish");
 
         call_a.leave().await.expect("A leave");
         call_b.leave().await.expect("B leave");
