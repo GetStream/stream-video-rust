@@ -123,6 +123,17 @@ impl RtcCore {
         let mut previous = {
             let mut participants = self.participants.lock().unwrap_or_else(|e| e.into_inner());
             let previous = std::mem::take(&mut *participants);
+            // Known participants keep the order in which the call learned them.
+            let current: HashSet<&str> = joined
+                .iter()
+                .map(|participant| participant.session_id.as_str())
+                .chain([session_id])
+                .collect();
+            for id in previous.keys() {
+                if current.contains(id.as_str()) {
+                    participants.insert(id.clone(), ParticipantState::default());
+                }
+            }
             let me = participants.entry(session_id.to_owned()).or_default();
             me.user_id = user_id.to_owned();
             me.session_id = session_id.to_owned();

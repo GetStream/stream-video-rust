@@ -62,7 +62,8 @@ field. Code that builds `PcmFrame` with a struct literal must set `pts` or use
 `audio_video`, `all` and `none` stay. The default video and screen-share
 dimension is now 1920×1080 (it was 1280×720), also for a `SubscriptionTarget`
 without a dimension. `Call::participants` gives the participants in the order
-the call learned about them.
+the call learned about them. `set_incoming_video_enabled` keeps the configured
+video dimension.
 
 ## New Features
 

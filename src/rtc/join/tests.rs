@@ -1670,6 +1670,71 @@ fn participant_refresh_replaces_published_track_state() {
     assert!(entry.published.contains(&(TrackType::Audio as i32)));
 }
 
+#[tokio::test]
+async fn turning_incoming_video_off_and_on_keeps_the_video_dimension() {
+    let core = test_core();
+    let config = SubscriptionConfig {
+        default: crate::rtc::TrackSubscriptionConfig {
+            track_types: vec![TrackType::Video],
+            video_dimension: (640, 360),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    core.update_subscriptions(config.clone())
+        .await
+        .expect("update subscriptions");
+    core.set_incoming_video_enabled(false)
+        .await
+        .expect("video off");
+    core.set_incoming_video_enabled(true)
+        .await
+        .expect("video on");
+
+    assert_eq!(
+        *core.sub_config.lock().unwrap_or_else(|e| e.into_inner()),
+        config
+    );
+}
+
+#[test]
+fn a_join_response_keeps_the_order_of_known_participants() {
+    let core = test_core();
+    let generation = core.begin_join().expect("test generation");
+    let call_state = |session_ids: &[&str]| {
+        Some(models::CallState {
+            participants: session_ids
+                .iter()
+                .map(|session_id| models::Participant {
+                    user_id: format!("user-{session_id}"),
+                    session_id: (*session_id).to_owned(),
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        })
+    };
+    assert!(core.apply_join_call_state_if_current(
+        generation,
+        "me",
+        "me",
+        call_state(&["c", "a", "b"])
+    ));
+    assert!(core.apply_join_call_state_if_current(
+        generation,
+        "me",
+        "me",
+        call_state(&["d", "b", "a"])
+    ));
+
+    let order: Vec<_> = core
+        .participants()
+        .into_iter()
+        .map(|participant| participant.session_id)
+        .collect();
+    assert_eq!(order, ["me", "a", "b", "d"]);
+}
+
 #[test]
 fn participants_keep_the_order_in_which_the_call_learned_them() {
     let core = test_core();
