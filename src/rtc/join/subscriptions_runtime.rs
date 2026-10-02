@@ -42,6 +42,11 @@ impl RtcCore {
     }
 
     /// Enable or disable incoming video for every remote participant.
+    ///
+    /// This adds or removes `TrackType::Video` in every rule of the current
+    /// [`SubscriptionConfig`] and keeps the other track types. The default
+    /// config has no track types, so before an `update_subscriptions` call,
+    /// `true` subscribes to video only.
     pub async fn set_incoming_video_enabled(&self, enabled: bool) -> Result<()> {
         {
             let mut guard = self.sub_config.lock().unwrap_or_else(|e| e.into_inner());

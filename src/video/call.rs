@@ -1002,7 +1002,8 @@ impl Call {
     }
 
     /// Set the subscription policy and (re)send `UpdateSubscriptions`. The SFU
-    /// forwards no media until this is called; the default policy is audio-only.
+    /// forwards no media until this is called; `SubscriptionConfig::default()`
+    /// subscribes to nothing.
     pub async fn update_subscriptions(
         &self,
         config: crate::rtc::SubscriptionConfig,
@@ -1019,6 +1020,11 @@ impl Call {
     }
 
     /// Enable or disable incoming video from every remote participant.
+    ///
+    /// This adds or removes `TrackType::Video` in every rule of the current
+    /// [`SubscriptionConfig`](crate::rtc::SubscriptionConfig) and keeps the
+    /// other track types. The default config has no track types, so before an
+    /// `update_subscriptions` call, `true` subscribes to video only.
     pub async fn set_incoming_video_enabled(&self, enabled: bool) -> crate::rtc::RtcResult<()> {
         self.rtc.set_incoming_video_enabled(enabled).await
     }
