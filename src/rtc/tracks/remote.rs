@@ -215,9 +215,6 @@ struct AudioDecode {
     decoder: opus::Decoder,
     last_seq: Option<u16>,
     ready: VecDeque<PcmFrame>,
-    /// The RTP timestamp right after the last queued frame. A frame rebuilt
-    /// for a lost packet starts here.
-    next_pts: u32,
     /// Length of the last frame decoded from a real packet. libopus makes a
     /// rebuilt frame as long as the output buffer. A lost packet states no
     /// length, so the stream's own frame size is the best value to use.
@@ -524,7 +521,6 @@ impl AudioDecode {
             decoder,
             last_seq: None,
             ready: VecDeque::new(),
-            next_pts: 0,
             frame_samples: FRAME_SAMPLES_20MS,
             scratch: vec![0; MAX_OPUS_FRAME_SAMPLES],
         }
@@ -561,11 +557,18 @@ impl AudioDecode {
         };
         self.last_seq = Some(sequence_number);
 
-        for _ in 1..missing {
-            self.decode_frame(&[], false, self.next_pts);
+        // Lost frames count back from the packet that arrived: DTX skips
+        // timestamps over silence but not sequence numbers.
+        let frame_samples = self.frame_samples as u32;
+        for back in (2..=missing).rev() {
+            self.decode_frame(
+                &[],
+                false,
+                rtp_timestamp.wrapping_sub(u32::from(back) * frame_samples),
+            );
         }
         if missing > 0 {
-            self.decode_frame(payload, true, self.next_pts);
+            self.decode_frame(payload, true, rtp_timestamp.wrapping_sub(frame_samples));
         }
         self.decode_frame(payload, false, rtp_timestamp);
     }
@@ -598,7 +601,6 @@ impl AudioDecode {
                 let mut frame = PcmFrame::mono(self.scratch[..samples].to_vec(), OPUS_SAMPLE_RATE);
                 frame.pts = Some(pts);
                 self.ready.push_back(frame);
-                self.next_pts = pts.wrapping_add(samples as u32);
             }
             Err(error) => {
                 tracing::debug!(error = %error, "stream.rtc.remote.opus_decode_failed");
@@ -901,6 +903,32 @@ mod tests {
         assert_eq!(
             timestamps,
             [Some(first), Some(0), Some(FRAME_SAMPLES_20MS as u32)]
+        );
+    }
+
+    #[test]
+    fn frames_lost_after_dtx_silence_take_their_timestamps_from_the_next_packet() {
+        let packets = tone_packets(4, true);
+        let mut state = audio_decode();
+        // DTX skips 400 ms of timestamps and keeps the sequence numbers.
+        let after_silence = rtp(20);
+
+        state.push_packet(0, rtp(0), &packets[0]);
+        assert!(state.take_frame().is_some());
+        // Packets 1 and 2, the first ones after the silence, are lost.
+        state.push_packet(3, after_silence + rtp(2), &packets[3]);
+
+        let mut timestamps = Vec::new();
+        while let Some(frame) = state.take_frame() {
+            timestamps.push(frame.pts);
+        }
+        assert_eq!(
+            timestamps,
+            [
+                Some(after_silence),
+                Some(after_silence + rtp(1)),
+                Some(after_silence + rtp(2))
+            ]
         );
     }
 
