@@ -39,10 +39,10 @@ use the new fields or `..`.
 
 `PcmFrame` adds `pts: Option<u32>`: the RTP timestamp of the first sample, in
 units of 1/48000 s, wrapping like RTP. `RemoteTrack::next_pcm` sets it; a frame
-rebuilt for a lost packet continues from the frame before it. Frames that the
-application or a conversion builds have `None`, and `write_pcm` ignores the
-field. Code that builds `PcmFrame` with a struct literal must set `pts` or use
-`PcmFrame::new` / `PcmFrame::mono`.
+rebuilt for a lost packet counts back from the next packet that arrives. Frames
+that the application or a conversion builds have `None`, and `write_pcm` ignores
+the field. Code that builds `PcmFrame` with a struct literal must set `pts` or
+use `PcmFrame::new` / `PcmFrame::mono`.
 
 ### Subscription config has the stream-py shape
 
