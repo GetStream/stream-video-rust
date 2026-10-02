@@ -27,7 +27,7 @@ pub(super) struct LocalPublication {
 pub(super) struct MediaState {
     pub(super) publications: Vec<LocalPublication>,
     pub(super) publish_quality: HashMap<(i32, i32), Vec<event::VideoLayerSetting>>,
-    /// The publish option id and stopped track of each sender that
+    /// The publish option id and stopped track of each audio sender that
     /// `stop_publish` kept in the publisher envelope.
     retired: Vec<(i32, LocalTrack)>,
 }
@@ -96,11 +96,17 @@ impl MediaState {
     }
 
     /// Remove the publication of a stopped track whose sender stays in the
-    /// publisher envelope, and keep that sender for a later publish.
+    /// publisher envelope. Keep an audio sender for a later publish; `publish`
+    /// never reuses a video sender.
     pub(super) fn retire(&mut self, track_id: &str) -> Option<LocalTrack> {
         let publish_option_id = self.publications[self.position(track_id)?].publish_option_id;
         let track = self.remove(track_id)?;
-        self.retired.push((publish_option_id, track.clone()));
+        if matches!(
+            track.track_type(),
+            TrackType::Audio | TrackType::ScreenShareAudio
+        ) {
+            self.retired.push((publish_option_id, track.clone()));
+        }
         Some(track)
     }
 
