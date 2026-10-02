@@ -674,7 +674,10 @@ async fn dropped_join_allows_a_new_join() {
 #[tokio::test]
 async fn dropped_leave_still_leaves_the_call() {
     let core = test_core();
-    prepare_joined_core(&core, "alice");
+    let generation = prepare_joined_core(&core, "alice");
+    let (connection, sfu) = establish_fake(&core, generation).await;
+    let (subscriber, publisher) = (connection.subscriber.clone(), connection.publisher.clone());
+    *core.connection.lock().await = Some(connection);
     let connection_slot = core.connection.lock().await;
 
     let leave = tokio::time::timeout(Duration::from_millis(50), core.leave("dropped leave")).await;
@@ -682,7 +685,44 @@ async fn dropped_leave_still_leaves_the_call() {
     drop(connection_slot);
 
     assert_eq!(core.state(), CallingState::Left);
+    let requests = requests_until_close(sfu).await;
+    assert!(requests.iter().any(|request| matches!(
+        request.request_payload,
+        Some(event::sfu_request::RequestPayload::LeaveCallRequest(_))
+    )));
+    wait_for(
+        Duration::from_secs(2),
+        || {
+            subscriber.connection_state() == RTCPeerConnectionState::Closed
+                && publisher.connection_state() == RTCPeerConnectionState::Closed
+        },
+        "closed peer connections",
+    )
+    .await;
     core.begin_join().expect("a new join can start");
+}
+
+#[tokio::test]
+async fn a_dropped_leave_keeps_the_connection_of_a_later_join() {
+    let core = test_core();
+    prepare_joined_core(&core, "alice");
+    let mut connection_slot = core.connection.lock().await;
+    let leave = tokio::time::timeout(Duration::from_millis(50), core.leave("dropped leave")).await;
+    assert!(leave.is_err(), "leave waits for the connection lock");
+
+    let generation = core.begin_join().expect("a new join can start");
+    let (connection, _sfu) = establish_fake(&core, generation).await;
+    *connection_slot = Some(connection);
+    let (_, _, completed) = core.runtime_task_snapshot();
+    drop(connection_slot);
+    wait_for(
+        Duration::from_secs(2),
+        || core.runtime_task_snapshot().2 > completed,
+        "the leave task",
+    )
+    .await;
+
+    assert!(core.connection.lock().await.is_some());
 }
 
 #[tokio::test]
