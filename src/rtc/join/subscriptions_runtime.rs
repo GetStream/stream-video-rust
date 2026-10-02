@@ -53,7 +53,6 @@ impl RtcCore {
                 if enabled {
                     rule.track_types.push(TrackType::Video);
                 }
-                rule.video_dimension = DEFAULT_VIDEO_DIMENSION;
             }
         }
         *self
