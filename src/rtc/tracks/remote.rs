@@ -9,7 +9,7 @@
 //! - [`RemoteTrack::next_pcm`] — decoded 48 kHz mono [`PcmFrame`] (audio only;
 //!   Opus decode, for the PCM bridge / bots).
 //! - [`RemoteTrack::next_video_frame`] — decoded packed-I420 [`VideoFrame`]
-//!   (VP8/VP9/H264 video, for bots that need to *see* the call).
+//!   (VP8/VP9 video, for bots that need to *see* the call).
 //!
 //! Read operations on one track are serialized. Do not mix raw and decoded
 //! reads: each RTP packet is consumed by whichever read operation acquires the
@@ -33,8 +33,6 @@ use webrtc::rtp::codecs::vp9::Vp9Packet;
 use webrtc::track::track_remote::TrackRemote;
 
 use super::local::RtpPacket;
-use crate::rtc::codecs::h264::{H264Decoder, access_unit_has_idr};
-use crate::rtc::codecs::rtp_h264::H264Depacketizer;
 use crate::rtc::codecs::vpx::{VpxCodec, VpxDecoder};
 use crate::rtc::error::{Result, RtcError};
 use crate::rtc::pcm::{FRAME_SAMPLES_20MS, OPUS_SAMPLE_RATE, PcmFrame};
@@ -146,7 +144,6 @@ pub struct Codec {
 enum VideoSamples {
     Vp8(SampleBuilder<Vp8Packet>),
     Vp9(SampleBuilder<Vp9Packet>),
-    H264(SampleBuilder<H264Depacketizer>),
 }
 
 impl VideoSamples {
@@ -162,11 +159,6 @@ impl VideoSamples {
                 Vp9Packet::default(),
                 VIDEO_CLOCK_RATE,
             )),
-            VideoCodec::H264 => Self::H264(SampleBuilder::new(
-                VIDEO_MAX_LATE,
-                H264Depacketizer::default(),
-                VIDEO_CLOCK_RATE,
-            )),
         }
     }
 
@@ -174,7 +166,6 @@ impl VideoSamples {
         match self {
             Self::Vp8(b) => b.push(packet),
             Self::Vp9(b) => b.push(packet),
-            Self::H264(b) => b.push(packet),
         }
     }
 
@@ -182,7 +173,6 @@ impl VideoSamples {
         match self {
             Self::Vp8(b) => b.pop(),
             Self::Vp9(b) => b.pop(),
-            Self::H264(b) => b.pop(),
         }
     }
 }
@@ -191,22 +181,15 @@ impl VideoSamples {
 enum VideoCodec {
     Vp8,
     Vp9,
-    H264,
-}
-
-enum VideoDecoder {
-    Vpx(VpxDecoder),
-    H264(H264Decoder),
 }
 
 /// Inbound video reassembly + decode state, plus frames already decoded but not
 /// yet handed to the caller (one sample can yield more than one frame).
 struct VideoDecode {
     samples: VideoSamples,
-    decoder: VideoDecoder,
+    decoder: VpxDecoder,
     ready: VecDeque<VideoFrame>,
     last_resolution: Option<(u32, u32)>,
-    awaiting_h264_idr: bool,
 }
 
 /// Inbound audio decode state, plus frames already decoded but not yet handed to
@@ -227,7 +210,7 @@ struct AudioDecode {
 enum Decode {
     /// Opus → 48 kHz mono PCM.
     Audio(StdMutex<AudioDecode>),
-    /// VP8/VP9/H264 RTP → packed I420 frames. Shared with the bounded blocking
+    /// VP8/VP9 RTP → packed I420 frames. Shared with the bounded blocking
     /// decode work; a [`SampleBuilder`] carries a full sequence-number window.
     Video(Arc<StdMutex<VideoDecode>>),
     /// No decoder: a codec we cannot decode (for example AV1), or a decoder that
@@ -438,7 +421,7 @@ impl RemoteTrack {
             let packet = self.read_rtp_inner().await?;
 
             // Packet reordering/depacketization is cheap and stays on the async
-            // task. Native VPx/OpenH264 decode is measured in milliseconds at
+            // task. Native VPx decode is measured in milliseconds at
             // 720p, so only complete samples cross into Tokio's blocking pool.
             let samples = {
                 let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
@@ -653,25 +636,10 @@ impl VideoDecode {
                     "stream.rtc.remote.video_packets_dropped"
                 );
                 needs_keyframe = true;
-                self.restart_h264_after_discontinuity();
             }
 
-            if self.awaiting_h264_idr && !access_unit_has_idr(&sample.data) {
-                needs_keyframe = true;
-                continue;
-            }
-
-            let decoded = match &mut self.decoder {
-                VideoDecoder::Vpx(decoder) => decoder.decode(&sample.data, sample.packet_timestamp),
-                VideoDecoder::H264(decoder) => {
-                    decoder.decode(&sample.data, sample.packet_timestamp)
-                }
-            };
-            match decoded {
+            match self.decoder.decode(&sample.data, sample.packet_timestamp) {
                 Ok(frames) => {
-                    if self.awaiting_h264_idr && !frames.is_empty() {
-                        self.awaiting_h264_idr = false;
-                    }
                     for frame in frames {
                         let resolution = (frame.width, frame.height);
                         if self.last_resolution != Some(resolution) {
@@ -688,24 +656,10 @@ impl VideoDecode {
                 Err(e) => {
                     tracing::debug!(error = %e, "stream.rtc.remote.video_decode_failed");
                     needs_keyframe = true;
-                    self.restart_h264_after_discontinuity();
                 }
             }
         }
         needs_keyframe
-    }
-
-    fn restart_h264_after_discontinuity(&mut self) {
-        let VideoDecoder::H264(decoder) = &mut self.decoder else {
-            return;
-        };
-        self.awaiting_h264_idr = true;
-        if let Err(error) = decoder.restart() {
-            tracing::warn!(
-                error = %error,
-                "stream.rtc.remote.h264_decoder_restart_failed"
-            );
-        }
     }
 }
 
@@ -745,22 +699,20 @@ fn build_decoder(track_type: TrackType, codec: &Codec) -> Decode {
         tracing::warn!(
             mime_type = %codec.mime_type,
             "stream.rtc.remote.video_codec_not_decodable: next_video_frame will return None; \
-             VP8, VP9, and H264 are decodable (read_rtp still works)"
+             VP8 and VP9 are decodable (read_rtp still works)"
         );
         return Decode::None;
     };
-    let decoder = match video_codec {
-        VideoCodec::Vp8 => VpxDecoder::new(VpxCodec::Vp8).map(VideoDecoder::Vpx),
-        VideoCodec::Vp9 => VpxDecoder::new(VpxCodec::Vp9).map(VideoDecoder::Vpx),
-        VideoCodec::H264 => H264Decoder::new().map(VideoDecoder::H264),
-    };
+    let decoder = VpxDecoder::new(match video_codec {
+        VideoCodec::Vp8 => VpxCodec::Vp8,
+        VideoCodec::Vp9 => VpxCodec::Vp9,
+    });
     match decoder {
         Ok(decoder) => Decode::Video(Arc::new(StdMutex::new(VideoDecode {
             samples: VideoSamples::new(video_codec),
             decoder,
             ready: VecDeque::new(),
             last_resolution: None,
-            awaiting_h264_idr: video_codec == VideoCodec::H264,
         }))),
         Err(e) => {
             tracing::warn!(
@@ -779,7 +731,6 @@ fn video_codec_for(mime_type: &str) -> Option<VideoCodec> {
     match () {
         () if mime.ends_with("/vp8") => Some(VideoCodec::Vp8),
         () if mime.ends_with("/vp9") => Some(VideoCodec::Vp9),
-        () if mime.ends_with("/h264") => Some(VideoCodec::H264),
         () => None,
     }
 }
@@ -792,7 +743,7 @@ mod tests {
     fn supported_video_mime_types_map_to_a_decoder() {
         assert_eq!(video_codec_for("video/VP8"), Some(VideoCodec::Vp8));
         assert_eq!(video_codec_for("video/vp9"), Some(VideoCodec::Vp9));
-        assert_eq!(video_codec_for("video/H264"), Some(VideoCodec::H264));
+        assert_eq!(video_codec_for("video/H264"), None);
     }
 
     /// One 20 ms frame of 440 Hz tone, loud enough that a silent or badly

@@ -37,7 +37,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use bytes::Bytes;
 use tokio::sync::{Notify, Semaphore};
 use tokio::task::JoinHandle;
-use webrtc::api::media_engine::{MIME_TYPE_H264, MIME_TYPE_OPUS, MIME_TYPE_VP8, MIME_TYPE_VP9};
+use webrtc::api::media_engine::{MIME_TYPE_OPUS, MIME_TYPE_VP8, MIME_TYPE_VP9};
 use webrtc::rtp::extension::HeaderExtension;
 use webrtc::rtp::extension::audio_level_extension::AudioLevelExtension;
 use webrtc::rtp::packetizer::{Packetizer, new_packetizer};
@@ -48,8 +48,6 @@ use webrtc::track::track_local::TrackLocalWriter;
 use webrtc::track::track_local::track_local_static_rtp::TrackLocalStaticRTP;
 
 use super::layers::{PlannedVideoLayer, simulcast_layers, single_layer};
-use crate::rtc::codecs::h264::{H264Encoder, validate_h264_encode_request};
-use crate::rtc::codecs::rtp_h264::H264RtpPacketizer;
 use crate::rtc::codecs::rtp_vpx::VpxRtpPacketizer;
 use crate::rtc::codecs::vpx::{Vp9SvcMode, VpxCodec, VpxEncoder, VpxSvcEncoder};
 use crate::rtc::error::{Result, RtcError};
@@ -835,12 +833,6 @@ fn encode_opus_into(encoder: &mut opus::Encoder, pcm: &[i16], output: &mut [u8])
 
 // Video
 
-#[derive(Clone, Copy)]
-enum VideoCodec {
-    Vpx(VpxCodec),
-    H264,
-}
-
 enum VideoCodecState {
     Vpx {
         encoder: VpxEncoder,
@@ -849,11 +841,6 @@ enum VideoCodecState {
     Vp9Svc {
         encoder: VpxSvcEncoder,
         packetizer: VpxRtpPacketizer,
-    },
-    H264 {
-        encoder: Box<H264Encoder>,
-        packetizer: H264RtpPacketizer,
-        encoded: Vec<u8>,
     },
 }
 
@@ -905,7 +892,7 @@ impl VideoEncoding {
 
 struct VideoInner {
     encodings: Vec<VideoEncoding>,
-    codec_id: VideoCodec,
+    codec_id: VpxCodec,
     /// Serializes frame work before it enters Tokio's blocking pool. The permit
     /// moves into the worker so cancellation cannot build an unbounded queue.
     encode_gate: Arc<Semaphore>,
@@ -930,8 +917,8 @@ pub enum VideoLayering {
     Single,
     /// Build server-managed layering, optionally capped locally.
     ///
-    /// VP9 camera tracks use one-SSRC codec-native SVC. H264 camera and VP8
-    /// screen-share tracks use independent RID simulcast encodings.
+    /// VP9 camera tracks use one-SSRC codec-native SVC. VP8 screen-share tracks
+    /// use independent RID simulcast encodings.
     ServerManaged {
         /// Maximum local spatial layers. `None` allows up to three.
         max_spatial_layers: Option<NonZeroU8>,
@@ -979,7 +966,7 @@ impl LocalVideoTrackConfig {
     }
 }
 
-/// An outbound video track (VP8, VP9, or H264).
+/// An outbound video track (VP8 or VP9).
 ///
 /// Feed raw frames via [`write_i420`](Self::write_i420) (the SDK encodes to the
 /// track's codec and packetizes), publish pre-encoded frames via
@@ -1007,7 +994,7 @@ impl LocalVideoTrack {
                 sdp_fmtp_line: String::new(),
                 rtcp_feedback: vec![],
             },
-            VideoCodec::Vpx(VpxCodec::Vp8),
+            VpxCodec::Vp8,
             config,
         )
     }
@@ -1034,7 +1021,7 @@ impl LocalVideoTrack {
                 sdp_fmtp_line: "profile-id=0".to_owned(),
                 rtcp_feedback: vec![],
             },
-            VideoCodec::Vpx(VpxCodec::Vp9),
+            VpxCodec::Vp9,
             config,
         )
     }
@@ -1048,40 +1035,9 @@ impl LocalVideoTrack {
         Self::vp9_with_config(LocalVideoTrackConfig::default().server_managed())
     }
 
-    /// Build an H264 Constrained Baseline, packetization-mode 1 video track.
-    ///
-    /// VP9 remains the SDK's default camera codec. Select H264 for peers that
-    /// require it, including Safari-origin media and OpenAI Realtime video.
-    /// H264 may be covered by patents in some jurisdictions; distributors must
-    /// evaluate their own licensing obligations.
-    pub fn h264() -> Result<Self> {
-        Self::h264_with_config(LocalVideoTrackConfig::default())
-    }
-
-    /// Build an H264 track with explicit local encoder settings.
-    pub fn h264_with_config(config: LocalVideoTrackConfig) -> Result<Self> {
-        Self::with_codec(
-            RTCRtpCodecCapability {
-                mime_type: MIME_TYPE_H264.to_owned(),
-                clock_rate: 90_000,
-                channels: 0,
-                sdp_fmtp_line: crate::rtc::publish_options::H264_FMTP.to_owned(),
-                rtcp_feedback: vec![],
-            },
-            VideoCodec::H264,
-            config,
-        )
-    }
-
-    /// Build an H264 camera track configured for server-managed simulcast.
-    /// Publish it with [`crate::Call::publish_video`].
-    pub fn h264_simulcast() -> Result<Self> {
-        Self::h264_with_config(LocalVideoTrackConfig::default().server_managed())
-    }
-
     fn with_codec(
         codec: RTCRtpCodecCapability,
-        codec_id: VideoCodec,
+        codec_id: VpxCodec,
         config: LocalVideoTrackConfig,
     ) -> Result<Self> {
         if config.target_bitrate_bps == 0 {
@@ -1093,8 +1049,10 @@ impl LocalVideoTrack {
         let stream_id = "stream-rust-video".to_owned();
         let rids: &[Option<&str>] = match (config.layering, codec_id) {
             (VideoLayering::Single, _) => &[None],
-            (VideoLayering::ServerManaged { .. }, VideoCodec::Vpx(VpxCodec::Vp9)) => &[Some("q")],
-            (VideoLayering::ServerManaged { .. }, _) => &[Some("q"), Some("h"), Some("f")],
+            (VideoLayering::ServerManaged { .. }, VpxCodec::Vp9) => &[Some("q")],
+            (VideoLayering::ServerManaged { .. }, VpxCodec::Vp8) => {
+                &[Some("q"), Some("h"), Some("f")]
+            }
         };
         let bitrate_kbps = config.target_bitrate_bps.saturating_add(999) / 1_000;
         let mut encodings = Vec::with_capacity(rids.len());
@@ -1204,9 +1162,6 @@ impl LocalVideoTrack {
                      and {MAX_LOCAL_VIDEO_PIXELS} pixels (got {width}x{height})"
                 ))
             })?;
-        if matches!(self.inner.codec_id, VideoCodec::H264) {
-            validate_h264_encode_request(width, height, duration)?;
-        }
         let expected = usize::try_from(width)
             .ok()
             .and_then(|width| {
@@ -1417,12 +1372,10 @@ impl LocalVideoTrack {
                 max_spatial_layers,
                 max_temporal_layers: _,
             } => {
-                let supported = (matches!(self.inner.codec_id, VideoCodec::H264)
-                    && track_type == TrackType::Video)
-                    || (matches!(self.inner.codec_id, VideoCodec::Vpx(VpxCodec::Vp8))
-                        && track_type == TrackType::ScreenShare)
-                    || (matches!(self.inner.codec_id, VideoCodec::Vpx(VpxCodec::Vp9))
-                        && track_type == TrackType::Video);
+                let supported = matches!(
+                    (self.inner.codec_id, track_type),
+                    (VpxCodec::Vp8, TrackType::ScreenShare) | (VpxCodec::Vp9, TrackType::Video)
+                );
                 if !supported {
                     return Err(RtcError::UnsupportedVideoLayering {
                         codec: self.mime_type(),
@@ -1532,7 +1485,7 @@ impl LocalVideoTrack {
     }
 
     fn is_vp9_svc(&self) -> bool {
-        matches!(self.inner.codec_id, VideoCodec::Vpx(VpxCodec::Vp9))
+        matches!(self.inner.codec_id, VpxCodec::Vp9)
             && matches!(self.inner.layering, VideoLayering::ServerManaged { .. })
     }
 
@@ -1701,13 +1654,6 @@ fn encode_i420_layers(
         let scale = encoding.scale_resolution_down_by();
         let layer_width = scaled_even(width, scale);
         let layer_height = scaled_even(height, scale);
-        if matches!(inner.codec_id, VideoCodec::H264) {
-            validate_h264_encode_request(
-                layer_width,
-                layer_height,
-                Duration::from_millis(dur_ms.max(1) as u64),
-            )?;
-        }
         let scaled;
         let layer_data = if layer_width == width && layer_height == height {
             data
@@ -1724,7 +1670,7 @@ fn encode_i420_layers(
             pts,
             dur_ms,
             timestamp,
-            if matches!(inner.codec_id, VideoCodec::Vpx(VpxCodec::Vp9))
+            if matches!(inner.codec_id, VpxCodec::Vp9)
                 && matches!(inner.layering, VideoLayering::ServerManaged { .. })
             {
                 Some(Vp9SvcMode::new(
@@ -1742,7 +1688,7 @@ fn encode_i420_layers(
 
 #[allow(clippy::too_many_arguments)]
 fn encode_layer_packets(
-    codec_id: VideoCodec,
+    codec_id: VpxCodec,
     encoding: &VideoEncoding,
     data: &[u8],
     width: u32,
@@ -1758,7 +1704,7 @@ fn encode_layer_packets(
         Some(state) => {
             let current_svc_mode = match &state.codec {
                 VideoCodecState::Vp9Svc { encoder, .. } => Some(encoder.mode()),
-                VideoCodecState::Vpx { .. } | VideoCodecState::H264 { .. } => None,
+                VideoCodecState::Vpx { .. } => None,
             };
             state.width != width
                 || state.height != height
@@ -1774,24 +1720,19 @@ fn encode_layer_packets(
             .unwrap_or_else(seed_u16);
         let prior_vp9_packetizer = guard.as_ref().and_then(|state| match &state.codec {
             VideoCodecState::Vp9Svc { packetizer, .. } => Some(packetizer.clone()),
-            VideoCodecState::Vpx { .. } | VideoCodecState::H264 { .. } => None,
+            VideoCodecState::Vpx { .. } => None,
         });
         let codec = match (codec_id, svc_mode) {
-            (VideoCodec::Vpx(VpxCodec::Vp9), Some(mode)) => VideoCodecState::Vp9Svc {
+            (VpxCodec::Vp9, Some(mode)) => VideoCodecState::Vp9Svc {
                 encoder: VpxSvcEncoder::new(width, height, bitrate_kbps, mode)?,
                 packetizer: prior_vp9_packetizer
                     .unwrap_or_else(|| VpxRtpPacketizer::new(VpxCodec::Vp9)),
             },
-            (VideoCodec::Vpx(codec), None) => VideoCodecState::Vpx {
+            (codec, None) => VideoCodecState::Vpx {
                 encoder: VpxEncoder::new(codec, width, height, bitrate_kbps)?,
                 packetizer: VpxRtpPacketizer::new(codec),
             },
-            (VideoCodec::H264, None) => VideoCodecState::H264 {
-                encoder: Box::new(H264Encoder::new(bitrate_kbps.saturating_mul(1_000))?),
-                packetizer: H264RtpPacketizer::default(),
-                encoded: Vec::new(),
-            },
-            (VideoCodec::Vpx(VpxCodec::Vp8), Some(_)) | (VideoCodec::H264, Some(_)) => {
+            (VpxCodec::Vp8, Some(_)) => {
                 return Err(RtcError::Media(
                     "VP9 SVC mode supplied for a non-VP9 encoder".to_owned(),
                 ));
@@ -1894,35 +1835,6 @@ fn encode_layer_packets(
                 out.push(RtpPacket {
                     header,
                     payload: Bytes::from(payload.data),
-                });
-                seq = seq.wrapping_add(1);
-            }
-        }
-        VideoCodecState::H264 {
-            encoder,
-            packetizer,
-            encoded,
-        } => {
-            let key = encoder.encode_into(data, width, height, force_key, encoded)?;
-            tracing::trace!(
-                bytes = encoded.len(),
-                key,
-                mime = %encoding.core.mime_type,
-                "stream.rtc.video.encoded_frame"
-            );
-            for payload in packetizer.packetize(encoded, PACKET_MTU)? {
-                let header = webrtc::rtp::header::Header {
-                    version: 2,
-                    payload_type: PLACEHOLDER_PT,
-                    sequence_number: seq,
-                    timestamp,
-                    ssrc: PLACEHOLDER_SSRC,
-                    marker: payload.last,
-                    ..Default::default()
-                };
-                out.push(RtpPacket {
-                    header,
-                    payload: payload.data,
                 });
                 seq = seq.wrapping_add(1);
             }
@@ -2859,10 +2771,6 @@ mod tests {
         assert!(track.track_id().starts_with("video-"));
     }
 
-    fn layered_config() -> LocalVideoTrackConfig {
-        LocalVideoTrackConfig::default().server_managed()
-    }
-
     fn layered_option(track_type: TrackType, codec: &str) -> PublishOption {
         PublishOption {
             id: 41,
@@ -2881,29 +2789,6 @@ mod tests {
             }),
             ..Default::default()
         }
-    }
-
-    #[test]
-    fn layered_h264_camera_builds_three_rid_encodings() {
-        let track = LocalVideoTrack::h264_with_config(layered_config()).expect("layered H264");
-        let layers = track
-            .configure_for_publish(TrackType::Video, &layered_option(TrackType::Video, "H264"))
-            .expect("supported H264 camera topology");
-        assert_eq!(
-            layers
-                .iter()
-                .map(|layer| layer.rid.as_str())
-                .collect::<Vec<_>>(),
-            ["q", "h", "f"]
-        );
-        assert_eq!(
-            track
-                .webrtc_tracks()
-                .iter()
-                .filter_map(|track| track.rid())
-                .collect::<Vec<_>>(),
-            ["q", "h", "f"]
-        );
     }
 
     #[test]
@@ -3130,9 +3015,12 @@ mod tests {
 
     #[test]
     fn publish_quality_updates_only_the_named_rid_and_forces_keyframe_on_resume() {
-        let track = LocalVideoTrack::h264_with_config(layered_config()).expect("layered H264");
+        let track = LocalVideoTrack::vp8_simulcast().expect("layered VP8");
         track
-            .configure_for_publish(TrackType::Video, &layered_option(TrackType::Video, "H264"))
+            .configure_for_publish(
+                TrackType::ScreenShare,
+                &layered_option(TrackType::ScreenShare, "VP8"),
+            )
             .expect("configure layers");
         track.apply_layer_setting(&VideoLayerSetting {
             name: "h".to_owned(),
@@ -3225,40 +3113,6 @@ mod tests {
                 .await
                 .expect("write_i420 blue frame");
         }
-    }
-
-    #[tokio::test]
-    async fn h264_write_i420_encodes_blue_frame() {
-        let track = LocalVideoTrack::h264().expect("H264 track");
-        let (w, h) = (320u32, 240u32);
-        let mut buf = vec![41u8; (w * h) as usize];
-        buf.extend(std::iter::repeat_n(240u8, ((w / 2) * (h / 2)) as usize));
-        buf.extend(std::iter::repeat_n(110u8, ((w / 2) * (h / 2)) as usize));
-        track
-            .write_i420(&buf, w, h, Duration::from_millis(100))
-            .await
-            .expect("write_i420 H264 blue frame");
-        assert_eq!(track.mime_type(), MIME_TYPE_H264);
-    }
-
-    #[tokio::test]
-    async fn h264_write_i420_rejects_frames_beyond_level_3_1_before_copy() {
-        let track = LocalVideoTrack::h264().expect("H264 track");
-        let max_fs_error = track
-            .write_i420(&[], 1_920, 1_080, Duration::from_millis(100))
-            .await
-            .expect_err("1080p exceeds level 3.1 MaxFS");
-        assert!(max_fs_error.to_string().contains("level 3.1"));
-
-        let frame_rate_error = track
-            .write_i420(&[], 1_280, 720, Duration::from_millis(16))
-            .await
-            .expect_err("720p60 exceeds the configured level 3.1 rate");
-        assert!(
-            frame_rate_error
-                .to_string()
-                .contains("duration is too short")
-        );
     }
 
     #[tokio::test]

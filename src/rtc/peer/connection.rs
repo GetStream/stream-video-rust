@@ -4,9 +4,7 @@ use std::sync::Arc;
 
 use serde_json::json;
 use webrtc::api::interceptor_registry::register_default_interceptors;
-use webrtc::api::media_engine::{
-    MIME_TYPE_H264, MIME_TYPE_OPUS, MIME_TYPE_VP8, MIME_TYPE_VP9, MediaEngine,
-};
+use webrtc::api::media_engine::{MIME_TYPE_OPUS, MIME_TYPE_VP8, MIME_TYPE_VP9, MediaEngine};
 use webrtc::api::{API, APIBuilder};
 use webrtc::ice_transport::ice_server::RTCIceServer;
 use webrtc::interceptor::registry::Registry;
@@ -23,19 +21,18 @@ use webrtc::sdp::extmap::{
 
 use crate::rtc::coordinator::IceServer;
 use crate::rtc::error::Result;
-use crate::rtc::publish_options::H264_FMTP;
 use crate::rtc::tracer::Tracer;
 
 const OPUS_PAYLOAD_TYPE: u8 = 111;
 const VP8_PAYLOAD_TYPE: u8 = 96;
 const VP9_PAYLOAD_TYPE: u8 = 98;
-const H264_PAYLOAD_TYPE: u8 = 125;
 
 /// Register exactly the codecs that the SDK can encode or decode.
 ///
 /// `MediaEngine::register_default_codecs` also advertises legacy audio, VP9
-/// profile 1, AV1, and HEVC. Negotiating any of those would deliver a track
-/// that the decoded [`RemoteTrack`](crate::rtc::RemoteTrack) APIs cannot consume.
+/// profile 1, H264, AV1, and HEVC. Negotiating any of those would deliver a
+/// track that the decoded [`RemoteTrack`](crate::rtc::RemoteTrack) APIs cannot
+/// consume.
 fn register_supported_codecs(media_engine: &mut MediaEngine) -> Result<()> {
     media_engine.register_codec(
         RTCRtpCodecParameters {
@@ -73,7 +70,6 @@ fn register_supported_codecs(media_engine: &mut MediaEngine) -> Result<()> {
     for (mime_type, payload_type, fmtp) in [
         (MIME_TYPE_VP8, VP8_PAYLOAD_TYPE, ""),
         (MIME_TYPE_VP9, VP9_PAYLOAD_TYPE, "profile-id=0"),
-        (MIME_TYPE_H264, H264_PAYLOAD_TYPE, H264_FMTP),
     ] {
         media_engine.register_codec(
             RTCRtpCodecParameters {
@@ -386,13 +382,13 @@ mod tests {
             );
         }
 
-        for supported in ["VP8/90000", "VP9/90000", "H264/90000"] {
+        for supported in ["VP8/90000", "VP9/90000"] {
             assert!(
                 video.contains(supported),
                 "missing supported video codec {supported}:\n{video}"
             );
         }
-        for unsupported in ["AV1/90000", "H265/90000"] {
+        for unsupported in ["H264/90000", "AV1/90000", "H265/90000"] {
             assert!(
                 !video.contains(unsupported),
                 "advertised unsupported video codec {unsupported}:\n{video}"

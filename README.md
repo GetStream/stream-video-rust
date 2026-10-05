@@ -35,7 +35,7 @@ remote audio and video, transform it, and publish media back into the call.
   audio, video, and screen-share tracks.
 - Observe typed participant, connection-quality, pin, grant, and inbound-pause
   state from the SFU.
-- Read Opus audio as PCM, decode VP8/VP9/H264 video as I420, or work with raw
+- Read Opus audio as PCM, decode VP8/VP9 video as I420, or work with raw
   RTP packets.
 - Resample and rechannel PCM, convert it to 32-bit float, raw bytes, WAV, or
   G.711, and slice it into chunks and sliding windows.
@@ -249,8 +249,8 @@ async fn run_media_bridge(call: &Call) -> Result<(), Box<dyn std::error::Error>>
 }
 ```
 
-For a complete bridge with cancellation, barge-in, audio and video processing,
-and deterministic cleanup, see [`gpt_realtime_bot`](https://github.com/GetStream/stream-video-rust/blob/main/examples/gpt_realtime_bot.rs).
+For a complete voice bridge with cancellation, barge-in, and deterministic
+cleanup, see [`gpt_realtime_bot`](https://github.com/GetStream/stream-video-rust/blob/main/examples/gpt_realtime_bot.rs).
 
 For selective agents, set `role_filters` and `max_subscriptions` in
 `SubscriptionConfig`, or use `Call::update_subscription_targets` with
@@ -305,10 +305,9 @@ bitrate, and every codec has a `_with_config` constructor that takes it.
 
 Layered publishing is opt-in. `LocalVideoTrack::vp9_svc()` provides camera SVC
 with up to three spatial and temporal layers on one SSRC.
-`LocalVideoTrack::h264_simulcast()` supports camera video and
 `LocalVideoTrack::vp8_simulcast()` supports screen share with a `q`/`h`/`f` RID
-ladder on one m-line. Each of the three is a shortcut for the matching
-`_with_config` call on a `server_managed` config. All three follow SFU quality
+ladder on one m-line. Each of the two is a shortcut for the matching
+`_with_config` call on a `server_managed` config. Both follow SFU quality
 updates. To publish fewer layers than the SFU offers, set `VideoLayering`
 directly and cap the counts.
 
@@ -335,8 +334,7 @@ fn video_tracks() -> RtcResult<()> {
     };
     let capped_svc = LocalVideoTrack::vp9_with_config(capped)?;
 
-    // H264 camera simulcast, and VP8 screen-share simulcast.
-    let h264_camera = LocalVideoTrack::h264_simulcast()?;
+    // VP8 screen-share simulcast.
     let screen_share = LocalVideoTrack::vp8_simulcast()?;
     Ok(())
 }
@@ -370,7 +368,7 @@ Join a call as a backend participant:
 cargo run --example join_call
 ```
 
-Run the Stream-to-OpenAI Realtime audio/video bridge:
+Run the Stream-to-OpenAI Realtime voice bridge:
 
 ```bash
 cargo run --example gpt_realtime_bot
@@ -405,9 +403,6 @@ tracing::info!(event_type = event.event_type(), "verified Stream webhook");
 # Ok(())
 # }
 ```
-
-H264 can be subject to patent obligations in some jurisdictions. Applications
-that distribute H264 functionality must assess their own requirements.
 
 ## Contributing
 

@@ -3,8 +3,7 @@
 use super::*;
 use crate::client::ClientConfig;
 use crate::rtc::{
-    ClientPublishOptions, LocalAudioTrack, LocalVideoTrack, LocalVideoTrackConfig, PcmFrame,
-    PreferredVideoCodec, publish_options::H264_FMTP,
+    ClientPublishOptions, LocalAudioTrack, LocalVideoTrack, PcmFrame, PreferredVideoCodec,
 };
 use std::io::{Read, Write};
 use std::net::TcpListener;
@@ -289,23 +288,23 @@ fn preferred_codec(core: &RtcCore, generation: u64) -> Option<models::Codec> {
 }
 
 #[test]
-fn pre_join_h264_preference_builds_canonical_join_option() {
+fn pre_join_vp8_preference_builds_canonical_join_option() {
     let core = test_core();
     core.update_publish_options(ClientPublishOptions {
-        preferred_codec: Some(PreferredVideoCodec::H264),
+        preferred_codec: Some(PreferredVideoCodec::Vp8),
     });
     let generation = core.begin_join().expect("join generation");
 
-    let codec = preferred_codec(&core, generation).expect("H264 preference");
-    assert_eq!(codec.name, "H264");
-    assert_eq!(codec.fmtp, H264_FMTP);
+    let codec = preferred_codec(&core, generation).expect("VP8 preference");
+    assert_eq!(codec.name, "VP8");
+    assert_eq!(codec.fmtp, "");
 }
 
 #[test]
 fn update_after_join_starts_has_no_effect() {
     let core = test_core();
     core.update_publish_options(ClientPublishOptions {
-        preferred_codec: Some(PreferredVideoCodec::H264),
+        preferred_codec: Some(PreferredVideoCodec::Vp8),
     });
     let generation = core.begin_join().expect("join generation");
     assert!(core.set_state_if_current(generation, CallingState::Joined));
@@ -314,8 +313,8 @@ fn update_after_join_starts_has_no_effect() {
         preferred_codec: Some(PreferredVideoCodec::Vp9),
     });
 
-    let codec = preferred_codec(&core, generation).expect("active H264 preference");
-    assert_eq!(codec.name, "H264");
+    let codec = preferred_codec(&core, generation).expect("active VP8 preference");
+    assert_eq!(codec.name, "VP8");
 
     let leave_generation = core.cancel_generation();
     assert!(core.set_state_if_current(leave_generation, CallingState::Left));
@@ -328,15 +327,15 @@ fn update_after_join_starts_has_no_effect() {
 async fn publish_preference_persists_across_leave_and_rejoin() {
     let core = test_core();
     core.update_publish_options(ClientPublishOptions {
-        preferred_codec: Some(PreferredVideoCodec::H264),
+        preferred_codec: Some(PreferredVideoCodec::Vp8),
     });
     core.begin_join().expect("first generation");
     core.leave("test leave").await.expect("leave");
     let second = core.begin_join().expect("second generation");
 
-    let codec = preferred_codec(&core, second).expect("retained H264 preference");
-    assert_eq!(codec.name, "H264");
-    assert_eq!(codec.fmtp, H264_FMTP);
+    let codec = preferred_codec(&core, second).expect("retained VP8 preference");
+    assert_eq!(codec.name, "VP8");
+    assert_eq!(codec.fmtp, "");
 
     core.leave("test reset").await.expect("second leave");
     core.update_publish_options(ClientPublishOptions::default());
@@ -1094,16 +1093,16 @@ async fn a_stopped_simulcast_publication_is_not_replaced() {
     let (mut connection, _sfu) = establish_fake(&core, generation).await;
     connection.publish_options = vec![models::PublishOption {
         id: 1,
-        track_type: TrackType::Video as i32,
+        track_type: TrackType::ScreenShare as i32,
         codec: Some(models::Codec {
-            name: "h264".to_owned(),
+            name: "vp8".to_owned(),
             ..Default::default()
         }),
         ..Default::default()
     }];
     let stopped = LocalTrack::Video {
-        track: LocalVideoTrack::h264_simulcast().expect("simulcast track"),
-        track_type: TrackType::Video,
+        track: LocalVideoTrack::vp8_simulcast().expect("simulcast track"),
+        track_type: TrackType::ScreenShare,
     };
     let reader_tasks = crate::rtc::peer::publisher::add_transceiver_for_track(
         &connection.publisher,
@@ -1116,7 +1115,7 @@ async fn a_stopped_simulcast_publication_is_not_replaced() {
     core.own_capabilities
         .lock()
         .unwrap_or_else(|error| error.into_inner())
-        .insert("send-video".to_owned());
+        .insert("screenshare".to_owned());
     {
         let mut media = core.media.lock().await;
         media.begin_publish(stopped.clone(), 1);
@@ -1125,20 +1124,20 @@ async fn a_stopped_simulcast_publication_is_not_replaced() {
     stopped.stop();
 
     for track in [
-        LocalVideoTrack::h264_simulcast().expect("new simulcast track"),
-        LocalVideoTrack::h264().expect("new single-layer track"),
+        LocalVideoTrack::vp8_simulcast().expect("new simulcast track"),
+        LocalVideoTrack::vp8().expect("new single-layer track"),
     ] {
         let result = core
             .publish(LocalTrack::Video {
                 track,
-                track_type: TrackType::Video,
+                track_type: TrackType::ScreenShare,
             })
             .await;
         assert!(
             matches!(
                 result,
                 Err(RtcError::SimulcastReplace {
-                    track_type: TrackType::Video
+                    track_type: TrackType::ScreenShare
                 })
             ),
             "{result:?}"
@@ -1843,9 +1842,7 @@ async fn video_track_with_a_non_video_type_is_not_published() {
         .lock()
         .unwrap_or_else(|error| error.into_inner())
         .insert("send-video".to_owned());
-    let track =
-        LocalVideoTrack::h264_with_config(LocalVideoTrackConfig::default().server_managed())
-            .expect("video track");
+    let track = LocalVideoTrack::vp9_svc().expect("video track");
 
     let result = core
         .publish(LocalTrack::Video {
@@ -2366,19 +2363,18 @@ fn mute_state_builder_deduplicates_track_types() {
 
 #[test]
 fn publish_quality_routes_by_option_id_and_track_type() {
-    let config = LocalVideoTrackConfig::default().server_managed();
     let first = LocalTrack::Video {
-        track: LocalVideoTrack::h264_with_config(config).expect("first layered track"),
-        track_type: TrackType::Video,
+        track: LocalVideoTrack::vp8_simulcast().expect("first layered track"),
+        track_type: TrackType::ScreenShare,
     };
     let second = LocalTrack::Video {
-        track: LocalVideoTrack::h264_with_config(config).expect("second layered track"),
-        track_type: TrackType::Video,
+        track: LocalVideoTrack::vp8_simulcast().expect("second layered track"),
+        track_type: TrackType::ScreenShare,
     };
     let option = models::PublishOption {
-        track_type: TrackType::Video as i32,
+        track_type: TrackType::ScreenShare as i32,
         codec: Some(models::Codec {
-            name: "H264".to_owned(),
+            name: "VP8".to_owned(),
             ..Default::default()
         }),
         bitrate: 1_200_000,
@@ -2398,7 +2394,7 @@ fn publish_quality_routes_by_option_id_and_track_type() {
 
     let matched = media.apply_publish_quality(&event::ChangePublishQuality {
         video_senders: vec![event::VideoSender {
-            track_type: TrackType::Video as i32,
+            track_type: TrackType::ScreenShare as i32,
             publish_option_id: 11,
             layers: vec![event::VideoLayerSetting {
                 name: "h".to_owned(),
@@ -2417,22 +2413,19 @@ fn publish_quality_routes_by_option_id_and_track_type() {
 }
 
 #[test]
-fn publish_quality_routes_to_vp9_without_mutating_an_h264_publication() {
-    let h264_track =
-        LocalVideoTrack::h264_with_config(LocalVideoTrackConfig::default().server_managed())
-            .expect("layered H264");
-    let vp9_track = LocalVideoTrack::vp9_svc().expect("VP9 SVC");
-    let h264 = LocalTrack::Video {
-        track: h264_track,
-        track_type: TrackType::Video,
+fn publish_quality_routes_to_vp9_without_mutating_a_vp8_publication() {
+    let vp8 = LocalTrack::Video {
+        track: LocalVideoTrack::vp8_simulcast().expect("layered VP8"),
+        track_type: TrackType::ScreenShare,
     };
+    let vp9_track = LocalVideoTrack::vp9_svc().expect("VP9 SVC");
     let vp9 = LocalTrack::Video {
         track: vp9_track.clone(),
         track_type: TrackType::Video,
     };
-    let option = |id, codec: &str| models::PublishOption {
+    let option = |id, track_type: TrackType, codec: &str| models::PublishOption {
         id,
-        track_type: TrackType::Video as i32,
+        track_type: track_type as i32,
         codec: Some(models::Codec {
             name: codec.to_owned(),
             ..Default::default()
@@ -2447,13 +2440,13 @@ fn publish_quality_routes_to_vp9_without_mutating_an_h264_publication() {
         }),
         ..Default::default()
     };
-    h264.configure_for_publish(&option(10, "H264"))
-        .expect("H264 plan");
-    vp9.configure_for_publish(&option(11, "VP9"))
+    vp8.configure_for_publish(&option(10, TrackType::ScreenShare, "VP8"))
+        .expect("VP8 plan");
+    vp9.configure_for_publish(&option(11, TrackType::Video, "VP9"))
         .expect("VP9 plan");
-    let h264_before = h264.video_layer_control_state("q").expect("H264 low layer");
+    let vp8_before = vp8.video_layer_control_state("q").expect("VP8 low layer");
     let mut media = MediaState::default();
-    media.begin_publish(h264.clone(), 10);
+    media.begin_publish(vp8.clone(), 10);
     media.begin_publish(vp9.clone(), 11);
 
     let matched = media.apply_publish_quality(&event::ChangePublishQuality {
@@ -2475,7 +2468,7 @@ fn publish_quality_routes_to_vp9_without_mutating_an_h264_publication() {
     });
 
     assert_eq!(matched, 1);
-    assert_eq!(h264.video_layer_control_state("q"), Some(h264_before));
+    assert_eq!(vp8.video_layer_control_state("q"), Some(vp8_before));
     assert_eq!(vp9_track.svc_mode(), Some((1, 2)));
     assert_eq!(
         vp9.video_layer_control_state("q"),
@@ -2573,9 +2566,8 @@ fn refreshed_vp9_publish_option_restores_cached_svc_quality() {
 fn refreshed_publish_options_preserve_pair_scoped_quality() {
     let audio = LocalTrack::Audio(LocalAudioTrack::opus().expect("audio track"));
     let video = LocalTrack::Video {
-        track: LocalVideoTrack::h264_with_config(LocalVideoTrackConfig::default().server_managed())
-            .expect("layered video"),
-        track_type: TrackType::Video,
+        track: LocalVideoTrack::vp8_simulcast().expect("layered video"),
+        track_type: TrackType::ScreenShare,
     };
     let options = vec![
         models::PublishOption {
@@ -2589,9 +2581,9 @@ fn refreshed_publish_options_preserve_pair_scoped_quality() {
         },
         models::PublishOption {
             id: 41,
-            track_type: TrackType::Video as i32,
+            track_type: TrackType::ScreenShare as i32,
             codec: Some(models::Codec {
-                name: "H264".to_owned(),
+                name: "VP8".to_owned(),
                 ..Default::default()
             }),
             bitrate: 1_200_000,
@@ -2613,7 +2605,7 @@ fn refreshed_publish_options_preserve_pair_scoped_quality() {
     assert_eq!(
         media.apply_publish_quality(&event::ChangePublishQuality {
             video_senders: vec![event::VideoSender {
-                track_type: TrackType::Video as i32,
+                track_type: TrackType::ScreenShare as i32,
                 publish_option_id: 41,
                 layers: vec![event::VideoLayerSetting {
                     name: "h".to_owned(),
@@ -2646,7 +2638,7 @@ fn refreshed_publish_options_preserve_pair_scoped_quality() {
     assert!(
         media
             .publish_quality
-            .contains_key(&(41, TrackType::Video as i32))
+            .contains_key(&(41, TrackType::ScreenShare as i32))
     );
     assert!(
         !media

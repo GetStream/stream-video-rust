@@ -1,6 +1,6 @@
 //! Reproducible local media baselines for production-hardening work.
 //!
-//! These benchmarks intentionally exercise the same private VPx/H264 encoders,
+//! These benchmarks intentionally exercise the same private VPx encoders,
 //! decoders, and RTP packetizers as the SDK without making benchmark hooks part
 //! of the public API.
 
@@ -18,10 +18,6 @@ mod rtc;
 
 use rtc::codecs::rtp_vpx::VpxRtpPacketizer;
 use rtc::codecs::vpx::{VpxCodec, VpxDecoder, VpxEncoder};
-use rtc::codecs::{
-    h264::{H264Decoder, H264Encoder},
-    rtp_h264::H264RtpPacketizer,
-};
 
 const FRAME_DURATION_MS: i64 = 33;
 const RTP_PAYLOAD_MTU: usize = 1_200;
@@ -61,18 +57,6 @@ fn encoded_keyframe(codec: VpxCodec, width: u32, height: u32) -> Vec<u8> {
         .find(|frame| !frame.data.is_empty())
         .expect("fixture encoder must emit a frame")
         .data
-}
-
-fn encoded_h264_keyframe(width: u32, height: u32) -> Vec<u8> {
-    let source = i420_fixture(width, height);
-    let mut encoder = H264Encoder::new(1_000_000).expect("create fixture H264 encoder");
-    let mut encoded = Vec::new();
-    let keyframe = encoder
-        .encode_into(&source, width, height, true, &mut encoded)
-        .expect("encode fixture H264 keyframe");
-    assert!(keyframe, "fixture H264 frame must be a keyframe");
-    assert!(!encoded.is_empty(), "fixture H264 frame must not be empty");
-    encoded
 }
 
 fn bench_resampling(criterion: &mut Criterion) {
@@ -155,18 +139,6 @@ fn bench_rtp_packetization(criterion: &mut Criterion) {
             },
         );
     }
-    let frame = encoded_h264_keyframe(1_280, 720);
-    let mut packetizer = H264RtpPacketizer::default();
-    group.throughput(Throughput::Bytes(frame.len() as u64));
-    group.bench_function("h264_720p_keyframe", |bencher| {
-        bencher.iter(|| {
-            black_box(
-                packetizer
-                    .packetize(black_box(&frame), RTP_PAYLOAD_MTU)
-                    .expect("packetize H264 benchmark frame"),
-            )
-        });
-    });
     group.finish();
 }
 
@@ -222,43 +194,6 @@ fn bench_vpx_decode(criterion: &mut Criterion) {
                 },
             );
         }
-    }
-    group.finish();
-}
-
-fn bench_h264_encode(criterion: &mut Criterion) {
-    let mut group = criterion.benchmark_group("h264_encode");
-    for (width, height) in [(640, 360), (1_280, 720)] {
-        let mut source = i420_fixture(width, height);
-        let mut encoder = H264Encoder::new(1_000_000).expect("create H264 encoder");
-        let mut encoded = Vec::new();
-        encoder
-            .encode_into(&source, width, height, true, &mut encoded)
-            .expect("warm H264 encoder");
-        let mut frame_index = 0usize;
-
-        group.throughput(Throughput::Bytes(source.len() as u64));
-        group.bench_function(
-            format!("h264_{width}x{height}_realtime_sequence"),
-            |bencher| {
-                bencher.iter(|| {
-                    let offset = frame_index % source.len();
-                    source[offset] = source[offset].wrapping_add(1);
-                    let force_keyframe = frame_index.is_multiple_of(30);
-                    let keyframe = encoder
-                        .encode_into(
-                            black_box(&source),
-                            width,
-                            height,
-                            force_keyframe,
-                            black_box(&mut encoded),
-                        )
-                        .expect("encode H264 benchmark frame");
-                    frame_index = frame_index.wrapping_add(1);
-                    black_box((keyframe, encoded.len()))
-                });
-            },
-        );
     }
     group.finish();
 }
@@ -322,26 +257,6 @@ fn bench_multitrack_load(criterion: &mut Criterion) {
     group.finish();
 }
 
-fn bench_h264_decode(criterion: &mut Criterion) {
-    let mut group = criterion.benchmark_group("h264_decode");
-    for (width, height) in [(640, 360), (1_280, 720)] {
-        let encoded = encoded_h264_keyframe(width, height);
-        let mut decoder = H264Decoder::new().expect("create H264 decoder");
-
-        group.throughput(Throughput::Bytes(encoded.len() as u64));
-        group.bench_function(format!("h264_{width}x{height}_keyframe"), |bencher| {
-            bencher.iter(|| {
-                black_box(
-                    decoder
-                        .decode(black_box(&encoded), 90_000)
-                        .expect("decode H264 benchmark frame"),
-                )
-            });
-        });
-    }
-    group.finish();
-}
-
 criterion_group! {
     name = media_baselines;
     config = Criterion::default()
@@ -354,8 +269,6 @@ criterion_group! {
         bench_rtp_packetization,
         bench_vpx_encode,
         bench_vpx_decode,
-        bench_h264_encode,
-        bench_h264_decode,
         bench_multitrack_load
 }
 criterion_main!(media_baselines);
