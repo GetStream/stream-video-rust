@@ -751,7 +751,7 @@ async fn no_video_on_track_without_video_subscription() {
             .await
             .expect("A publish video");
 
-        // B subscribes to audio only (the default).
+        // B subscribes to audio only.
         let mut rx_b = track_sink(&call_b);
         call_b
             .join(JoinCallData::new(&user_b))
