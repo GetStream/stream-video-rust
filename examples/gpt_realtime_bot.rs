@@ -334,8 +334,6 @@ async fn configure_openai(
         Box::pin(async move {
             if state == RTCPeerConnectionState::Connected {
                 paced_mic.start_pacing().await;
-            } else {
-                paced_mic.pause_pacing();
             }
         })
     }));

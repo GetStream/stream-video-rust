@@ -166,12 +166,13 @@ pub(super) fn register_connection_state(
             tracing::debug!(label, ?state, "stream.rtc.pc.state");
             tracer.trace("connectionstatechange", json!(state.to_string()));
             // Not awaited: waiting for the media lock here can block ICE
-            // state delivery. The sync reads the current publisher state, so
-            // a subscriber change applies the same state again.
-            if core.is_generation_current(generation) {
-                let sync_core = core.clone();
+            // state delivery. The task reads the current publisher state, so
+            // a subscriber change only repeats the check.
+            if state == RTCPeerConnectionState::Connected && core.is_generation_current(generation)
+            {
+                let pacing_core = core.clone();
                 std::mem::drop(core.spawn_generation_task(generation, async move {
-                    sync_core.sync_audio_pacing().await;
+                    pacing_core.start_audio_pacing_if_connected().await;
                 }));
             }
             if state == RTCPeerConnectionState::Connected {

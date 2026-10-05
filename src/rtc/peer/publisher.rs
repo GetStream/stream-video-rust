@@ -101,11 +101,6 @@ pub(crate) async fn restart_ice(
             }
         }
     }
-    // Media is lost until ICE connects again; the publisher `Connected` state
-    // resumes pacing.
-    for track in tracks {
-        track.pause_audio_pacing();
-    }
     negotiate_publish(publisher, signal, session_id, tracks, publish_options).await
 }
 
@@ -385,13 +380,12 @@ mod tests {
             .expect("remote track")
             .expect("remote track channel");
         let (mut last, _) = remote.read_rtp().await.expect("first packet");
-        retired.pause_audio_pacing();
+        retired.stop();
         while let Ok(Ok((packet, _))) =
             tokio::time::timeout(Duration::from_millis(200), remote.read_rtp()).await
         {
             last = packet;
         }
-        retired.stop();
 
         let track = LocalTrack::Audio(LocalAudioTrack::opus().expect("second track"));
         assert!(
