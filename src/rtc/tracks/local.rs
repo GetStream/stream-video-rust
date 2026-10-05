@@ -213,6 +213,11 @@ impl TrackCore {
             ));
         }
         if self.muted.load(Ordering::SeqCst) || self.quality_paused.load(Ordering::SeqCst) {
+            // The RTP clock keeps time while no packet goes out.
+            self.packetizer
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .skip_samples(samples);
             return Ok(());
         }
         let payload = Bytes::copy_from_slice(payload);
@@ -872,6 +877,17 @@ struct VideoClock {
     rtp_ts: u32,
 }
 
+impl VideoClock {
+    /// Return the presentation time and RTP timestamp of the next frame, and
+    /// move the clock past its duration.
+    fn advance(&mut self, dur_ms: i64, samples: u32) -> (i64, u32) {
+        let current = (self.next_pts, self.rtp_ts);
+        self.next_pts = self.next_pts.saturating_add(dur_ms);
+        self.rtp_ts = self.rtp_ts.wrapping_add(samples);
+        current
+    }
+}
+
 struct VideoEncoding {
     core: TrackCore,
     encoder: StdMutex<Option<VideoEncoder>>,
@@ -1138,6 +1154,9 @@ impl LocalVideoTrack {
                 "write to a stopped track".to_owned(),
             ));
         }
+        let dur_ms = i64::try_from(duration.as_millis().max(1)).unwrap_or(i64::MAX);
+        let samples =
+            (duration.as_secs_f64() * f64::from(self.inner.encodings[0].core.clock_rate)) as u32;
         if self
             .inner
             .encodings
@@ -1147,6 +1166,12 @@ impl LocalVideoTrack {
             ))
             .all(|encoding| encoding.core.is_output_paused())
         {
+            // The RTP clock keeps time while no frame goes out.
+            self.inner
+                .clock
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .advance(dur_ms, samples);
             return Ok(());
         }
         if width == 0 || height == 0 || !width.is_multiple_of(2) || !height.is_multiple_of(2) {
@@ -1204,10 +1229,6 @@ impl LocalVideoTrack {
                 data.len()
             )));
         }
-
-        let dur_ms = i64::try_from(duration.as_millis().max(1)).unwrap_or(i64::MAX);
-        let samples =
-            (duration.as_secs_f64() * f64::from(self.inner.encodings[0].core.clock_rate)) as u32;
 
         let permit = self
             .inner
@@ -1666,16 +1687,11 @@ fn encode_i420_layers(
     dur_ms: i64,
     samples: u32,
 ) -> Result<Vec<(usize, Vec<RtpPacket>)>> {
-    let (pts, timestamp) = {
-        let mut clock = inner
-            .clock
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        let current = (clock.next_pts, clock.rtp_ts);
-        clock.next_pts = clock.next_pts.saturating_add(dur_ms);
-        clock.rtp_ts = clock.rtp_ts.wrapping_add(samples);
-        current
-    };
+    let (pts, timestamp) = inner
+        .clock
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .advance(dur_ms, samples);
     let count = usize::from(inner.active_encoding_count.load(Ordering::SeqCst));
     let mut output = Vec::with_capacity(count);
     for (index, encoding) in inner.encodings.iter().take(count).enumerate() {
@@ -2536,6 +2552,111 @@ mod tests {
             "the timestamp advanced {skipped} samples over the mute"
         );
         track.stop();
+        let _ = sender.close().await;
+        let _ = receiver.close().await;
+    }
+
+    #[tokio::test]
+    async fn the_rtp_clock_runs_while_encoded_audio_is_muted() {
+        let track = LocalAudioTrack::opus().expect("opus track");
+        let sender = peer::new_peer_connection(&[]).await.expect("sender");
+        sender
+            .add_track(track.webrtc_track())
+            .await
+            .expect("add track");
+        let (receiver, mut remote_rx) = peer::connect_audio_receiver(&sender).await;
+        let silence = [0xf8u8, 0xff, 0xfe];
+        let frame = Duration::from_millis(20);
+        let published = LocalTrack::Audio(track.clone());
+
+        for _ in 0..3 {
+            track.write_sample(&silence, frame).await.expect("write");
+        }
+        let remote = tokio::time::timeout(Duration::from_secs(5), remote_rx.recv())
+            .await
+            .expect("remote track")
+            .expect("remote track channel");
+        let mut before = None;
+        while let Ok(Ok((packet, _))) =
+            tokio::time::timeout(Duration::from_millis(100), remote.read_rtp()).await
+        {
+            before = Some(packet);
+        }
+        published.set_muted(true);
+        for _ in 0..10 {
+            track
+                .write_sample(&silence, frame)
+                .await
+                .expect("muted write");
+        }
+        published.set_muted(false);
+        track.write_sample(&silence, frame).await.expect("write");
+        let (after, _) = tokio::time::timeout(Duration::from_secs(5), remote.read_rtp())
+            .await
+            .expect("packet after the mute")
+            .expect("packet after the mute");
+
+        let before = before.expect("packets before the mute");
+        assert_eq!(
+            after.header.timestamp.wrapping_sub(before.header.timestamp),
+            11 * FRAME_SAMPLES_20MS as u32
+        );
+        let _ = sender.close().await;
+        let _ = receiver.close().await;
+    }
+
+    #[tokio::test]
+    async fn the_rtp_clock_runs_while_a_video_track_is_muted() {
+        use webrtc::rtp_transceiver::rtp_codec::RTPCodecType;
+
+        let track = LocalVideoTrack::vp9().expect("vp9 track");
+        let sender = peer::new_peer_connection(&[]).await.expect("sender");
+        sender
+            .add_track(track.webrtc_track())
+            .await
+            .expect("add track");
+        let (receiver, mut remote_rx) = peer::connect_receiver(&sender, RTPCodecType::Video).await;
+        let frame = vec![128_u8; 320 * 240 * 3 / 2];
+        let frame_time = Duration::from_millis(33);
+
+        for _ in 0..3 {
+            track
+                .write_i420(&frame, 320, 240, frame_time)
+                .await
+                .expect("frame");
+        }
+        let remote = tokio::time::timeout(Duration::from_secs(5), remote_rx.recv())
+            .await
+            .expect("remote track")
+            .expect("remote track channel");
+        let mut before = None;
+        while let Ok(Ok((packet, _))) =
+            tokio::time::timeout(Duration::from_millis(100), remote.read_rtp()).await
+        {
+            before = Some(packet);
+        }
+        track.set_muted(true);
+        for _ in 0..10 {
+            track
+                .write_i420(&frame, 320, 240, frame_time)
+                .await
+                .expect("muted frame");
+        }
+        track.set_muted(false);
+        track
+            .write_i420(&frame, 320, 240, frame_time)
+            .await
+            .expect("frame");
+        let (after, _) = tokio::time::timeout(Duration::from_secs(5), remote.read_rtp())
+            .await
+            .expect("packet after the mute")
+            .expect("packet after the mute");
+
+        let before = before.expect("packets before the mute");
+        assert_eq!(
+            after.header.timestamp.wrapping_sub(before.header.timestamp),
+            11 * 2_970
+        );
         let _ = sender.close().await;
         let _ = receiver.close().await;
     }
