@@ -238,7 +238,8 @@ enum Decode {
 /// An inbound media track from a remote participant.
 ///
 /// Not `Clone`: it owns the inbound stream and unsubscribes on drop. Wrap it in
-/// an `Arc` if you need shared read handles.
+/// an `Arc` if you need shared read handles. When the publisher publishes a
+/// dropped track again, `on_track` delivers a new `RemoteTrack` for it.
 pub struct RemoteTrack {
     track: Arc<TrackRemote>,
     participant: RemoteParticipant,
@@ -258,6 +259,8 @@ pub struct RemoteTrack {
     last_keyframe_request: StdMutex<Option<Instant>>,
     /// Invoked once on drop to unsubscribe from the SFU.
     on_drop: StdMutex<Option<Box<dyn FnOnce() + Send>>>,
+    /// A packet read before this track was built, returned by the first read.
+    first_packet: StdMutex<Option<RtpPacket>>,
 }
 
 impl RemoteTrack {
@@ -265,13 +268,15 @@ impl RemoteTrack {
     ///
     /// `subscriber` is the PeerConnection the track arrived on, used to send
     /// RTCP keyframe requests. `on_drop` is invoked exactly once when the track
-    /// is dropped so the call can retract the subscription.
+    /// is dropped so the call can retract the subscription. `first_packet` is
+    /// returned before the packets of `track`.
     pub(crate) fn new(
         track: Arc<TrackRemote>,
         participant: RemoteParticipant,
         track_type: TrackType,
         subscriber: Weak<RTCPeerConnection>,
         on_drop: Box<dyn FnOnce() + Send>,
+        first_packet: Option<RtpPacket>,
     ) -> Self {
         let params = track.codec();
         let codec = Codec {
@@ -294,6 +299,7 @@ impl RemoteTrack {
             subscriber,
             last_keyframe_request: StdMutex::new(None),
             on_drop: StdMutex::new(Some(on_drop)),
+            first_packet: StdMutex::new(first_packet),
         }
     }
 
@@ -317,6 +323,7 @@ impl RemoteTrack {
             track_type,
             Arc::downgrade(peer),
             Box::new(|| {}),
+            None,
         )
     }
 
@@ -353,6 +360,14 @@ impl RemoteTrack {
     }
 
     async fn read_rtp_inner(&self) -> Option<RtpPacket> {
+        let first = self
+            .first_packet
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        if first.is_some() {
+            return first;
+        }
         match self.track.read_rtp().await {
             Ok((pkt, _attr)) => Some(pkt),
             Err(e) => {

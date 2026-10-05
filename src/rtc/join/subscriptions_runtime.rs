@@ -182,14 +182,15 @@ impl RtcCore {
     /// Correlate an inbound track to a participant, build a [`RemoteTrack`], and
     /// deliver it to the `on_track` callback. Called by the subscriber PC, which
     /// passes itself as `subscriber` so the track can send RTCP keyframe
-    /// requests.
-    pub(super) async fn handle_incoming_track(
+    /// requests. `first_packet` is a packet already read from `track`.
+    pub(super) fn handle_incoming_track(
         self: Arc<Self>,
         generation: u64,
         connection_epoch: u64,
         reconnect_enabled: Arc<AtomicBool>,
         track: Arc<TrackRemote>,
         subscriber: Weak<RTCPeerConnection>,
+        first_packet: Option<RtpPacket>,
     ) {
         if !self.is_generation_current(generation) || !reconnect_enabled.load(Ordering::SeqCst) {
             return;
@@ -231,6 +232,7 @@ impl RtcCore {
             .unwrap_or_else(|e| e.into_inner())
             .insert(key.clone(), track_id);
         let weak = Arc::downgrade(&self);
+        let (kept_track, kept_subscriber) = (track.clone(), subscriber.clone());
         // The caller can drop the track on a thread without a runtime.
         let runtime = tokio::runtime::Handle::current();
         let on_drop = Box::new(move || {
@@ -238,37 +240,63 @@ impl RtcCore {
                 let _runtime = runtime.enter();
                 let task_core = core.clone();
                 std::mem::drop(core.spawn_generation_task(generation, async move {
-                    task_core
-                        .on_remote_track_dropped(generation, connection_epoch, key, track_id)
-                        .await;
+                    if task_core
+                        .clone()
+                        .on_remote_track_dropped(
+                            generation,
+                            connection_epoch,
+                            key.clone(),
+                            track_id,
+                        )
+                        .await
+                    {
+                        task_core
+                            .deliver_again_when_published(
+                                generation,
+                                connection_epoch,
+                                reconnect_enabled,
+                                key,
+                                kept_track,
+                                kept_subscriber,
+                            )
+                            .await;
+                    }
                 }));
             }
         });
-        let remote = RemoteTrack::new(track, participant, track_type, subscriber, on_drop);
+        let remote = RemoteTrack::new(
+            track,
+            participant,
+            track_type,
+            subscriber,
+            on_drop,
+            first_packet,
+        );
         cb(remote);
     }
 
-    /// The publisher dropped their inbound track handle → unsubscribe from it.
+    /// The consumer dropped their inbound track handle → unsubscribe from it.
+    /// Returns whether the dropped track was the latest one for its key.
     pub(super) async fn on_remote_track_dropped(
         self: Arc<Self>,
         generation: u64,
         connection_epoch: u64,
         key: TrackKey,
         track_id: u64,
-    ) {
+    ) -> bool {
         {
             let connection = self.connection.lock().await;
             if !connection.as_ref().is_some_and(|current| {
                 current.generation == generation && current.epoch == connection_epoch
             }) {
-                return;
+                return false;
             }
             let mut delivered = self
                 .delivered_tracks
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
             if delivered.get(&key) != Some(&track_id) {
-                return;
+                return false;
             }
             delivered.remove(&key);
             drop(delivered);
@@ -281,10 +309,68 @@ impl RtcCore {
             .is_connection_current(generation, connection_epoch)
             .await
         {
-            return;
+            return false;
         }
         if let Err(e) = self.recompute_subscriptions().await {
             tracing::debug!(error = %e, "stream.rtc.unsubscribe_on_drop_failed");
+        }
+        true
+    }
+
+    /// Read and drop the packets of a dropped track. When a packet arrives
+    /// after a republish subscribed the track again, deliver the track again
+    /// with that packet first: webrtc-rs fires `on_track` only once for each
+    /// receiver.
+    async fn deliver_again_when_published(
+        self: Arc<Self>,
+        generation: u64,
+        connection_epoch: u64,
+        reconnect_enabled: Arc<AtomicBool>,
+        key: TrackKey,
+        track: Arc<TrackRemote>,
+        subscriber: Weak<RTCPeerConnection>,
+    ) {
+        while let Ok((packet, _)) = track.read_rtp().await {
+            // A track that a new receiver delivered, or a new connection, ends
+            // the wait.
+            let replaced = self
+                .delivered_tracks
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains_key(&key);
+            if replaced
+                || !self
+                    .is_connection_current(generation, connection_epoch)
+                    .await
+            {
+                return;
+            }
+            // The drop set `manual_unsub`, and only a republish clears it.
+            let dropped = self
+                .manual_unsub
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains(&key);
+            let subscribed = !dropped
+                && self
+                    .active_subs
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .iter()
+                    .any(|details| {
+                        details.session_id == key.session_id && details.track_type == key.track_type
+                    });
+            if subscribed {
+                self.handle_incoming_track(
+                    generation,
+                    connection_epoch,
+                    reconnect_enabled,
+                    track,
+                    subscriber,
+                    Some(packet),
+                );
+                return;
+            }
         }
     }
 }
