@@ -772,6 +772,10 @@ async fn pace_audio(track: Weak<AudioInner>) {
                 *slot = buf.pop_front().unwrap_or(0);
             }
         }
+        // A muted track sends nothing, so its audio is dropped without an encode.
+        if inner.core.is_output_paused() {
+            continue;
+        }
         // Measure what we are about to encode, including any silence fill, so a
         // starved pacer reports silence rather than the last spoken level.
         inner
