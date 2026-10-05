@@ -365,7 +365,7 @@ mod tests {
     use crate::rtc::peer;
     use crate::rtc::proto::event::VideoLayerSetting;
     use crate::rtc::proto::models::{Codec, VideoDimension};
-    use crate::rtc::tracks::{LocalAudioTrack, LocalVideoTrack, LocalVideoTrackConfig};
+    use crate::rtc::tracks::{LocalAudioTrack, LocalVideoTrack};
     use std::time::Duration;
     use webrtc::rtp_transceiver::rtp_codec::RTPCodecType;
 
@@ -591,16 +591,16 @@ mod tests {
 
     #[test]
     fn publish_codec_validation_accepts_an_exact_case_insensitive_match() {
-        let track: LocalTrack = LocalVideoTrack::h264().expect("H264 track").into();
-        validate_publish_codecs(&[track], &[video_option("H264")])
-            .expect("matching H264 publish option");
+        let track: LocalTrack = LocalVideoTrack::vp9().expect("VP9 track").into();
+        validate_publish_codecs(&[track], &[video_option("vp9")])
+            .expect("matching VP9 publish option");
     }
 
     #[test]
     fn publish_codec_validation_rejects_a_fallback_codec() {
-        let track: LocalTrack = LocalVideoTrack::h264().expect("H264 track").into();
+        let track: LocalTrack = LocalVideoTrack::vp8().expect("VP8 track").into();
         let error = validate_publish_codecs(&[track], &[video_option("VP9")])
-            .expect_err("VP9 cannot carry an H264 bitstream");
+            .expect_err("VP9 cannot carry a VP8 bitstream");
         assert!(
             matches!(error, RtcError::Media(message) if message.contains("available codecs: VP9"))
         );
@@ -608,13 +608,13 @@ mod tests {
 
     #[test]
     fn duplicate_codec_publications_receive_distinct_server_option_ids() {
-        let first: LocalTrack = LocalVideoTrack::h264().expect("first H264").into();
-        let second: LocalTrack = LocalVideoTrack::h264().expect("second H264").into();
+        let first: LocalTrack = LocalVideoTrack::vp9().expect("first VP9").into();
+        let second: LocalTrack = LocalVideoTrack::vp9().expect("second VP9").into();
         let options = [
-            video_option("H264"),
+            video_option("VP9"),
             PublishOption {
                 id: 8,
-                ..video_option("H264")
+                ..video_option("VP9")
             },
         ];
         let mut used = HashSet::new();
@@ -636,18 +636,16 @@ mod tests {
 
     #[tokio::test]
     async fn layered_track_uses_one_mline_and_metadata_planning_is_read_only() {
-        let track =
-            LocalVideoTrack::h264_with_config(LocalVideoTrackConfig::default().server_managed())
-                .expect("layered H264");
+        let track = LocalVideoTrack::vp8_simulcast().expect("layered VP8");
         let local = LocalTrack::Video {
             track,
-            track_type: TrackType::Video,
+            track_type: TrackType::ScreenShare,
         };
         let option = PublishOption {
             id: 73,
-            track_type: TrackType::Video as i32,
+            track_type: TrackType::ScreenShare as i32,
             codec: Some(Codec {
-                name: "H264".to_owned(),
+                name: "VP8".to_owned(),
                 ..Default::default()
             }),
             bitrate: 1_200_000,

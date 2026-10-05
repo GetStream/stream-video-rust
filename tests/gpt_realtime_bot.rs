@@ -1,8 +1,7 @@
 //! Live end-to-end test for the `gpt_realtime_bot` example.
 //!
-//! A second SDK session publishes bursty audio and a blue video frame, then
-//! verifies that the bot processes both media tracks and publishes an audible
-//! response from OpenAI Realtime.
+//! A second SDK session publishes bursty audio, then verifies that the bot
+//! receives it and publishes an audible response from OpenAI Realtime.
 //!
 //! Skips cleanly without `STREAM_API_*` (no client) or without `OPENAI_API_KEY`
 //! (no OpenAI bridge). Nothing is mocked.
@@ -21,9 +20,7 @@ use getstream::models::{
     CallRequest, DeleteCallRequest, GetOrCreateCallRequest, MemberRequest, UserRequest,
 };
 use getstream::rtc::proto::models::TrackType;
-use getstream::rtc::{
-    JoinCallData, LocalAudioTrack, LocalVideoTrack, PcmFrame, RemoteTrack, SubscriptionConfig,
-};
+use getstream::rtc::{JoinCallData, LocalAudioTrack, PcmFrame, RemoteTrack, SubscriptionConfig};
 use getstream::video::Call;
 use tokio::sync::mpsc::{Receiver, channel};
 use tokio::task::JoinHandle;
@@ -35,8 +32,6 @@ const TONE_HZ: f64 = 300.0;
 const TONE_AMP: f64 = 12_000.0;
 /// A comfortably non-silent RMS floor (silence is 0; our tone is ~0.26).
 const NON_SILENT_RMS: f64 = 0.02;
-const VIDEO_W: u32 = 320;
-const VIDEO_H: u32 = 240;
 
 fn init_tracing() {
     let _ = tracing_subscriber::fmt()
@@ -77,33 +72,6 @@ fn spawn_speech_tone(track: LocalAudioTrack) -> JoinHandle<()> {
                         return;
                     }
                 }
-            }
-        }
-    })
-}
-
-/// A solid-blue frame in packed I420 (BT.601 limited-range).
-fn solid_blue_i420(width: u32, height: u32) -> Vec<u8> {
-    let (w, h) = (width as usize, height as usize);
-    let mut buf = vec![41u8; w * h];
-    buf.extend(std::iter::repeat_n(240u8, (w / 2) * (h / 2)));
-    buf.extend(std::iter::repeat_n(110u8, (w / 2) * (h / 2)));
-    buf
-}
-
-/// Publish a solid-blue I420 frame at ~10 fps until the track is stopped.
-fn spawn_blue_video(track: LocalVideoTrack) -> JoinHandle<()> {
-    tokio::spawn(async move {
-        let frame = solid_blue_i420(VIDEO_W, VIDEO_H);
-        let mut interval = tokio::time::interval(Duration::from_millis(100));
-        loop {
-            interval.tick().await;
-            if track
-                .write_i420(&frame, VIDEO_W, VIDEO_H, Duration::from_millis(100))
-                .await
-                .is_err()
-            {
-                return;
             }
         }
     })
@@ -192,7 +160,7 @@ async fn max_block_rms(remote: &RemoteTrack, overall: Duration) -> f64 {
 }
 
 #[tokio::test]
-async fn gpt_bot_hears_audio_video_and_replies() {
+async fn gpt_bot_hears_audio_and_replies() {
     let Some(client) = common::client_or_skip() else {
         return;
     };
@@ -233,7 +201,6 @@ async fn gpt_bot_hears_audio_video_and_replies() {
     let call_s = client.video().call("default", &call_id);
     let mut bot_handle = None;
     let mut tone = None;
-    let mut blue = None;
     let outcome: Result<()> = tokio::time::timeout(Duration::from_secs(180), async {
         bot_handle = Some(
             bot::start_bot(&client, &cfg, &bot_user, "default", &call_id)
@@ -254,34 +221,14 @@ async fn gpt_bot_hears_audio_video_and_replies() {
             .context("speaker publish audio")?;
         tone = Some(spawn_speech_tone(audio));
 
-        let video = LocalVideoTrack::vp9().context("speaker VP9 track")?;
         call_s
-            .publish_video(video.clone())
-            .await
-            .context("speaker publish video")?;
-        blue = Some(spawn_blue_video(video));
-
-        call_s
-            .update_subscriptions(SubscriptionConfig::audio_video())
+            .update_subscriptions(SubscriptionConfig::audio_all())
             .await
             .context("speaker subscriptions")?;
 
         ensure!(
             wait_until(Duration::from_secs(60), || bot.audio_seen()).await,
             "bot on_track never fired for AUDIO (subscription/ICE/RTP stage)"
-        );
-
-        ensure!(
-            wait_until(Duration::from_secs(60), || bot.video_frames_decoded() >= 3).await,
-            "bot received video but decoded only {} frames (reassembly/keyframe/decode stage)",
-            bot.video_frames_decoded()
-        );
-
-        ensure!(
-            wait_until(Duration::from_secs(30), || bot.video_frames_encoded() >= 2).await,
-            "bot decoded video but only H264-encoded {} frames for OpenAI \
-             (downscale/OpenH264/track-write stage)",
-            bot.video_frames_encoded()
         );
 
         let bot_audio = recv_track(
@@ -297,15 +244,6 @@ async fn gpt_bot_hears_audio_video_and_replies() {
             rms > NON_SILENT_RMS,
             "bot produced only silence (max block rms={rms:.4})"
         );
-
-        let codec = bot
-            .openai_video_codec()
-            .await
-            .context("OpenAI's SDP answer carried no video m-line")?;
-        ensure!(
-            codec.contains("H264"),
-            "expected OpenAI to negotiate H264 video, got {codec}"
-        );
         ensure!(
             bot.openai_connection_state() == RTCPeerConnectionState::Connected,
             "the OpenAI PeerConnection is not connected: {:?}",
@@ -318,7 +256,6 @@ async fn gpt_bot_hears_audio_video_and_replies() {
     .and_then(|result| result);
 
     stop_task(tone).await;
-    stop_task(blue).await;
     let speaker_cleanup = call_s.leave().await;
     let bot_cleanup = match bot_handle {
         Some(bot) => bot.shutdown().await,

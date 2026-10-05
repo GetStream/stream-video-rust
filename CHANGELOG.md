@@ -82,6 +82,17 @@ default (it was 200 ms). A producer that writes faster than real time gets
 one 20 ms frame; `LocalAudioTrack::opus_with_config` returns `RtcError::Media`
 for a smaller value.
 
+### H.264 is removed
+
+The SDK no longer depends on OpenH264, so it neither encodes nor decodes H.264.
+`LocalVideoTrack::h264`, `h264_with_config`, `h264_simulcast` and
+`PreferredVideoCodec::H264` are removed, and `"h264"` no longer parses as a
+`PreferredVideoCodec`. The publisher and the subscriber negotiate only VP8 and
+VP9 video, so a publisher that sends only H.264 gives the agent no video track.
+Use `vp9` or `vp9_svc` for camera video and `vp8` or `vp8_simulcast` for screen
+share. The `gpt_realtime_bot` example is voice-only, because OpenAI Realtime
+accepts only H.264 video.
+
 ## New Features
 
 ### Pacing control for PCM tracks
@@ -100,9 +111,9 @@ After `stop_publish`, a new audio, video, or screen-share track of the same kind
 and publish option takes over the sender that the stop kept, as JS
 `replaceTrack` does. Remote participants keep their remote track and get the
 media of the new track. Before, a second video publish failed with
-"participant not found". A simulcast track (`h264_simulcast`, `vp8_simulcast`)
-cannot replace or be replaced: `publish` returns `RtcError::SimulcastReplace`.
-Turn such a track off and on with `mute_track` and `unmute_track`.
+"participant not found". A simulcast track (`vp8_simulcast`) cannot replace or
+be replaced: `publish` returns `RtcError::SimulcastReplace`. Turn such a track
+off and on with `mute_track` and `unmute_track`.
 
 ### A dropped remote track comes back after a republish
 
