@@ -265,6 +265,18 @@ pub(crate) async fn connect_audio_receiver(
     Arc<RTCPeerConnection>,
     tokio::sync::mpsc::Receiver<Arc<webrtc::track::track_remote::TrackRemote>>,
 ) {
+    connect_receiver(sender, RTPCodecType::Audio).await
+}
+
+/// [`connect_audio_receiver`] for a receive-only peer of `kind`.
+#[cfg(test)]
+pub(crate) async fn connect_receiver(
+    sender: &RTCPeerConnection,
+    kind: RTPCodecType,
+) -> (
+    Arc<RTCPeerConnection>,
+    tokio::sync::mpsc::Receiver<Arc<webrtc::track::track_remote::TrackRemote>>,
+) {
     use std::time::Duration;
     use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
     use webrtc::rtp_transceiver::RTCRtpTransceiverInit;
@@ -274,7 +286,7 @@ pub(crate) async fn connect_audio_receiver(
     let receiver = new_peer_connection(&[]).await.expect("receiver");
     receiver
         .add_transceiver_from_kind(
-            RTPCodecType::Audio,
+            kind,
             Some(RTCRtpTransceiverInit {
                 direction: RTCRtpTransceiverDirection::Recvonly,
                 send_encodings: vec![],

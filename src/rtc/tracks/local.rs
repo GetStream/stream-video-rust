@@ -35,7 +35,7 @@ use std::sync::{Arc, Mutex as StdMutex, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
-use tokio::sync::Semaphore;
+use tokio::sync::{Notify, Semaphore};
 use tokio::task::JoinHandle;
 use webrtc::api::media_engine::{MIME_TYPE_H264, MIME_TYPE_OPUS, MIME_TYPE_VP8, MIME_TYPE_VP9};
 use webrtc::rtp::extension::HeaderExtension;
@@ -118,6 +118,7 @@ struct TrackCore {
     fwd_seq: AtomicU16,
     fwd_init: AtomicBool,
     stopped: AtomicBool,
+    stop_notify: Notify,
     muted: AtomicBool,
     quality_paused: AtomicBool,
     track_id: String,
@@ -171,6 +172,7 @@ impl TrackCore {
             fwd_seq: AtomicU16::new(0),
             fwd_init: AtomicBool::new(false),
             stopped: AtomicBool::new(false),
+            stop_notify: Notify::new(),
             muted: AtomicBool::new(false),
             quality_paused: AtomicBool::new(false),
             track_id,
@@ -294,6 +296,18 @@ impl TrackCore {
 
     fn stop(&self) {
         self.stopped.store(true, Ordering::SeqCst);
+        self.stop_notify.notify_waiters();
+    }
+
+    /// Wait until [`Self::stop`].
+    async fn stopped(&self) {
+        let notified = self.stop_notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        if self.stopped.load(Ordering::SeqCst) {
+            return;
+        }
+        notified.await;
     }
 
     fn set_muted(&self, muted: bool) {
@@ -1230,6 +1244,44 @@ impl LocalVideoTrack {
         }
     }
 
+    /// Continue the RTP sequence numbers and timestamps of the single-encoding
+    /// `previous`, whose sender this track takes over. The encoder state moves
+    /// here, so the sequence numbers and the VP9 picture ids continue. The SFU
+    /// drops a stream whose timestamps go back.
+    fn continue_rtp_from(&self, previous: &LocalVideoTrack) {
+        let (next_pts, rtp_ts) = {
+            let clock = previous
+                .inner
+                .clock
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            (clock.next_pts, clock.rtp_ts)
+        };
+        {
+            let mut clock = self.inner.clock.lock().unwrap_or_else(|e| e.into_inner());
+            clock.next_pts = next_pts;
+            clock.rtp_ts = rtp_ts;
+        }
+        let (current, previous) = (&self.inner.encodings[0], &previous.inner.encodings[0]);
+        let state = previous
+            .encoder
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        *current.encoder.lock().unwrap_or_else(|e| e.into_inner()) = state;
+        let packetizer = previous
+            .core
+            .packetizer
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        *current
+            .core
+            .packetizer
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = packetizer;
+    }
+
     /// The underlying webrtc-rs track, for attaching this track to a
     /// PeerConnection you manage yourself (`pc.add_track(...)`). See
     /// [`LocalAudioTrack::webrtc_track`].
@@ -2079,15 +2131,36 @@ impl LocalTrack {
         }
     }
 
+    /// Whether the track sends several RID encodings.
+    pub(crate) fn is_simulcast(&self) -> bool {
+        matches!(self, LocalTrack::Video { track, .. } if track.inner.encodings.len() > 1)
+    }
+
+    /// Wait until the track is stopped.
+    pub(crate) async fn stopped(&self) {
+        match self {
+            LocalTrack::Audio(a) | LocalTrack::ScreenShareAudio(a) => a.inner.core.stopped().await,
+            LocalTrack::Video { track, .. } => track.inner.encodings[0].core.stopped().await,
+        }
+    }
+
     /// Continue the RTP timeline of the audio track `previous`, whose sender
     /// this audio track takes over.
     pub(crate) fn continue_rtp_from(&self, previous: &LocalTrack) {
-        if let (
-            LocalTrack::Audio(track) | LocalTrack::ScreenShareAudio(track),
-            LocalTrack::Audio(previous) | LocalTrack::ScreenShareAudio(previous),
-        ) = (self, previous)
-        {
-            track.continue_rtp_from(previous);
+        match (self, previous) {
+            (
+                LocalTrack::Audio(track) | LocalTrack::ScreenShareAudio(track),
+                LocalTrack::Audio(previous) | LocalTrack::ScreenShareAudio(previous),
+            ) => track.continue_rtp_from(previous),
+            (
+                LocalTrack::Video { track, .. },
+                LocalTrack::Video {
+                    track: previous, ..
+                },
+            ) => {
+                track.continue_rtp_from(previous);
+            }
+            _ => {}
         }
     }
 

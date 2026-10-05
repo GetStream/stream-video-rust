@@ -63,25 +63,28 @@ impl RtcCore {
         };
         let mut publisher_rtcp_tasks = Vec::new();
         if status.is_none() {
-            // Reuse the audio sender that `stop_publish` kept, as JS `replaceTrack`
-            // does: a second audio m-line fails the SFU negotiation. Video RTCP
-            // readers keep the old track, and simulcast cannot be replaced.
-            let retired = if matches!(
-                track.track_type(),
-                TrackType::Audio | TrackType::ScreenShareAudio
-            ) {
-                media.take_retired(track.track_type(), publish_option_id)
-            } else {
-                None
-            };
-            let reused = match retired {
+            // Reuse the sender that `stop_publish` kept, as JS `replaceTrack`
+            // does: a second m-line for the same publish option fails the SFU
+            // negotiation.
+            if media
+                .retired(track.track_type(), publish_option_id)
+                .is_some_and(|retired| retired.is_simulcast() || track.is_simulcast())
+            {
+                return Err(RtcError::SimulcastReplace {
+                    track_type: track.track_type(),
+                });
+            }
+            let reader = match media.take_retired(track.track_type(), publish_option_id) {
                 Some(retired) => {
                     publisher::replace_retired_track(&publisher, &retired, &track, &publish_options)
                         .await?
                 }
-                None => false,
+                None => None,
             };
-            if !reused {
+            let reused = reader.is_some();
+            if let Some(reader) = reader {
+                self.register_publisher_tasks(vec![reader]).await;
+            } else {
                 publisher_rtcp_tasks = match publisher::add_transceiver_for_track(
                     &publisher,
                     &track,
@@ -208,6 +211,8 @@ impl RtcCore {
     /// (`Invalid SetPublisher request; ... new track must have the same envelope as
     /// previous`), so removing the sole sender and renegotiating an empty envelope
     /// fails on the wire; muting the track type is the wire-correct way to stop.
+    /// A later [`Self::publish`] of the same kind and publish option puts its
+    /// track on the kept sender.
     pub async fn stop_publish(self: &Arc<Self>, track: LocalTrack) -> Result<()> {
         let mut media = self.media.lock().await;
         let track_id = track.track_id();
