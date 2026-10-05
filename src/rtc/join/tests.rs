@@ -1006,6 +1006,16 @@ async fn published_audio_paces_from_the_first_connect_through_a_disconnect() {
         .await
         .expect("add observed track");
     let (observer_receiver, mut observed) = peer::connect_audio_receiver(&observer).await;
+    audio
+        .write_pcm(PcmFrame::mono(vec![0; 960], 48_000))
+        .await
+        .expect("write before the publisher connects");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), observed.recv())
+            .await
+            .is_err(),
+        "a publication takes no audio before the publisher connects"
+    );
     let (receiver, _remote) = peer::connect_audio_receiver(&publisher).await;
     let observed = tokio::time::timeout(Duration::from_secs(5), observed.recv())
         .await
@@ -1029,6 +1039,51 @@ async fn published_audio_paces_from_the_first_connect_through_a_disconnect() {
     let _ = receiver.close().await;
     let _ = observer_receiver.close().await;
     let _ = observer.close().await;
+    core.leave("test cleanup").await.expect("leave");
+}
+
+#[tokio::test]
+async fn a_failed_publish_does_not_hold_the_track() {
+    let core = test_core();
+    let generation = prepare_joined_core(&core, "alice");
+    let (mut connection, _sfu) = establish_fake(&core, generation).await;
+    connection.publish_options = vec![models::PublishOption {
+        track_type: TrackType::Audio as i32,
+        codec: Some(models::Codec {
+            name: "opus".to_owned(),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }];
+    *core.connection.lock().await = Some(connection);
+    core.own_capabilities
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .insert("send-audio".to_owned());
+    let audio = LocalAudioTrack::opus().expect("opus track");
+
+    // The fake SFU has no SetPublisher endpoint.
+    core.publish(LocalTrack::Audio(audio.clone()))
+        .await
+        .expect_err("publish without SetPublisher");
+
+    let sender = peer::new_peer_connection(&[]).await.expect("sender");
+    sender
+        .add_track(audio.webrtc_track())
+        .await
+        .expect("add track");
+    let (receiver, mut remote) = peer::connect_audio_receiver(&sender).await;
+    audio
+        .write_pcm(PcmFrame::mono(vec![0; 960], 48_000))
+        .await
+        .expect("write");
+    tokio::time::timeout(Duration::from_secs(5), remote.recv())
+        .await
+        .expect("the track paces on its own PeerConnection")
+        .expect("remote track");
+    audio.stop();
+    let _ = sender.close().await;
+    let _ = receiver.close().await;
     core.leave("test cleanup").await.expect("leave");
 }
 

@@ -51,8 +51,8 @@ use anyhow::{Context, Result, anyhow, bail};
 use getstream::models::{CallRequest, GetOrCreateCallRequest, MemberRequest, UserRequest};
 use getstream::rtc::proto::models::TrackType;
 use getstream::rtc::{
-    JoinCallData, LocalAudioTrack, LocalVideoTrack, RemoteTrack, RtcError, SubscriptionConfig,
-    TrackSubscriptionConfig, VideoFrame,
+    JoinCallData, LocalAudioTrack, LocalAudioTrackConfig, LocalVideoTrack, RemoteTrack, RtcError,
+    SubscriptionConfig, TrackSubscriptionConfig, VideoFrame,
 };
 use getstream::video::Call;
 use getstream::{Stream, TokenOptions};
@@ -321,7 +321,9 @@ async fn configure_openai(
         .await
         .context("create oai-events data channel")?;
 
-    let mic = LocalAudioTrack::opus().context("opus track for OpenAI")?;
+    // Paced from the OpenAI connect below, so audio written before it is kept.
+    let mic = LocalAudioTrack::opus_with_config(LocalAudioTrackConfig::default().with_pace(false))
+        .context("opus track for OpenAI")?;
     spawn_rtcp_drain(
         &tasks,
         pc.add_track(mic.webrtc_track())
