@@ -1609,3 +1609,374 @@ async fn sole_video_can_be_stopped_and_published_again() {
     let _ = admin.delete(DeleteCallRequest { hard: Some(true) }).await;
     outcome.expect("stop and publish video again timed out");
 }
+
+/// An audio track that B drops while A is muted arrives again after the unmute
+///
+/// The SFU sends the unmuted audio on the receiver that B already has, so
+/// webrtc-rs fires no new `on_track`. The SDK delivers a new `RemoteTrack` for
+/// that receiver when the audio arrives.
+#[tokio::test]
+async fn an_audio_track_dropped_while_muted_arrives_again_after_unmute() {
+    let Some(client) = common::client_or_skip() else {
+        return;
+    };
+    init_tracing();
+
+    let user_a = common::unique_id("a");
+    let user_b = common::unique_id("b");
+    let (admin, call_id) = setup_call(&client, &[&user_a, &user_b]).await;
+
+    let outcome = tokio::time::timeout(Duration::from_secs(150), async {
+        let call_a = client.video().call("default", &call_id);
+        let call_b = client.video().call("default", &call_id);
+
+        let mut tracks_b = track_sink(&call_b);
+        call_b
+            .join(JoinCallData::new(&user_b))
+            .await
+            .expect("B join");
+        call_b
+            .update_subscriptions(SubscriptionConfig::audio_all())
+            .await
+            .expect("B update_subscriptions");
+        let mut events_b = call_b.sfu_events();
+
+        call_a
+            .join(JoinCallData::new(&user_a))
+            .await
+            .expect("A join");
+        let audio_a = LocalAudioTrack::opus().expect("opus track");
+        call_a
+            .publish_audio(audio_a.clone())
+            .await
+            .expect("A publish_audio");
+        let feeder = spawn_tone(audio_a);
+        let remote_a = recv_track(
+            &mut tracks_b,
+            &user_a,
+            TrackType::Audio,
+            Duration::from_secs(45),
+        )
+        .await
+        .expect("B never received A's audio track");
+
+        call_a.mute_track(TrackType::Audio).await.expect("A mute");
+        assert!(
+            await_track_event(
+                &mut events_b,
+                &user_a,
+                TrackType::Audio,
+                false,
+                Duration::from_secs(45)
+            )
+            .await,
+            "B never received A's audio TrackUnpublished after the mute"
+        );
+        drop(remote_a);
+        call_a
+            .unmute_track(TrackType::Audio)
+            .await
+            .expect("A unmute");
+        assert!(
+            await_track_event(
+                &mut events_b,
+                &user_a,
+                TrackType::Audio,
+                true,
+                Duration::from_secs(45)
+            )
+            .await,
+            "B never received A's audio TrackPublished after the unmute"
+        );
+        let again = recv_track(
+            &mut tracks_b,
+            &user_a,
+            TrackType::Audio,
+            Duration::from_secs(30),
+        )
+        .await
+        .expect("B did not get A's audio track again after the unmute");
+        let rms = drain_rms(&again, FRAME_20MS * 100, Duration::from_secs(30)).await;
+        feeder.abort();
+        assert!(
+            rms > NON_SILENT_RMS,
+            "B got no audio on the track delivered again (rms={rms:.4})"
+        );
+
+        call_a.leave().await.expect("A leave");
+        call_b.leave().await.expect("B leave");
+    })
+    .await;
+
+    let _ = admin.delete(DeleteCallRequest { hard: Some(true) }).await;
+    outcome.expect("audio track dropped while muted timed out");
+}
+
+/// A video track that B drops while A is muted arrives again after the unmute
+#[tokio::test]
+async fn a_video_track_dropped_while_muted_arrives_again_after_unmute() {
+    let Some(client) = common::client_or_skip() else {
+        return;
+    };
+    init_tracing();
+
+    let user_a = common::unique_id("a");
+    let user_b = common::unique_id("b");
+    let (admin, call_id) = setup_call(&client, &[&user_a, &user_b]).await;
+
+    let outcome = tokio::time::timeout(Duration::from_secs(150), async {
+        let call_a = client.video().call("default", &call_id);
+        let call_b = client.video().call("default", &call_id);
+
+        let mut tracks_b = track_sink(&call_b);
+        call_b
+            .join(JoinCallData::new(&user_b))
+            .await
+            .expect("B join");
+        call_b
+            .update_subscriptions(SubscriptionConfig::audio_video())
+            .await
+            .expect("B update_subscriptions");
+        let mut events_b = call_b.sfu_events();
+
+        call_a
+            .join(JoinCallData::new(&user_a))
+            .await
+            .expect("A join");
+        let video_a = LocalVideoTrack::vp9().expect("vp9 track");
+        call_a
+            .publish_video(video_a.clone())
+            .await
+            .expect("A publish_video");
+        let feeder = spawn_blue_video(video_a);
+        let remote_a = recv_track(
+            &mut tracks_b,
+            &user_a,
+            TrackType::Video,
+            Duration::from_secs(45),
+        )
+        .await
+        .expect("B never received A's video track");
+
+        call_a.mute_track(TrackType::Video).await.expect("A mute");
+        assert!(
+            await_track_event(
+                &mut events_b,
+                &user_a,
+                TrackType::Video,
+                false,
+                Duration::from_secs(45)
+            )
+            .await,
+            "B never received A's video TrackUnpublished after the mute"
+        );
+        drop(remote_a);
+        call_a
+            .unmute_track(TrackType::Video)
+            .await
+            .expect("A unmute");
+        assert!(
+            await_track_event(
+                &mut events_b,
+                &user_a,
+                TrackType::Video,
+                true,
+                Duration::from_secs(45)
+            )
+            .await,
+            "B never received A's video TrackPublished after the unmute"
+        );
+        let again = recv_track(
+            &mut tracks_b,
+            &user_a,
+            TrackType::Video,
+            Duration::from_secs(30),
+        )
+        .await
+        .expect("B did not get A's video track again after the unmute");
+        let frame = tokio::time::timeout(Duration::from_secs(45), again.next_video_frame())
+            .await
+            .expect("B decoded no frame on the track delivered again")
+            .expect("the video track delivered again ended");
+        feeder.abort();
+        assert_packed_blue_frame(&frame);
+
+        call_a.leave().await.expect("A leave");
+        call_b.leave().await.expect("B leave");
+    })
+    .await;
+
+    let _ = admin.delete(DeleteCallRequest { hard: Some(true) }).await;
+    outcome.expect("video track dropped while muted timed out");
+}
+
+/// A track that B keeps through a mute gets the audio again after the unmute,
+/// and B gets no second track for it
+#[tokio::test]
+async fn a_kept_track_resumes_after_unmute_without_a_second_track() {
+    let Some(client) = common::client_or_skip() else {
+        return;
+    };
+    init_tracing();
+
+    let user_a = common::unique_id("a");
+    let user_b = common::unique_id("b");
+    let (admin, call_id) = setup_call(&client, &[&user_a, &user_b]).await;
+
+    let outcome = tokio::time::timeout(Duration::from_secs(150), async {
+        let call_a = client.video().call("default", &call_id);
+        let call_b = client.video().call("default", &call_id);
+
+        let mut tracks_b = track_sink(&call_b);
+        call_b
+            .join(JoinCallData::new(&user_b))
+            .await
+            .expect("B join");
+        call_b
+            .update_subscriptions(SubscriptionConfig::audio_all())
+            .await
+            .expect("B update_subscriptions");
+        let mut events_b = call_b.sfu_events();
+
+        call_a
+            .join(JoinCallData::new(&user_a))
+            .await
+            .expect("A join");
+        let audio_a = LocalAudioTrack::opus().expect("opus track");
+        call_a
+            .publish_audio(audio_a.clone())
+            .await
+            .expect("A publish_audio");
+        let feeder = spawn_tone(audio_a);
+        let remote_a = recv_track(
+            &mut tracks_b,
+            &user_a,
+            TrackType::Audio,
+            Duration::from_secs(45),
+        )
+        .await
+        .expect("B never received A's audio track");
+
+        call_a.mute_track(TrackType::Audio).await.expect("A mute");
+        assert!(
+            await_track_event(
+                &mut events_b,
+                &user_a,
+                TrackType::Audio,
+                false,
+                Duration::from_secs(45)
+            )
+            .await,
+            "B never received A's audio TrackUnpublished after the mute"
+        );
+        call_a
+            .unmute_track(TrackType::Audio)
+            .await
+            .expect("A unmute");
+        assert!(
+            await_track_event(
+                &mut events_b,
+                &user_a,
+                TrackType::Audio,
+                true,
+                Duration::from_secs(45)
+            )
+            .await,
+            "B never received A's audio TrackPublished after the unmute"
+        );
+        let rms = drain_rms(&remote_a, FRAME_20MS * 100, Duration::from_secs(30)).await;
+        assert!(
+            rms > NON_SILENT_RMS,
+            "B got no audio on its kept track after the unmute (rms={rms:.4})"
+        );
+        assert!(
+            recv_track(
+                &mut tracks_b,
+                &user_a,
+                TrackType::Audio,
+                Duration::from_secs(3)
+            )
+            .await
+            .is_none(),
+            "B got A's audio track a second time"
+        );
+        feeder.abort();
+
+        call_a.leave().await.expect("A leave");
+        call_b.leave().await.expect("B leave");
+    })
+    .await;
+
+    let _ = admin.delete(DeleteCallRequest { hard: Some(true) }).await;
+    outcome.expect("kept track through a mute timed out");
+}
+
+/// A track that B drops while A keeps sending does not come back
+#[tokio::test]
+async fn a_dropped_live_track_does_not_come_back() {
+    let Some(client) = common::client_or_skip() else {
+        return;
+    };
+    init_tracing();
+
+    let user_a = common::unique_id("a");
+    let user_b = common::unique_id("b");
+    let (admin, call_id) = setup_call(&client, &[&user_a, &user_b]).await;
+
+    let outcome = tokio::time::timeout(Duration::from_secs(150), async {
+        let call_a = client.video().call("default", &call_id);
+        let call_b = client.video().call("default", &call_id);
+
+        let mut tracks_b = track_sink(&call_b);
+        call_b
+            .join(JoinCallData::new(&user_b))
+            .await
+            .expect("B join");
+        call_b
+            .update_subscriptions(SubscriptionConfig::audio_all())
+            .await
+            .expect("B update_subscriptions");
+
+        call_a
+            .join(JoinCallData::new(&user_a))
+            .await
+            .expect("A join");
+        let audio_a = LocalAudioTrack::opus().expect("opus track");
+        call_a
+            .publish_audio(audio_a.clone())
+            .await
+            .expect("A publish_audio");
+        let feeder = spawn_tone(audio_a);
+        let remote_a = recv_track(
+            &mut tracks_b,
+            &user_a,
+            TrackType::Audio,
+            Duration::from_secs(45),
+        )
+        .await
+        .expect("B never received A's audio track");
+        let rms = drain_rms(&remote_a, FRAME_20MS * 25, Duration::from_secs(30)).await;
+        assert!(rms > NON_SILENT_RMS, "B got no audio before the drop");
+
+        drop(remote_a);
+        assert!(
+            recv_track(
+                &mut tracks_b,
+                &user_a,
+                TrackType::Audio,
+                Duration::from_secs(5)
+            )
+            .await
+            .is_none(),
+            "B got A's audio track again after it dropped the track"
+        );
+        feeder.abort();
+
+        call_a.leave().await.expect("A leave");
+        call_b.leave().await.expect("B leave");
+    })
+    .await;
+
+    let _ = admin.delete(DeleteCallRequest { hard: Some(true) }).await;
+    outcome.expect("dropped live track timed out");
+}

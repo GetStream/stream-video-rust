@@ -102,6 +102,14 @@ media of the new track. Before, a second video publish failed with
 cannot replace or be replaced: `publish` returns `RtcError::SimulcastReplace`.
 Turn such a track off and on with `mute_track` and `unmute_track`.
 
+### A dropped remote track comes back after a republish
+
+Dropping a `RemoteTrack` unsubscribes it. When the publisher publishes the
+track again (for example after an unmute), `on_track` now delivers a new
+`RemoteTrack` for it, also when the SFU sends the media on the receiver that
+the dropped track used. Before, the track did not come back. A track that is
+kept through a mute gets the media again and is not delivered a second time.
+
 ### A token-only client can prepare a call before the join
 
 `RtcClient::call` returns an `RtcCall` that is not joined yet, and

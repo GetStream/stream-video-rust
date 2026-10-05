@@ -140,8 +140,8 @@ pub(super) fn register_on_track(
                 reconnect_enabled,
                 track,
                 weak_pc,
-            )
-            .await;
+                None,
+            );
         })
     }));
 }

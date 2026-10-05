@@ -1177,15 +1177,14 @@ async fn only_the_latest_remote_track_unsubscribes_when_dropped_without_a_runtim
         .expect("inbound track")
         .expect("inbound track channel");
     for _ in 0..2 {
-        core.clone()
-            .handle_incoming_track(
-                generation,
-                epoch,
-                reconnect_enabled.clone(),
-                inbound.clone(),
-                Arc::downgrade(&receiver),
-            )
-            .await;
+        core.clone().handle_incoming_track(
+            generation,
+            epoch,
+            reconnect_enabled.clone(),
+            inbound.clone(),
+            Arc::downgrade(&receiver),
+            None,
+        );
     }
     let stale = remote_rx.recv().expect("stale remote track");
     let remote = remote_rx.recv().expect("latest remote track");
@@ -1225,6 +1224,77 @@ async fn only_the_latest_remote_track_unsubscribes_when_dropped_without_a_runtim
         "unsubscribe after the drop",
     )
     .await;
+    audio.stop();
+    let _ = sender.close().await;
+    let _ = receiver.close().await;
+    core.leave("test cleanup").await.expect("leave");
+}
+
+#[tokio::test]
+async fn a_dropped_track_is_delivered_again_only_after_it_is_published_again() {
+    let core = test_core();
+    let generation = prepare_joined_core(&core, "alice");
+    let (connection, _sfu) = establish_fake(&core, generation).await;
+    let (epoch, reconnect_enabled) = (connection.epoch, connection.reconnect_enabled.clone());
+    *core.connection.lock().await = Some(connection);
+    let (remote_tx, mut remote_rx) = tokio::sync::mpsc::unbounded_channel();
+    *core
+        .on_track_cb
+        .lock()
+        .unwrap_or_else(|error| error.into_inner()) = Some(Arc::new(move |remote| {
+        let _ = remote_tx.send(remote);
+    }));
+    let audio = LocalAudioTrack::opus().expect("opus track");
+    let sender = peer::new_peer_connection(&[]).await.expect("sender");
+    sender
+        .add_track(audio.webrtc_track())
+        .await
+        .expect("add track");
+    let (receiver, mut inbound) = peer::connect_audio_receiver(&sender).await;
+    audio.start_pacing().await;
+    let inbound = tokio::time::timeout(Duration::from_secs(5), inbound.recv())
+        .await
+        .expect("inbound track")
+        .expect("inbound track channel");
+    core.clone().handle_incoming_track(
+        generation,
+        epoch,
+        reconnect_enabled,
+        inbound,
+        Arc::downgrade(&receiver),
+        None,
+    );
+    let remote = remote_rx.recv().await.expect("remote track");
+    let session_id = remote.participant().session_id.clone();
+    // The SFU was asked to send the track.
+    *core
+        .active_subs
+        .lock()
+        .unwrap_or_else(|error| error.into_inner()) = vec![signal::TrackSubscriptionDetails {
+        session_id: session_id.clone(),
+        track_type: TrackType::Audio as i32,
+        ..Default::default()
+    }];
+
+    // The publisher keeps sending after the drop.
+    drop(remote);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(500), remote_rx.recv())
+            .await
+            .is_err(),
+        "a dropped live track does not come back"
+    );
+
+    core.add_published_track("bob", &session_id, TrackType::Audio as i32, None);
+    let again = tokio::time::timeout(Duration::from_secs(5), remote_rx.recv())
+        .await
+        .expect("the track is delivered again after the republish")
+        .expect("remote track");
+    tokio::time::timeout(Duration::from_secs(5), again.next_pcm())
+        .await
+        .expect("audio of the track delivered again")
+        .expect("pcm frame");
+
     audio.stop();
     let _ = sender.close().await;
     let _ = receiver.close().await;
