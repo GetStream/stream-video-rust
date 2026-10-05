@@ -773,7 +773,15 @@ async fn pace_audio(track: Weak<AudioInner>) {
             }
         }
         // A muted track sends nothing, so its audio is dropped without an encode.
+        // The RTP clock keeps time, so the first packet after the mute shows the
+        // gap (RFC 3550 §5.1).
         if inner.core.is_output_paused() {
+            inner
+                .core
+                .packetizer
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .skip_samples(FRAME_SAMPLES_20MS as u32);
             continue;
         }
         // Measure what we are about to encode, including any silence fill, so a
@@ -2486,6 +2494,47 @@ mod tests {
             .await
             .expect("paced audio reaches the receiver")
             .expect("remote track channel");
+        track.stop();
+        let _ = sender.close().await;
+        let _ = receiver.close().await;
+    }
+
+    #[tokio::test]
+    async fn the_rtp_clock_runs_while_a_paced_track_is_muted() {
+        let track = LocalAudioTrack::opus().expect("opus track");
+        let sender = peer::new_peer_connection(&[]).await.expect("sender");
+        sender
+            .add_track(track.webrtc_track())
+            .await
+            .expect("add track");
+        let (receiver, mut remote_rx) = peer::connect_audio_receiver(&sender).await;
+        track.start_pacing().await;
+        let remote = tokio::time::timeout(Duration::from_secs(5), remote_rx.recv())
+            .await
+            .expect("remote track")
+            .expect("remote track channel");
+        let published = LocalTrack::Audio(track.clone());
+
+        published.set_muted(true);
+        let (mut before, _) = remote.read_rtp().await.expect("packet before the mute");
+        while let Ok(Ok((packet, _))) =
+            tokio::time::timeout(Duration::from_millis(100), remote.read_rtp()).await
+        {
+            before = packet;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        published.set_muted(false);
+        let (after, _) = tokio::time::timeout(Duration::from_secs(5), remote.read_rtp())
+            .await
+            .expect("packet after the mute")
+            .expect("packet after the mute");
+
+        // The mute lasts at least 600 ms; a slow runtime can skip some ticks.
+        let skipped = after.header.timestamp.wrapping_sub(before.header.timestamp);
+        assert!(
+            skipped >= 10 * FRAME_SAMPLES_20MS as u32,
+            "the timestamp advanced {skipped} samples over the mute"
+        );
         track.stop();
         let _ = sender.close().await;
         let _ = receiver.close().await;
