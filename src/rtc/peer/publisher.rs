@@ -368,13 +368,14 @@ mod tests {
             }),
             ..Default::default()
         }];
-        let retired = LocalTrack::Audio(LocalAudioTrack::opus().expect("first track"));
+        let first = LocalAudioTrack::opus().expect("first track");
+        let retired = LocalTrack::Audio(first.clone());
         let publisher = peer::new_peer_connection(&[]).await.expect("publisher");
         let rtcp_tasks = add_transceiver_for_track(&publisher, &retired, &opus)
             .await
             .expect("first transceiver");
         let (receiver, mut remote_rx) = peer::connect_audio_receiver(&publisher).await;
-        retired.start_audio_pacing().await;
+        first.start_pacing().await;
         let remote = tokio::time::timeout(Duration::from_secs(5), remote_rx.recv())
             .await
             .expect("remote track")
@@ -387,13 +388,14 @@ mod tests {
             last = packet;
         }
 
-        let track = LocalTrack::Audio(LocalAudioTrack::opus().expect("second track"));
+        let second = LocalAudioTrack::opus().expect("second track");
+        let track = LocalTrack::Audio(second.clone());
         assert!(
             replace_retired_track(&publisher, &retired, &track, &opus)
                 .await
                 .expect("replace the retired track")
         );
-        track.start_audio_pacing().await;
+        second.start_pacing().await;
         let (next, _) = remote.read_rtp().await.expect("second packet");
 
         assert_eq!(

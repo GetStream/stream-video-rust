@@ -166,9 +166,10 @@ impl RtcCore {
         Ok(())
     }
 
-    /// Start pacing the published audio once the current publisher connects.
-    /// Pacing continues through later disconnects, so a reconnect adds no
-    /// delay; stream-py `AudioStreamTrack` also catches up after a gap.
+    /// End the hold of each new audio publication once the current publisher
+    /// connects, and start its pacing. Pacing continues through later
+    /// disconnects, so a reconnect adds no delay; stream-py `AudioStreamTrack`
+    /// also catches up after a gap.
     pub(super) async fn start_audio_pacing_if_connected(&self) {
         let media = self.media.lock().await;
         let connected = self

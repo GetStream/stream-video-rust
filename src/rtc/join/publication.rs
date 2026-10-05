@@ -63,6 +63,7 @@ impl MediaState {
         if let Some(position) = self.position(&track_id) {
             return self.publications[position].status;
         }
+        track.hold_audio_pacing();
         self.publications.push(LocalPublication {
             track,
             status: PublicationStatus::PendingPublishNegotiation,
@@ -80,6 +81,7 @@ impl MediaState {
     pub(super) fn remove(&mut self, track_id: &str) -> Option<LocalTrack> {
         let position = self.position(track_id)?;
         let publication = self.publications.remove(position);
+        publication.track.release_audio_pacing();
         let key = (
             publication.publish_option_id,
             publication.track.track_type() as i32,
