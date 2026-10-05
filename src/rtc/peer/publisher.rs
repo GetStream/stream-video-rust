@@ -228,13 +228,14 @@ pub(crate) async fn add_transceiver_for_track(
 }
 
 /// Put `track` on the sender that still carries the stopped track `retired`,
-/// as JS `replaceTrack` does. Returns `false` if `publisher` has no such sender.
+/// as JS `replaceTrack` does. Returns the RTCP reader of `track`, or `None` if
+/// `publisher` has no such sender.
 pub(crate) async fn replace_retired_track(
     publisher: &Arc<RTCPeerConnection>,
     retired: &LocalTrack,
     track: &LocalTrack,
     publish_options: &[PublishOption],
-) -> Result<bool> {
+) -> Result<Option<JoinHandle<()>>> {
     let retired_track_id = retired.track_id();
     for transceiver in publisher.get_transceivers().await {
         let sender = transceiver.sender().await;
@@ -251,13 +252,14 @@ pub(crate) async fn replace_retired_track(
         let physical = track.webrtc_tracks().into_iter().next().ok_or_else(|| {
             RtcError::Media("local publication has no physical encodings".to_owned())
         })?;
+        let rid = physical.rid().map(str::to_owned);
         sender
             .replace_track(Some(physical))
             .await
             .map_err(RtcError::from)?;
-        return Ok(true);
+        return Ok(Some(spawn_rtcp_reader(sender, rid, track.clone())));
     }
-    Ok(false)
+    Ok(None)
 }
 
 fn spawn_rtcp_reader(
@@ -267,12 +269,20 @@ fn spawn_rtcp_reader(
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         loop {
-            let result = match rid.as_deref() {
-                Some(rid) => {
-                    let mut buffer = vec![0_u8; 1_500];
-                    sender.read_simulcast(&mut buffer, rid).await
+            let read = async {
+                match rid.as_deref() {
+                    Some(rid) => {
+                        let mut buffer = vec![0_u8; 1_500];
+                        sender.read_simulcast(&mut buffer, rid).await
+                    }
+                    None => sender.read_rtcp().await,
                 }
-                None => sender.read_rtcp().await,
+            };
+            let result = tokio::select! {
+                biased;
+                // A track that takes over this sender starts its own reader.
+                () = track.stopped() => break,
+                result = read => result,
             };
             let Ok((packets, _attributes)) = result else {
                 break;
@@ -357,6 +367,7 @@ mod tests {
     use crate::rtc::proto::models::{Codec, VideoDimension};
     use crate::rtc::tracks::{LocalAudioTrack, LocalVideoTrack, LocalVideoTrackConfig};
     use std::time::Duration;
+    use webrtc::rtp_transceiver::rtp_codec::RTPCodecType;
 
     #[tokio::test]
     async fn a_track_on_a_retired_sender_continues_its_rtp_timeline() {
@@ -390,11 +401,10 @@ mod tests {
 
         let second = LocalAudioTrack::opus().expect("second track");
         let track = LocalTrack::Audio(second.clone());
-        assert!(
-            replace_retired_track(&publisher, &retired, &track, &opus)
-                .await
-                .expect("replace the retired track")
-        );
+        let reader = replace_retired_track(&publisher, &retired, &track, &opus)
+            .await
+            .expect("replace the retired track")
+            .expect("the retired sender");
         second.start_pacing().await;
         let (next, _) = remote.read_rtp().await.expect("second packet");
 
@@ -407,6 +417,159 @@ mod tests {
             last.header.timestamp.wrapping_add(960)
         );
         track.stop();
+        reader.abort();
+        for task in rtcp_tasks {
+            task.abort();
+        }
+        let _ = publisher.close().await;
+        let _ = receiver.close().await;
+    }
+
+    #[tokio::test]
+    async fn a_video_track_on_a_retired_sender_continues_its_rtp_timeline() {
+        let vp9 = [video_option("VP9")];
+        let first = LocalVideoTrack::vp9().expect("first track");
+        let retired = LocalTrack::Video {
+            track: first.clone(),
+            track_type: TrackType::Video,
+        };
+        let publisher = peer::new_peer_connection(&[]).await.expect("publisher");
+        let rtcp_tasks = add_transceiver_for_track(&publisher, &retired, &vp9)
+            .await
+            .expect("first transceiver");
+        let (receiver, mut remote_rx) =
+            peer::connect_receiver(&publisher, RTPCodecType::Video).await;
+        let frame = vec![128_u8; 320 * 240 * 3 / 2];
+        let frame_time = Duration::from_millis(33);
+        first
+            .write_i420(&frame, 320, 240, frame_time)
+            .await
+            .expect("first frame");
+        let remote = tokio::time::timeout(Duration::from_secs(5), remote_rx.recv())
+            .await
+            .expect("remote track")
+            .expect("remote track channel");
+        for _ in 0..3 {
+            first
+                .write_i420(&frame, 320, 240, frame_time)
+                .await
+                .expect("frame");
+        }
+        retired.stop();
+        let mut last = None;
+        while let Ok(Ok((packet, _))) =
+            tokio::time::timeout(Duration::from_millis(200), remote.read_rtp()).await
+        {
+            last = Some(packet);
+        }
+        let last = last.expect("packets of the first track");
+
+        let second = LocalVideoTrack::vp9().expect("second track");
+        let track = LocalTrack::Video {
+            track: second.clone(),
+            track_type: TrackType::Video,
+        };
+        let reader = replace_retired_track(&publisher, &retired, &track, &vp9)
+            .await
+            .expect("replace the retired track")
+            .expect("the retired sender");
+        second
+            .write_i420(&frame, 320, 240, frame_time)
+            .await
+            .expect("second track frame");
+        let (next, _) = tokio::time::timeout(Duration::from_secs(5), remote.read_rtp())
+            .await
+            .expect("the receiver takes the packets of the second track")
+            .expect("second track packet");
+
+        assert_eq!(
+            next.header.sequence_number,
+            last.header.sequence_number.wrapping_add(1)
+        );
+        assert_eq!(
+            next.header.timestamp,
+            last.header.timestamp.wrapping_add(2_970)
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), remote_rx.recv())
+                .await
+                .is_err(),
+            "the receiver keeps its remote track"
+        );
+        track.stop();
+        reader.abort();
+        for task in rtcp_tasks {
+            task.abort();
+        }
+        let _ = publisher.close().await;
+        let _ = receiver.close().await;
+    }
+
+    #[tokio::test]
+    async fn a_keyframe_request_reaches_the_track_on_a_retired_sender() {
+        use webrtc::rtcp::payload_feedbacks::picture_loss_indication::PictureLossIndication;
+
+        let vp9 = [video_option("VP9")];
+        let retired = LocalTrack::Video {
+            track: LocalVideoTrack::vp9().expect("first track"),
+            track_type: TrackType::Video,
+        };
+        let publisher = peer::new_peer_connection(&[]).await.expect("publisher");
+        let rtcp_tasks = add_transceiver_for_track(&publisher, &retired, &vp9)
+            .await
+            .expect("first transceiver");
+        let (receiver, mut remote_rx) =
+            peer::connect_receiver(&publisher, RTPCodecType::Video).await;
+        retired.stop();
+        let second = LocalVideoTrack::vp9().expect("second track");
+        let track = LocalTrack::Video {
+            track: second.clone(),
+            track_type: TrackType::Video,
+        };
+        let reader = replace_retired_track(&publisher, &retired, &track, &vp9)
+            .await
+            .expect("replace the retired track")
+            .expect("the retired sender");
+        let frame = vec![128_u8; 320 * 240 * 3 / 2];
+        let frame_time = Duration::from_millis(33);
+        second
+            .write_i420(&frame, 320, 240, frame_time)
+            .await
+            .expect("first frame");
+        let remote = tokio::time::timeout(Duration::from_secs(5), remote_rx.recv())
+            .await
+            .expect("remote track")
+            .expect("remote track channel");
+        // VP9 payload descriptor: B starts a frame, P marks an inter frame.
+        let starts_a_keyframe = |payload: &[u8]| payload[0] & 0x08 != 0 && payload[0] & 0x40 == 0;
+
+        receiver
+            .write_rtcp(&[Box::new(PictureLossIndication {
+                sender_ssrc: 0,
+                media_ssrc: remote.ssrc(),
+            })])
+            .await
+            .expect("send PLI");
+        let mut keyframes = 0;
+        // Ten frames are far below the periodic keyframe interval.
+        for _ in 0..10 {
+            second
+                .write_i420(&frame, 320, 240, frame_time)
+                .await
+                .expect("frame");
+            while let Ok(Ok((packet, _))) =
+                tokio::time::timeout(Duration::from_millis(100), remote.read_rtp()).await
+            {
+                keyframes += usize::from(starts_a_keyframe(&packet.payload));
+            }
+        }
+
+        assert!(
+            keyframes >= 2,
+            "the PLI forces a keyframe after the first one (keyframes: {keyframes})"
+        );
+        track.stop();
+        reader.abort();
         for task in rtcp_tasks {
             task.abort();
         }

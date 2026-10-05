@@ -27,7 +27,7 @@ pub(super) struct LocalPublication {
 pub(super) struct MediaState {
     pub(super) publications: Vec<LocalPublication>,
     pub(super) publish_quality: HashMap<(i32, i32), Vec<event::VideoLayerSetting>>,
-    /// The publish option id and stopped track of each audio sender that
+    /// The publish option id and stopped track of each sender that
     /// `stop_publish` kept in the publisher envelope.
     retired: Vec<(i32, LocalTrack)>,
 }
@@ -98,17 +98,11 @@ impl MediaState {
     }
 
     /// Remove the publication of a stopped track whose sender stays in the
-    /// publisher envelope. Keep an audio sender for a later publish; `publish`
-    /// never reuses a video sender.
+    /// publisher envelope, and keep that sender for a later publish.
     pub(super) fn retire(&mut self, track_id: &str) -> Option<LocalTrack> {
         let publish_option_id = self.publications[self.position(track_id)?].publish_option_id;
         let track = self.remove(track_id)?;
-        if matches!(
-            track.track_type(),
-            TrackType::Audio | TrackType::ScreenShareAudio
-        ) {
-            self.retired.push((publish_option_id, track.clone()));
-        }
+        self.retired.push((publish_option_id, track.clone()));
         Some(track)
     }
 
@@ -120,17 +114,31 @@ impl MediaState {
         }
     }
 
-    /// Take the stopped track of the latest sender that [`Self::retire`] kept
-    /// for this kind of track.
+    /// The stopped track of the latest sender that [`Self::retire`] kept for
+    /// this kind of track.
+    pub(super) fn retired(
+        &self,
+        track_type: TrackType,
+        publish_option_id: i32,
+    ) -> Option<&LocalTrack> {
+        let position = self.retired_position(track_type, publish_option_id)?;
+        Some(&self.retired[position].1)
+    }
+
+    /// Take the track that [`Self::retired`] returns.
     pub(super) fn take_retired(
         &mut self,
         track_type: TrackType,
         publish_option_id: i32,
     ) -> Option<LocalTrack> {
-        let position = self.retired.iter().rposition(|(option_id, retired)| {
-            retired.track_type() == track_type && *option_id == publish_option_id
-        })?;
+        let position = self.retired_position(track_type, publish_option_id)?;
         Some(self.retired.remove(position).1)
+    }
+
+    fn retired_position(&self, track_type: TrackType, publish_option_id: i32) -> Option<usize> {
+        self.retired.iter().rposition(|(option_id, retired)| {
+            retired.track_type() == track_type && *option_id == publish_option_id
+        })
     }
 
     pub(super) fn refresh_publish_options(

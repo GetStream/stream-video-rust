@@ -132,6 +132,19 @@ pub enum RtcError {
         track_type: models::TrackType,
     },
 
+    /// A stopped simulcast publication and a new track cannot share a sender:
+    /// webrtc-rs replaces the track only on a sender with one encoding. Turn a
+    /// simulcast track off and on with `mute_track` and `unmute_track` instead
+    /// of a stop.
+    #[error(
+        "a stopped {track_type:?} publication cannot change its track when either \
+         track is simulcast; use mute_track and unmute_track"
+    )]
+    SimulcastReplace {
+        /// Publication kind requested by the caller.
+        track_type: models::TrackType,
+    },
+
     /// A PCM write exceeded the track's PCM queue capacity. The newest samples
     /// were retained and this many oldest samples were discarded.
     #[error(
