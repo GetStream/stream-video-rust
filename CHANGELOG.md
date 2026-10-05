@@ -78,7 +78,9 @@ publish new tracks.
 
 `write_pcm` queues up to `LocalAudioTrackConfig::pcm_queue_capacity`, 60 s by
 default (it was 200 ms). A producer that writes faster than real time gets
-`PcmQueueOverflow` only when the queue is full.
+`PcmQueueOverflow` only when the queue is full. The capacity must hold at least
+one 20 ms frame; `LocalAudioTrack::opus_with_config` returns `RtcError::Media`
+for a smaller value.
 
 ## New Features
 
@@ -143,6 +145,34 @@ on `Call` (`get_call_participant_session_metrics`,
 `query_call_participant_sessions`, `get_call_session_participant_stats_details`,
 `query_call_session_participant_stats`,
 `get_call_session_participant_stats_timeline`).
+
+## Fixes
+
+- After a join or a reconnect, `sfu_events()` gives `ParticipantJoined`,
+  `ParticipantUpdated` and `ParticipantLeft` only for the participants that
+  changed since the previous join response. Before, each join response sent
+  `ParticipantJoined` for every participant. A change of speaking state, audio
+  level, connection quality or dominant speaker does not count: its own event
+  reports it.
+- Each join starts with an empty participant list and call state, also after
+  a join that failed or was dropped. A new join no longer reports
+  `ParticipantLeft` for the participants of the earlier attempt.
+- `ParticipantCountChanged` comes only when the count changes, not with each
+  SFU health check.
+- A dropped `RemoteTrack` unsubscribes its track only when it is the latest
+  track for that participant and track type. It can be dropped on a thread
+  without a Tokio runtime.
+- A dropped `join` future sets the call back to `Idle`, so the next `join` is
+  accepted. A dropped `leave` future still sends the leave, closes the
+  connection and sets `Left`.
+- The first join retry waits 250–500 ms and a later one up to 2.5 s, as in
+  stream-video-js.
+- The pacer task of a `LocalAudioTrack` ends when the track is dropped. A
+  decoded `PcmFrame` holds only its own samples.
+- A muted audio track no longer encodes its PCM.
+- While a track is muted, its RTP clock keeps running, for audio and video. The
+  first packet after an unmute shows the length of the mute (RFC 3550). Before,
+  the timestamps continued from the last packet before the mute.
 
 # v0.1.0-preview.2
 
