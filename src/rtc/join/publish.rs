@@ -166,8 +166,10 @@ impl RtcCore {
         Ok(())
     }
 
-    /// Pace the published audio only while the current publisher is connected.
-    pub(super) async fn sync_audio_pacing(&self) {
+    /// Start pacing the published audio once the current publisher connects.
+    /// Pacing continues through later disconnects, so a reconnect adds no
+    /// delay; stream-py `AudioStreamTrack` also catches up after a gap.
+    pub(super) async fn start_audio_pacing_if_connected(&self) {
         let media = self.media.lock().await;
         let connected = self
             .publisher_handles()
@@ -175,12 +177,11 @@ impl RtcCore {
             .is_some_and(|(publisher, ..)| {
                 publisher.connection_state() == RTCPeerConnectionState::Connected
             });
+        if !connected {
+            return;
+        }
         for track in media.active_tracks() {
-            if connected {
-                track.start_audio_pacing().await;
-            } else {
-                track.pause_audio_pacing();
-            }
+            track.start_audio_pacing().await;
         }
     }
 

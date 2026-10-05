@@ -7,9 +7,10 @@
 //! - [`LocalAudioTrack::write_pcm`] — raw [`PcmFrame`]s. Resampled to 48 kHz
 //!   mono, queued, and paced into 20 ms Opus frames by a background task that
 //!   emits silence on starve (stream-py `AudioStreamTrack` pacing). Pacing runs
-//!   after [`LocalAudioTrack::start_pacing`]; a published track paces only
-//!   while the SFU publisher is connected. This is the PCM republish / TTS-bot
-//!   path.
+//!   after [`LocalAudioTrack::start_pacing`]; a published track starts pacing
+//!   when the SFU publisher first connects and does not pause on a later
+//!   disconnect, so audio written during an outage is lost instead of delayed.
+//!   This is the PCM republish / TTS-bot path.
 //! - [`LocalAudioTrack::write_sample`] / [`LocalVideoTrack::write_sample`] —
 //!   already-encoded media (Opus/VP8/…) plus a frame duration; the SDK
 //!   packetizes and writes. The caller controls pacing.
@@ -600,24 +601,21 @@ impl LocalAudioTrack {
     /// the queue is empty. Before this, [`write_pcm`](Self::write_pcm) only
     /// fills the queue.
     ///
-    /// [`Call::publish_audio`](crate::Call::publish_audio) starts and pauses
-    /// pacing with the SFU publisher connection. Call this yourself only for a
-    /// track on your own PeerConnection (see [`webrtc_track`](Self::webrtc_track)),
-    /// after that PeerConnection connects.
+    /// [`Call::publish_audio`](crate::Call::publish_audio) starts pacing when
+    /// the SFU publisher first connects, and pacing continues through later
+    /// disconnects. Call this yourself only for a track on your own
+    /// PeerConnection (see [`webrtc_track`](Self::webrtc_track)), after that
+    /// PeerConnection connects.
     pub async fn start_pacing(&self) {
         self.inner.pacing_enabled.store(true, Ordering::SeqCst);
         self.ensure_pacer();
     }
 
-    /// Stop taking queued PCM. The queue keeps its audio for the next
+    /// Stop taking queued PCM. The queue keeps its audio, so audio written
+    /// while paused is sent late after the next
     /// [`start_pacing`](Self::start_pacing).
     pub fn pause_pacing(&self) {
         self.inner.pacing_enabled.store(false, Ordering::SeqCst);
-    }
-
-    #[cfg(test)]
-    pub(crate) fn is_pacing(&self) -> bool {
-        self.inner.pacing_enabled.load(Ordering::SeqCst)
     }
 
     /// Continue the RTP sequence numbers and timestamps of `previous`, whose
@@ -2006,15 +2004,6 @@ impl LocalTrack {
         match self {
             LocalTrack::Audio(track) | LocalTrack::ScreenShareAudio(track) => {
                 track.start_pacing().await;
-            }
-            LocalTrack::Video { .. } => {}
-        }
-    }
-
-    pub(crate) fn pause_audio_pacing(&self) {
-        match self {
-            LocalTrack::Audio(track) | LocalTrack::ScreenShareAudio(track) => {
-                track.pause_pacing();
             }
             LocalTrack::Video { .. } => {}
         }
