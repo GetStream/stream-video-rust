@@ -184,6 +184,10 @@ on `Call` (`get_call_participant_session_metrics`,
 - While a track is muted, its RTP clock keeps running, for audio and video. The
   first packet after an unmute shows the length of the mute (RFC 3550). Before,
   the timestamps continued from the last packet before the mute.
+- `RemoteTrack::next_video_frame` decodes the VP9 SVC that browsers send in
+  flexible mode. Before, it gave the first frames and then no more frames: the
+  depacketizer kept the reference indices of earlier packets and rejected each
+  inter frame after the third reference index.
 
 # v0.1.0-preview.2
 
