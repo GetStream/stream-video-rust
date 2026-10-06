@@ -23,6 +23,7 @@ use std::sync::Mutex as StdMutex;
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
+use bytes::Bytes;
 use tokio::sync::{Mutex as AsyncMutex, Semaphore};
 use webrtc::media::io::sample_builder::SampleBuilder;
 use webrtc::peer_connection::RTCPeerConnection;
@@ -30,6 +31,7 @@ use webrtc::rtcp::packet::Packet as RtcpPacket;
 use webrtc::rtcp::payload_feedbacks::picture_loss_indication::PictureLossIndication;
 use webrtc::rtp::codecs::vp8::Vp8Packet;
 use webrtc::rtp::codecs::vp9::Vp9Packet;
+use webrtc::rtp::packetizer::Depacketizer;
 use webrtc::track::track_remote::TrackRemote;
 
 use super::local::RtpPacket;
@@ -54,6 +56,8 @@ const VIDEO_CLOCK_RATE: u32 = 90_000;
 /// one is in flight for at least a round trip, so asking faster only wastes
 /// uplink.
 const KEYFRAME_REQUEST_INTERVAL: Duration = Duration::from_secs(1);
+/// Interval between `stream.rtc.remote.video_receive_stats` debug logs.
+const VIDEO_STATS_INTERVAL: Duration = Duration::from_secs(5);
 
 /// The publishing participant a [`RemoteTrack`] belongs to.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -143,7 +147,28 @@ pub struct Codec {
 /// decoder corrupts any frame that arrives out of order.
 enum VideoSamples {
     Vp8(SampleBuilder<Vp8Packet>),
-    Vp9(SampleBuilder<Vp9Packet>),
+    Vp9(SampleBuilder<Vp9Depacketizer>),
+}
+
+/// [`Vp9Packet`] reset before each packet. `Vp9Packet::depacketize` keeps the
+/// reference indices of earlier packets and fails once three accumulate, which
+/// rejects every flexible-mode inter frame after the third.
+#[derive(Default)]
+struct Vp9Depacketizer(Vp9Packet);
+
+impl Depacketizer for Vp9Depacketizer {
+    fn depacketize(&mut self, packet: &Bytes) -> std::result::Result<Bytes, webrtc::rtp::Error> {
+        self.0 = Vp9Packet::default();
+        self.0.depacketize(packet)
+    }
+
+    fn is_partition_head(&self, payload: &Bytes) -> bool {
+        self.0.is_partition_head(payload)
+    }
+
+    fn is_partition_tail(&self, marker: bool, payload: &Bytes) -> bool {
+        self.0.is_partition_tail(marker, payload)
+    }
 }
 
 impl VideoSamples {
@@ -156,7 +181,7 @@ impl VideoSamples {
             )),
             VideoCodec::Vp9 => Self::Vp9(SampleBuilder::new(
                 VIDEO_MAX_LATE,
-                Vp9Packet::default(),
+                Vp9Depacketizer::default(),
                 VIDEO_CLOCK_RATE,
             )),
         }
@@ -190,6 +215,26 @@ struct VideoDecode {
     decoder: VpxDecoder,
     ready: VecDeque<VideoFrame>,
     last_resolution: Option<(u32, u32)>,
+    /// Payload type of the last packet, starting at the negotiated one.
+    payload_type: u8,
+    last_sequence_number: Option<u16>,
+    stats: VideoStats,
+    stats_since: Instant,
+}
+
+/// Inbound video counts since the last stats log. [`SampleBuilder`] discards
+/// its build errors, so packets without completed samples are the only sign of
+/// a frame that could not be assembled.
+#[derive(Default)]
+struct VideoStats {
+    packets: usize,
+    /// Packets whose sequence number does not follow the previous packet's.
+    sequence_gaps: usize,
+    markers: usize,
+    samples: usize,
+    frames: usize,
+    decode_errors: usize,
+    last_payload_byte: Option<u8>,
 }
 
 /// Inbound audio decode state, plus frames already decoded but not yet handed to
@@ -268,6 +313,14 @@ impl RemoteTrack {
             clock_rate: params.capability.clock_rate,
             channels: params.capability.channels,
         };
+        tracing::debug!(
+            user_id = %participant.user_id,
+            ?track_type,
+            mime_type = %codec.mime_type,
+            payload_type = codec.payload_type,
+            ssrc = track.ssrc(),
+            "stream.rtc.remote.track_codec"
+        );
 
         let decode = build_decoder(track_type, &codec);
 
@@ -615,10 +668,53 @@ impl VideoDecode {
     /// Feed one RTP packet into the reassembler and return every sample it
     /// completes. This path performs no native decode work.
     fn push_packet(&mut self, packet: RtpPacket) -> Vec<webrtc::media::Sample> {
+        let ssrc = packet.header.ssrc;
+        let payload_type = packet.header.payload_type;
+        if payload_type != self.payload_type {
+            tracing::debug!(
+                ssrc,
+                from = self.payload_type,
+                to = payload_type,
+                "stream.rtc.remote.video_payload_type_changed"
+            );
+            self.payload_type = payload_type;
+        }
+        self.stats.packets += 1;
+        let sequence_number = packet.header.sequence_number;
+        if self
+            .last_sequence_number
+            .is_some_and(|last| sequence_number != last.wrapping_add(1))
+        {
+            self.stats.sequence_gaps += 1;
+        }
+        self.last_sequence_number = Some(sequence_number);
+        if packet.header.marker {
+            self.stats.markers += 1;
+        }
+        self.stats.last_payload_byte = packet.payload.first().copied();
+
         let mut completed = Vec::with_capacity(1);
         self.samples.push(packet);
         while let Some(sample) = self.samples.pop() {
             completed.push(sample);
+        }
+        self.stats.samples += completed.len();
+
+        if self.stats_since.elapsed() >= VIDEO_STATS_INTERVAL {
+            let stats = std::mem::take(&mut self.stats);
+            tracing::debug!(
+                ssrc,
+                payload_type,
+                packets = stats.packets,
+                sequence_gaps = stats.sequence_gaps,
+                markers = stats.markers,
+                samples = stats.samples,
+                frames = stats.frames,
+                decode_errors = stats.decode_errors,
+                last_payload_byte = ?stats.last_payload_byte.map(|b| format!("{b:#04x}")),
+                "stream.rtc.remote.video_receive_stats"
+            );
+            self.stats_since = Instant::now();
         }
         completed
     }
@@ -640,6 +736,7 @@ impl VideoDecode {
 
             match self.decoder.decode(&sample.data, sample.packet_timestamp) {
                 Ok(frames) => {
+                    self.stats.frames += frames.len();
                     for frame in frames {
                         let resolution = (frame.width, frame.height);
                         if self.last_resolution != Some(resolution) {
@@ -654,6 +751,7 @@ impl VideoDecode {
                     }
                 }
                 Err(e) => {
+                    self.stats.decode_errors += 1;
                     tracing::debug!(error = %e, "stream.rtc.remote.video_decode_failed");
                     needs_keyframe = true;
                 }
@@ -713,6 +811,10 @@ fn build_decoder(track_type: TrackType, codec: &Codec) -> Decode {
             decoder,
             ready: VecDeque::new(),
             last_resolution: None,
+            payload_type: codec.payload_type,
+            last_sequence_number: None,
+            stats: VideoStats::default(),
+            stats_since: Instant::now(),
         }))),
         Err(e) => {
             tracing::warn!(
@@ -738,12 +840,93 @@ fn video_codec_for(mime_type: &str) -> Option<VideoCodec> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::rtc::codecs::vpx::{EncodedFrame, VpxEncoder};
 
     #[test]
     fn supported_video_mime_types_map_to_a_decoder() {
         assert_eq!(video_codec_for("video/VP8"), Some(VideoCodec::Vp8));
         assert_eq!(video_codec_for("video/vp9"), Some(VideoCodec::Vp9));
         assert_eq!(video_codec_for("video/H264"), None);
+    }
+
+    /// RTP packets for one VP9 frame in flexible mode, as browsers send VP9
+    /// SVC: a 15-bit picture ID and, on an inter frame, one reference index.
+    fn vp9_flexible_mode_packets(
+        frame: &EncodedFrame,
+        picture_id: u16,
+        first_sequence_number: u16,
+    ) -> Vec<RtpPacket> {
+        let chunks: Vec<&[u8]> = frame.data.chunks(200).collect();
+        let last = chunks.len() - 1;
+        chunks
+            .into_iter()
+            .enumerate()
+            .map(|(index, chunk)| {
+                // I (picture ID) + F (flexible mode).
+                let mut payload = vec![0x90, 0x80 | (picture_id >> 8) as u8, picture_id as u8];
+                if !frame.key {
+                    payload[0] |= 0x40;
+                    // P_DIFF = 1, N = 0.
+                    payload.push(1 << 1);
+                }
+                if index == 0 {
+                    payload[0] |= 0x08;
+                }
+                if index == last {
+                    payload[0] |= 0x04;
+                }
+                payload.extend_from_slice(chunk);
+                RtpPacket {
+                    header: webrtc::rtp::header::Header {
+                        version: 2,
+                        payload_type: 98,
+                        sequence_number: first_sequence_number.wrapping_add(index as u16),
+                        timestamp: u32::from(picture_id) * 3_000,
+                        marker: index == last,
+                        ..Default::default()
+                    },
+                    payload: Bytes::from(payload),
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn every_frame_of_a_flexible_mode_vp9_stream_is_decoded() {
+        let (width, height) = (160, 120);
+        let mut encoder = VpxEncoder::new(VpxCodec::Vp9, width, height, 400).expect("vp9 encoder");
+        let image = vec![128u8; (width * height * 3 / 2) as usize];
+        let codec = Codec {
+            mime_type: "video/VP9".to_owned(),
+            payload_type: 98,
+            clock_rate: VIDEO_CLOCK_RATE,
+            channels: 0,
+        };
+        let Decode::Video(state) = build_decoder(TrackType::Video, &codec) else {
+            panic!("VP9 must have a decoder");
+        };
+        let mut state = state.lock().expect("video decode state");
+
+        let mut pictures: u16 = 0;
+        let mut sequence_number: u16 = 0;
+        for index in 0..10 {
+            let encoded = encoder
+                .encode(&image, index * 33, 33, index == 0)
+                .expect("encode");
+            for frame in &encoded {
+                let packets = vp9_flexible_mode_packets(frame, pictures, sequence_number);
+                pictures += 1;
+                sequence_number = sequence_number.wrapping_add(packets.len() as u16);
+                for packet in packets {
+                    let samples = state.push_packet(packet);
+                    state.decode_samples(samples);
+                }
+            }
+        }
+
+        // The last frame completes only when a packet of a later frame arrives.
+        assert!(pictures > 3, "the encoder must emit inter frames");
+        assert_eq!(state.ready.len(), usize::from(pictures) - 1);
     }
 
     /// One 20 ms frame of 440 Hz tone, loud enough that a silent or badly
