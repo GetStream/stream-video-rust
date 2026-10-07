@@ -242,6 +242,12 @@ on `Call` (`get_call_participant_session_metrics`,
 - A VP8 or VP9 track continues its picture IDs when its encoder is set up again,
   for example after a size or bitrate change. Before, the picture ID jumped to a
   new value on the same SSRC, which RFC 7741 does not permit.
+- The vendored SFU protocol removes the deprecated `SendStatsRequest` fields
+  `subscriber_stats`, `publisher_stats`, `audio_devices`, `video_devices`,
+  `subscriber_rtc_stats` and `publisher_rtc_stats`. A stats report sends the
+  `get_stats()` samples only in the `getstats` records of `rtc_stats`. Before,
+  it also sent them as JSON strings in `subscriber_stats` and
+  `publisher_stats`.
 
 # v0.1.0-preview.2
 
