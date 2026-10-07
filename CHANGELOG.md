@@ -188,6 +188,10 @@ on `Call` (`get_call_participant_session_metrics`,
   flexible mode. Before, it gave the first frames and then no more frames: the
   depacketizer kept the reference indices of earlier packets and rejected each
   inter frame after the third reference index.
+- `RemoteTrack::next_video_frame` asks the publisher for a keyframe when
+  packets arrive but no frame is decoded for 3 s, and again after each further
+  3 s, as libwebrtc does. Before, a stream whose frames could not be assembled
+  stayed frozen and sent no keyframe request.
 
 # v0.1.0-preview.2
 
