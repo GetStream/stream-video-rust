@@ -5,10 +5,10 @@
 //! Ported from stream-video-js `stats/SfuStatsReporter.ts`. The reporter drains
 //! the signal / publisher / subscriber [`Tracer`]s into the `rtc_stats` JSON
 //! array (ICE / track / PC-state / RPC events), samples each PeerConnection's
-//! `get_stats()` into `{subscriber,publisher}_stats` plus a `getstats` trace
-//! record, and posts a fully-populated [`SendStatsRequest`] over the Twirp
-//! signal client. The loop is interval-driven (no busy-wait) and is drained one
-//! final time on leave / reconnect so end-of-call events are recorded.
+//! `get_stats()` into a `getstats` trace record, and posts a fully-populated
+//! [`SendStatsRequest`] over the Twirp signal client. The loop is
+//! interval-driven (no busy-wait) and is drained one final time on leave /
+//! reconnect so end-of-call events are recorded.
 //!
 //! Cadence is driven by the coordinator's cached `stats_options`
 //! (`reporting_interval_ms`); when the coordinator leaves it unset we default it
@@ -154,8 +154,8 @@ impl StatsReporter {
         let _guard = self.send_lock.lock().await;
 
         tracing::debug!(session_id = %self.session_id, "stream.rtc.stats.report_start");
-        let (subscriber_stats, subscriber_flat) = collect_stats(&self.subscriber).await;
-        let (publisher_stats, publisher_flat) = collect_stats(&self.publisher).await;
+        let subscriber_flat = collect_stats(&self.subscriber).await;
+        let publisher_flat = collect_stats(&self.publisher).await;
         let ts = now_ms();
 
         let signal_traces = self.signal_tracer.take();
@@ -184,8 +184,6 @@ impl StatsReporter {
         let request = SendStatsRequest {
             session_id: self.session_id.clone(),
             unified_session_id: self.unified_session_id.clone(),
-            subscriber_stats,
-            publisher_stats,
             webrtc_version: identity::WEBRTC_VERSION.to_owned(),
             sdk: identity::sdk_name().to_owned(),
             sdk_version: identity::sdk_version(),
@@ -261,26 +259,21 @@ fn getstats_record(id: Option<&str>, flattened: Value, ts: i64) -> TraceRecord {
     TraceRecord("getstats".to_owned(), id.map(str::to_owned), flattened, ts)
 }
 
-/// Collect `pc.get_stats()` (time-boxed) as `(json_string, flattened_value)`.
-///
-/// The string form fills `SendStats.{subscriber,publisher}_stats`; the
-/// flattened value rides in the `getstats` `rtc_stats` record. `flatten`
-/// mirrors JS: the stats-report map becomes an array of stat objects.
-async fn collect_stats(pc: &Arc<RTCPeerConnection>) -> (String, Value) {
+/// Collect `pc.get_stats()` (time-boxed), flattened for the `getstats`
+/// `rtc_stats` record. `flatten` mirrors JS: the stats-report map becomes an
+/// array of stat objects.
+async fn collect_stats(pc: &Arc<RTCPeerConnection>) -> Value {
     let report = match tokio::time::timeout(GET_STATS_TIMEOUT, pc.get_stats()).await {
         Ok(report) => report,
         Err(_) => {
             tracing::debug!("stream.rtc.stats.get_stats_timed_out");
-            return ("[]".to_owned(), Value::Array(Vec::new()));
+            return Value::Array(Vec::new());
         }
     };
-    let value = serde_json::to_value(&report).unwrap_or(Value::Null);
-    let flattened = match value {
+    match serde_json::to_value(&report).unwrap_or(Value::Null) {
         Value::Object(map) => Value::Array(map.into_values().collect()),
         other => other,
-    };
-    let as_string = serde_json::to_string(&flattened).unwrap_or_else(|_| "[]".to_owned());
-    (as_string, flattened)
+    }
 }
 
 #[cfg(test)]

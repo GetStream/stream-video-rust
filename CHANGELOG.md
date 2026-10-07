@@ -24,6 +24,16 @@ on `Call` (`get_call_participant_session_metrics`,
 `query_call_session_participant_stats`,
 `get_call_session_participant_stats_timeline`).
 
+## Changes
+
+### SFU protocol sync
+
+The vendored SFU protocol drops the deprecated `SendStatsRequest` fields
+`subscriber_stats`, `publisher_stats`, `audio_devices`, `video_devices`,
+`subscriber_rtc_stats`, and `publisher_rtc_stats`. Stats reports no longer
+include the raw `getStats()` strings; the same samples still reach the
+dashboard through the `getstats` records in `rtc_stats`.
+
 # v0.1.0-preview.2
 
 docs.rs builds on current nightly. `doc_auto_cfg` was removed in 1.92 and
