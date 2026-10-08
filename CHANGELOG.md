@@ -96,12 +96,13 @@ accepts only H.264 video.
 ### PCM has a fixed sample rate
 
 `write_pcm` takes the sample rate of the first frame. A later frame at another
-rate gets `RtcError::IllegalState`. The track still averages the channels of a
-frame to mono.
+rate gets `RtcError::PcmRateMismatch { expected, actual }` and is not written.
+The track still averages the channels of a frame to mono.
 
 `StreamResampler::new(out_rate, channels)` replaces `new(out_rate)` and
 `to_opus_mono()`. The first `push` sets the input rate. A frame with another
-rate or channel count gets `RtcError::IllegalState`. `push` and `flush` return
+rate gets `RtcError::PcmRateMismatch`, and a frame with another channel count
+gets `RtcError::IllegalState`. `push` and `flush` return
 `RtcResult<PcmFrame>` with the same channels as the input. The resampler no
 longer downmixes to mono.
 
