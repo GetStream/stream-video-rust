@@ -7,8 +7,8 @@
 //! - [`LocalAudioTrack::write_pcm`] — raw [`PcmFrame`]s at the rate of the
 //!   first frame. Averaged to mono, resampled to 48 kHz, queued, and paced
 //!   into 20 ms Opus frames by a background task that
-//!   emits silence on starve (stream-py `AudioStreamTrack` pacing).
-//!   [`LocalAudioTrack::drain`] queues the audio the resampler still holds. Pacing
+//!   emits silence on starve (stream-py `AudioStreamTrack` pacing). Before
+//!   the silence, it takes the audio that the resampler still holds. Pacing
 //!   starts at the first write, or at [`LocalAudioTrack::start_pacing`] when
 //!   [`LocalAudioTrackConfig::pace`] is off. A published track holds its queue
 //!   until the SFU publisher first connects and does not pause on a later
@@ -365,6 +365,38 @@ struct AudioInner {
     write_guard: tokio::sync::Mutex<()>,
 }
 
+impl AudioInner {
+    /// Fill `frame` from the queue and then with silence. A queue shorter than
+    /// `frame` first gets the audio that the resampler still holds, so the end
+    /// of the written audio plays without a gap.
+    fn take_pcm(&self, frame: &mut [i16]) {
+        let mut buf = self.pcm.lock().unwrap_or_else(|e| e.into_inner());
+        if buf.len() < frame.len() {
+            drop(buf);
+            let mut resampler = self.resampler.lock().unwrap_or_else(|e| e.into_inner());
+            buf = self.pcm.lock().unwrap_or_else(|e| e.into_inner());
+            if buf.len() < frame.len() {
+                match resampler.flush() {
+                    Ok(mut tail) => {
+                        // The silence after the tail would delay the next write.
+                        let end = tail
+                            .samples
+                            .iter()
+                            .rposition(|&s| s != 0)
+                            .map_or(0, |i| i + 1);
+                        tail.samples.truncate(end);
+                        push_bounded_pcm(&mut buf, tail.samples, self.pcm_capacity_samples);
+                    }
+                    Err(e) => tracing::debug!(error = %e, "stream.rtc.audio.flush_failed"),
+                }
+            }
+        }
+        for slot in frame.iter_mut() {
+            *slot = buf.pop_front().unwrap_or(0);
+        }
+    }
+}
+
 /// Encoder settings for a locally encoded Opus track.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -524,7 +556,9 @@ impl LocalAudioTrack {
     /// pacing when [`LocalAudioTrackConfig::pace`] is set (the default);
     /// otherwise [`start_pacing`](Self::start_pacing) does. While pacing runs, a
     /// background task emits one Opus packet every 20 ms, writing silence when
-    /// the buffer runs dry. This method
+    /// the buffer runs dry. Before the silence, it takes the audio that the
+    /// resampler still holds (8 ms at 16 kHz), so the end of the written audio
+    /// plays without the next write. This method
     /// does not backpressure a producer: overflow drops the oldest queued
     /// samples and retains the newest audio. [`flush`](Self::flush) still drops
     /// all unsent samples immediately for barge-in.
@@ -572,30 +606,6 @@ impl LocalAudioTrack {
             self.start_pacing().await;
         }
         queued
-    }
-
-    /// Queue the audio that the resampler still holds, so the end of the
-    /// written audio plays without the next write. Call it when the producer
-    /// stops writing, for example at the end of an utterance. It queues nothing
-    /// when the track takes 48 kHz PCM.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`RtcError::IllegalState`] on a stopped track,
-    /// [`RtcError::PcmQueueOverflow`] after retaining the newest audio when the
-    /// queue capacity is exceeded, and [`RtcError::Media`] if the resampler
-    /// fails.
-    pub fn drain(&self) -> Result<()> {
-        if self.inner.core.stopped.load(Ordering::SeqCst) {
-            return Err(RtcError::IllegalState("drain a stopped track".to_owned()));
-        }
-        let mut r = self
-            .inner
-            .resampler
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let tail = r.flush()?.samples;
-        self.queue_pcm(tail)
     }
 
     /// Append 48 kHz mono samples to the pacer queue, dropping the oldest
@@ -824,12 +834,7 @@ async fn pace_audio(track: Weak<AudioInner>) {
         if !inner.pcm_pacing.load(Ordering::SeqCst) {
             continue;
         }
-        {
-            let mut buf = inner.pcm.lock().unwrap_or_else(|e| e.into_inner());
-            for slot in scratch.iter_mut() {
-                *slot = buf.pop_front().unwrap_or(0);
-            }
-        }
+        inner.take_pcm(&mut scratch);
         // A muted track sends nothing, so its audio is dropped without an encode.
         // The RTP clock keeps time, so the first packet after the mute shows the
         // gap (RFC 3550 §5.1).
@@ -2363,33 +2368,53 @@ mod tests {
         PcmFrame::mono(samples, 16_000)
     }
 
-    fn queued_peak(track: &LocalAudioTrack) -> i16 {
-        let queue = track
-            .inner
-            .pcm
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        queue.iter().map(|s| s.saturating_abs()).max().unwrap_or(0)
-    }
-
     fn unpaced_track() -> LocalAudioTrack {
         LocalAudioTrack::opus_with_config(LocalAudioTrackConfig::default().with_pace(false))
             .expect("opus track")
     }
 
+    fn peak(samples: &[i16]) -> i16 {
+        samples
+            .iter()
+            .map(|s| s.saturating_abs())
+            .max()
+            .unwrap_or(0)
+    }
+
     #[tokio::test]
-    async fn drain_queues_the_end_of_the_written_audio() {
+    async fn a_short_queue_takes_the_end_of_the_written_audio() {
         let track = unpaced_track();
         track.write_pcm(loud_end_16k()).await.expect("write_pcm");
-        let before = queued_peak(&track);
+        let mut first = vec![0; FRAME_SAMPLES_20MS];
+        let mut second = vec![0; FRAME_SAMPLES_20MS];
 
-        track.drain().expect("drain");
+        track.inner.take_pcm(&mut first);
+        track.inner.take_pcm(&mut second);
 
-        assert!(before < 1_000, "the loud end was queued before the drain");
-        assert!(
-            queued_peak(&track) > 15_000,
-            "the drain did not queue the loud end"
-        );
+        assert!(peak(&first) < 1_000, "the loud end came before its time");
+        assert!(peak(&second) > 15_000, "the loud end did not play");
+        track.stop();
+    }
+
+    #[tokio::test]
+    async fn the_end_of_the_written_audio_leaves_no_silence_in_the_queue() {
+        let track = unpaced_track();
+        let tone_5ms = (0..80)
+            .map(|index| {
+                let time = index as f64 / 16_000.0;
+                (12_000.0 * (std::f64::consts::TAU * 440.0 * time).sin()) as i16
+            })
+            .collect();
+        track
+            .write_pcm(PcmFrame::mono(tone_5ms, 16_000))
+            .await
+            .expect("write_pcm");
+
+        track.inner.take_pcm(&mut vec![0; FRAME_SAMPLES_20MS]);
+
+        let queue = track.inner.pcm.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(queue.is_empty(), "{} samples of silence wait", queue.len());
+        drop(queue);
         track.stop();
     }
 
@@ -2399,17 +2424,10 @@ mod tests {
         track.write_pcm(loud_end_16k()).await.expect("write_pcm");
 
         track.flush();
-        track
-            .write_pcm(PcmFrame::silence(1_600, 16_000, 1))
-            .await
-            .expect("write_pcm");
-        track.drain().expect("drain");
+        let mut frame = vec![0; FRAME_SAMPLES_20MS];
+        track.inner.take_pcm(&mut frame);
 
-        assert_eq!(
-            queued_peak(&track),
-            0,
-            "audio from before the flush was queued"
-        );
+        assert_eq!(peak(&frame), 0, "audio from before the flush played");
         track.stop();
     }
 
@@ -2866,7 +2884,6 @@ mod tests {
             .write_sample(&[0xf8, 0xff, 0xfe], Duration::from_millis(20))
             .await;
         assert!(matches!(err, Err(RtcError::IllegalState(_))));
-        assert!(matches!(track.drain(), Err(RtcError::IllegalState(_))));
     }
 
     #[tokio::test]
