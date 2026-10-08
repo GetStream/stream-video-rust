@@ -107,13 +107,15 @@ longer downmixes to mono.
 
 ## New Features
 
-### Drain the end of the PCM
+### The pacer plays the end of the PCM
 
 `StreamResampler` holds the newest 128 input frames in its filter: 8 ms at
-16 kHz, 5.3 ms at 24 kHz. `StreamResampler::flush` returns them.
-`LocalAudioTrack::drain` puts them in the pacer queue. Call it when the producer
-stops writing, for example at the end of an utterance. Without it, that audio
-plays at the start of the next write. A track at 48 kHz holds no audio.
+16 kHz, 5.3 ms at 24 kHz. `StreamResampler::flush` returns them. When the queue
+of a `LocalAudioTrack` holds less than one 20 ms frame, the pacer first adds
+that audio, so the end of the written audio plays without the next write. A
+track at 48 kHz holds no audio. Each time the queue runs short in the middle of
+the audio, the filter starts again: the gap is at least 11 ms at 16 kHz and
+23 ms at 8 kHz.
 
 ### Pacing control for PCM tracks
 
