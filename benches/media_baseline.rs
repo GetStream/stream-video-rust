@@ -66,8 +66,7 @@ fn bench_resampling(criterion: &mut Criterion) {
         ("24k_mono_to_48k_mono_20ms", tone(24_000, 1, 20)),
     ] {
         group.throughput(Throughput::Elements(input.frames() as u64));
-        let mut resampler = StreamResampler::new(input.sample_rate, 48_000, input.channels)
-            .expect("create resampler");
+        let mut resampler = StreamResampler::new(48_000, input.channels);
         group.bench_function(name, |bencher| {
             bencher.iter(|| black_box(resampler.push(black_box(&input))));
         });
