@@ -4,9 +4,11 @@
 //! Rust analog of videosdk's `track.Local` (`WriteRTP` / `WriteSample` /
 //! `StartWrite`). Three write paths feed the same outbound track:
 //!
-//! - [`LocalAudioTrack::write_pcm`] — raw [`PcmFrame`]s. Resampled to 48 kHz
-//!   mono, queued, and paced into 20 ms Opus frames by a background task that
-//!   emits silence on starve (stream-py `AudioStreamTrack` pacing). Pacing
+//! - [`LocalAudioTrack::write_pcm`] — raw [`PcmFrame`]s at
+//!   [`LocalAudioTrackConfig::pcm_sample_rate`]. Averaged to mono, resampled to
+//!   48 kHz, queued, and paced into 20 ms Opus frames by a background task that
+//!   emits silence on starve (stream-py `AudioStreamTrack` pacing).
+//!   [`LocalAudioTrack::drain`] queues the audio the resampler still holds. Pacing
 //!   starts at the first write, or at [`LocalAudioTrack::start_pacing`] when
 //!   [`LocalAudioTrackConfig::pace`] is off. A published track holds its queue
 //!   until the SFU publisher first connects and does not pause on a later
@@ -346,6 +348,8 @@ struct AudioInner {
     /// Resampled 48 kHz mono PCM awaiting the 20 ms pacer.
     pcm: StdMutex<VecDeque<i16>>,
     pcm_capacity_samples: usize,
+    /// Locked before `pcm`. A writer keeps it until its audio is queued, so a
+    /// flush cannot fall between the resample and the queue.
     resampler: StdMutex<StreamResampler>,
     encoder: StdMutex<opus::Encoder>,
     pacer: StdMutex<Option<JoinHandle<()>>>,
@@ -379,6 +383,9 @@ pub struct LocalAudioTrackConfig {
     /// write above it drops the oldest queued samples. The minimum is one 20 ms
     /// frame.
     pub pcm_queue_capacity: Duration,
+    /// Sample rate of the PCM that [`LocalAudioTrack::write_pcm`] accepts. The
+    /// track resamples it to 48 kHz.
+    pub pcm_sample_rate: u32,
     /// Start pacing at the first [`LocalAudioTrack::write_pcm`]. When `false`,
     /// `write_pcm` only queues until [`LocalAudioTrack::start_pacing`].
     pub pace: bool,
@@ -392,6 +399,7 @@ impl Default for LocalAudioTrackConfig {
             expected_packet_loss_pct: EXPECTED_PACKET_LOSS_PCT,
             dtx: true,
             pcm_queue_capacity: PCM_QUEUE_CAPACITY,
+            pcm_sample_rate: OPUS_SAMPLE_RATE,
             pace: true,
         }
     }
@@ -432,6 +440,14 @@ impl LocalAudioTrackConfig {
     #[must_use]
     pub fn with_pcm_queue_capacity(mut self, pcm_queue_capacity: Duration) -> Self {
         self.pcm_queue_capacity = pcm_queue_capacity;
+        self
+    }
+
+    /// Set the sample rate of the PCM that [`LocalAudioTrack::write_pcm`]
+    /// accepts.
+    #[must_use]
+    pub fn with_pcm_sample_rate(mut self, pcm_sample_rate: u32) -> Self {
+        self.pcm_sample_rate = pcm_sample_rate;
         self
     }
 
@@ -498,7 +514,11 @@ impl LocalAudioTrack {
                 core,
                 pcm: StdMutex::new(VecDeque::new()),
                 pcm_capacity_samples,
-                resampler: StdMutex::new(StreamResampler::to_opus_mono()),
+                resampler: StdMutex::new(StreamResampler::new(
+                    config.pcm_sample_rate,
+                    OPUS_SAMPLE_RATE,
+                    1,
+                )?),
                 encoder: StdMutex::new(encoder),
                 pacer: StdMutex::new(None),
                 pacer_started: AtomicBool::new(false),
@@ -513,7 +533,8 @@ impl LocalAudioTrack {
 
     /// Queue a PCM frame for the paced 20 ms Opus encoder.
     ///
-    /// The frame is resampled to 48 kHz mono and buffered up to
+    /// The frame must be at [`LocalAudioTrackConfig::pcm_sample_rate`]. Its
+    /// channels are averaged to mono, resampled to 48 kHz, and buffered up to
     /// [`LocalAudioTrackConfig::pcm_queue_capacity`]. The first write starts
     /// pacing when [`LocalAudioTrackConfig::pace`] is set (the default);
     /// otherwise [`start_pacing`](Self::start_pacing) does. While pacing runs, a
@@ -528,7 +549,8 @@ impl LocalAudioTrack {
     /// Returns [`RtcError::PcmQueueOverflow`] after retaining the newest audio
     /// when this write exceeds the queue capacity. The caller may continue
     /// writing; the typed error makes overload observable without allowing
-    /// stale audio to accumulate.
+    /// stale audio to accumulate. Returns [`RtcError::IllegalState`] when the
+    /// frame is not at [`LocalAudioTrackConfig::pcm_sample_rate`].
     pub async fn write_pcm(&self, frame: PcmFrame) -> Result<()> {
         if self.inner.core.stopped.load(Ordering::SeqCst) {
             return Err(RtcError::IllegalState(
@@ -536,39 +558,78 @@ impl LocalAudioTrack {
             ));
         }
         self.inner.pcm_pacing.store(true, Ordering::SeqCst);
-        let resampled = {
+        let frame = if frame.channels > 1 {
+            let channels = usize::from(frame.channels);
+            let samples = frame
+                .samples
+                .chunks_exact(channels)
+                .map(|chunk| {
+                    let sum: f32 = chunk.iter().map(|&s| f32::from(s)).sum();
+                    (sum / channels as f32).round() as i16
+                })
+                .collect();
+            PcmFrame::mono(samples, frame.sample_rate)
+        } else {
+            frame
+        };
+        let queued = {
             let mut r = self
                 .inner
                 .resampler
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
-            r.push(&frame)
-        };
-        let dropped = {
-            let mut buf = self.inner.pcm.lock().unwrap_or_else(|e| e.into_inner());
-            let dropped = push_bounded_pcm(&mut buf, resampled, self.inner.pcm_capacity_samples);
-            if dropped > 0 {
-                tracing::debug!(
-                    dropped_samples = dropped,
-                    capacity_samples = self.inner.pcm_capacity_samples,
-                    "stream.rtc.audio.pcm_queue_overflow"
-                );
-            }
-            dropped
+            let resampled = r.push(&frame)?.samples;
+            self.queue_pcm(resampled)
         };
         // Only a pacer that never started starts here, so a `pause_pacing`
         // stays in force.
         if self.inner.pace && !self.inner.pacer_started.load(Ordering::SeqCst) {
             self.start_pacing().await;
         }
-        if dropped > 0 {
-            Err(RtcError::PcmQueueOverflow {
-                dropped_samples: dropped,
-                capacity_samples: self.inner.pcm_capacity_samples,
-            })
-        } else {
-            Ok(())
+        queued
+    }
+
+    /// Queue the audio that the resampler still holds, so the end of the
+    /// written audio plays without the next write. Call it when the producer
+    /// stops writing, for example at the end of an utterance. It queues nothing
+    /// when [`LocalAudioTrackConfig::pcm_sample_rate`] is 48 kHz.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RtcError::IllegalState`] on a stopped track,
+    /// [`RtcError::PcmQueueOverflow`] after retaining the newest audio when the
+    /// queue capacity is exceeded, and [`RtcError::Media`] if the resampler
+    /// fails.
+    pub fn drain(&self) -> Result<()> {
+        if self.inner.core.stopped.load(Ordering::SeqCst) {
+            return Err(RtcError::IllegalState("drain a stopped track".to_owned()));
         }
+        let mut r = self
+            .inner
+            .resampler
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let tail = r.flush()?.samples;
+        self.queue_pcm(tail)
+    }
+
+    /// Append 48 kHz mono samples to the pacer queue, dropping the oldest
+    /// audio above the capacity. Callers hold the `resampler` lock.
+    fn queue_pcm(&self, samples: Vec<i16>) -> Result<()> {
+        let mut buf = self.inner.pcm.lock().unwrap_or_else(|e| e.into_inner());
+        let dropped = push_bounded_pcm(&mut buf, samples, self.inner.pcm_capacity_samples);
+        if dropped == 0 {
+            return Ok(());
+        }
+        tracing::debug!(
+            dropped_samples = dropped,
+            capacity_samples = self.inner.pcm_capacity_samples,
+            "stream.rtc.audio.pcm_queue_overflow"
+        );
+        Err(RtcError::PcmQueueOverflow {
+            dropped_samples: dropped,
+            capacity_samples: self.inner.pcm_capacity_samples,
+        })
     }
 
     /// Write an already-encoded Opus frame of `duration` (packetized immediately;
@@ -634,8 +695,17 @@ impl LocalAudioTrack {
         self.inner.core.forward_rtp(&packet).await
     }
 
-    /// Drop any buffered-but-unsent PCM (barge-in). Does not stop the track.
+    /// Drop any buffered-but-unsent PCM (barge-in), including the audio that
+    /// the resampler still holds. Does not stop the track.
     pub fn flush(&self) {
+        let mut r = self
+            .inner
+            .resampler
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Err(e) = r.flush() {
+            tracing::debug!(error = %e, "stream.rtc.audio.flush_failed");
+        }
         let mut buf = self.inner.pcm.lock().unwrap_or_else(|e| e.into_inner());
         buf.clear();
     }
@@ -2294,6 +2364,74 @@ mod tests {
         track.stop();
     }
 
+    /// A silent 20 ms block at 16 kHz whose last 2 ms carry a loud 1 kHz tone.
+    fn loud_end_16k() -> PcmFrame {
+        let samples = (0..320)
+            .map(|index| {
+                if index < 288 {
+                    return 0;
+                }
+                let time = index as f64 / 16_000.0;
+                (20_000.0 * (std::f64::consts::TAU * 1_000.0 * time).sin()) as i16
+            })
+            .collect();
+        PcmFrame::mono(samples, 16_000)
+    }
+
+    fn queued_peak(track: &LocalAudioTrack) -> i16 {
+        let queue = track
+            .inner
+            .pcm
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        queue.iter().map(|s| s.saturating_abs()).max().unwrap_or(0)
+    }
+
+    fn track_at_16k() -> LocalAudioTrack {
+        LocalAudioTrack::opus_with_config(
+            LocalAudioTrackConfig::default()
+                .with_pace(false)
+                .with_pcm_sample_rate(16_000),
+        )
+        .expect("opus track")
+    }
+
+    #[tokio::test]
+    async fn drain_queues_the_end_of_the_written_audio() {
+        let track = track_at_16k();
+        track.write_pcm(loud_end_16k()).await.expect("write_pcm");
+        let before = queued_peak(&track);
+
+        track.drain().expect("drain");
+
+        assert!(before < 1_000, "the loud end was queued before the drain");
+        assert!(
+            queued_peak(&track) > 15_000,
+            "the drain did not queue the loud end"
+        );
+        track.stop();
+    }
+
+    #[tokio::test]
+    async fn flush_drops_the_audio_the_resampler_still_holds() {
+        let track = track_at_16k();
+        track.write_pcm(loud_end_16k()).await.expect("write_pcm");
+
+        track.flush();
+        track
+            .write_pcm(PcmFrame::silence(1_600, 16_000, 1))
+            .await
+            .expect("write_pcm");
+        track.drain().expect("drain");
+
+        assert_eq!(
+            queued_peak(&track),
+            0,
+            "audio from before the flush was queued"
+        );
+        track.stop();
+    }
+
     #[test]
     fn pcm_queue_overflow_drops_oldest_and_flush_still_clears() {
         let track = LocalAudioTrack::opus().expect("opus track");
@@ -2747,6 +2885,7 @@ mod tests {
             .write_sample(&[0xf8, 0xff, 0xfe], Duration::from_millis(20))
             .await;
         assert!(matches!(err, Err(RtcError::IllegalState(_))));
+        assert!(matches!(track.drain(), Err(RtcError::IllegalState(_))));
     }
 
     #[tokio::test]

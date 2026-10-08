@@ -52,6 +52,9 @@ rustdoc-args = ["--cfg", "docsrs", "--generate-link-to-definition"]
 # `cmake_minimum_required(VERSION 3.16)`, which satisfies CMake 4's
 # minimum-policy floor without any build-time environment override.
 opus = "0.4"
+# Sinc resampler for PCM written at a rate other than 48 kHz. Only the `Async`
+# resampler is used, so the default FFT feature is off.
+rubato = { version = "5.0.1", default-features = false }
 base64 = "0.23.1"
 bytes = "1.12.1"
 futures-util = "0.3.34"

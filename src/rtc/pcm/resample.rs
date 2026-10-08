@@ -6,16 +6,26 @@
 //!   the rate ratio alone, so a 20 ms block in is a 20 ms block out — what a
 //!   model API expecting exact frame sizes needs. Ported from stream-py's
 //!   `Resampler`.
-//! - [`StreamResampler`] carries a fractional read position and one sample of
-//!   history between calls, so a continuous stream joins without clicks at block
-//!   boundaries. This is what the publish pacer uses.
+//! - [`StreamResampler`] runs a windowed-sinc filter (rubato) whose state carries
+//!   between calls, so a continuous stream joins without clicks at block
+//!   boundaries and does not alias. This is what the publish pacer uses.
 //!
-//! Both interpolate linearly. That is accurate enough for voice and for the
-//! synthesized test tones, and keeps the dependency surface small; a
-//! higher-order kernel can replace either one without an API change.
+//! [`Resampler`] interpolates linearly, so it aliases when it downsamples.
+
+use rubato::audioadapter_buffers::direct::InterleavedSlice;
+use rubato::{
+    Async, FixedAsync, Resampler as _, Resizable as _, SincInterpolationParameters, WindowFunction,
+};
 
 use super::OPUS_SAMPLE_RATE;
 use super::PcmFrame;
+use crate::rtc::error::{Result, RtcError};
+
+/// Sinc filter length in input frames. The filter delays audio by half of it.
+const SINC_LEN: usize = 256;
+/// Zero frames that push all held input out of the filter. An output sample
+/// reads `SINC_LEN + 1` input frames from a fractional position.
+const FLUSH_FRAMES: usize = SINC_LEN + 4;
 
 /// Convert one PCM block to a target sample rate and channel count.
 ///
@@ -170,98 +180,150 @@ fn clamp_to_i16(v: f64) -> i16 {
     v.round().clamp(f64::from(i16::MIN), f64::from(i16::MAX)) as i16
 }
 
-/// A streaming linear resampler that downmixes to mono and converts to a fixed
-/// output rate (48 kHz by default).
+/// A streaming sinc resampler with a fixed input rate, output rate, and channel
+/// count.
 ///
-/// Feed input blocks with [`StreamResampler::push`]; it retains a one-sample
-/// history and a fractional read position so consecutive blocks resample
-/// continuously. Use this for a live stream, where block boundaries are
-/// arbitrary; use [`Resampler`] when each block must convert to an exact length
-/// on its own.
+/// Feed input blocks of any length with [`StreamResampler::push`]; the filter
+/// state carries across calls, so consecutive blocks resample continuously. The
+/// filter delays audio by 128 input frames (8 ms at 16 kHz) and holds them until
+/// more input or [`flush`](Self::flush) pushes them out. Input already at the
+/// output rate passes through unfiltered. Use this for a live stream, where
+/// block boundaries are arbitrary; use [`Resampler`] when each block must
+/// convert to an exact length on its own.
+///
+/// ```
+/// use getstream::rtc::{PcmFrame, StreamResampler};
+///
+/// let mut r = StreamResampler::new(16_000, 48_000, 1)?;
+/// let mut out = r.push(&PcmFrame::mono(vec![0; 320], 16_000))?;
+/// out.append(&r.flush()?);
+/// assert_eq!(out.sample_rate, 48_000);
+/// # Ok::<(), getstream::rtc::RtcError>(())
+/// ```
 #[derive(Debug)]
 pub struct StreamResampler {
-    out_rate: u32,
     in_rate: u32,
-    in_channels: u16,
-    /// Carried mono input (f32), including one history sample at index 0.
-    inbuf: Vec<f32>,
-    /// Fractional read position within `inbuf`.
-    pos: f64,
+    out_rate: u32,
+    channels: u16,
+    /// `None` when the input rate equals the output rate.
+    filter: Option<Async<f32>>,
+    /// Interleaved input of the current call.
+    input: Vec<f32>,
+    /// Interleaved filter output, `output_frames_max` frames long.
+    output: Vec<f32>,
+    /// Set when input went into the filter after the last flush.
+    holds_audio: bool,
 }
 
 impl StreamResampler {
-    /// A resampler targeting 48 kHz mono.
-    pub fn to_opus_mono() -> Self {
-        Self::new(OPUS_SAMPLE_RATE)
+    /// A resampler from `in_rate` to `out_rate` for `channels` interleaved
+    /// channels.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RtcError::Media`] if the filter cannot be built for the rates.
+    pub fn new(in_rate: u32, out_rate: u32, channels: u16) -> Result<Self> {
+        let (in_rate, out_rate, channels) = (in_rate.max(1), out_rate.max(1), channels.max(1));
+        let filter = if in_rate == out_rate {
+            None
+        } else {
+            let params =
+                SincInterpolationParameters::new(SINC_LEN, WindowFunction::BlackmanHarris2);
+            // The largest block one filter call takes; `run` splits longer input.
+            let max_chunk = (in_rate as usize / 10).max(1);
+            let filter = Async::new_sinc(
+                f64::from(out_rate) / f64::from(in_rate),
+                1.0,
+                &params,
+                max_chunk,
+                usize::from(channels),
+                FixedAsync::Input,
+            )
+            .map_err(|e| RtcError::Media(e.to_string()))?;
+            Some(filter)
+        };
+        let output_frames = filter.as_ref().map_or(0, |f| f.output_frames_max());
+        Ok(Self {
+            in_rate,
+            out_rate,
+            channels,
+            filter,
+            input: Vec::new(),
+            output: vec![0.0; output_frames * usize::from(channels)],
+            holds_audio: false,
+        })
     }
 
-    /// A resampler targeting `out_rate` mono.
-    pub fn new(out_rate: u32) -> Self {
-        Self {
-            out_rate: out_rate.max(1),
-            in_rate: 0,
-            in_channels: 1,
-            inbuf: Vec::new(),
-            pos: 0.0,
+    /// Resample `frame` to the output rate. The newest 128 input frames stay in
+    /// the filter until the next call or a [`flush`](Self::flush).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RtcError::IllegalState`] if `frame` has another rate or channel
+    /// count than the input, and [`RtcError::Media`] if the filter rejects a
+    /// buffer.
+    pub fn push(&mut self, frame: &PcmFrame) -> Result<PcmFrame> {
+        if frame.sample_rate != self.in_rate || frame.channels != self.channels {
+            return Err(RtcError::IllegalState(format!(
+                "pcm frame at {} Hz with {} channels, resampler input is {} Hz with {} channels",
+                frame.sample_rate, frame.channels, self.in_rate, self.channels
+            )));
         }
+        let samples = frame.frames() * usize::from(self.channels);
+        self.input.clear();
+        self.input
+            .extend(frame.samples[..samples].iter().map(|&s| f32::from(s)));
+        self.run()
     }
 
-    /// Resample and downmix `frame`, returning mono s16 samples at the target
-    /// rate. Returns an empty vector when there is not yet enough input to emit
-    /// a sample (the remainder is buffered for the next call).
-    pub fn push(&mut self, frame: &PcmFrame) -> Vec<i16> {
-        let in_rate = frame.sample_rate.max(1);
-        let in_channels = frame.channels.max(1);
-
-        // A format change invalidates the carried history; restart cleanly.
-        if in_rate != self.in_rate || in_channels != self.in_channels {
-            self.in_rate = in_rate;
-            self.in_channels = in_channels;
-            self.inbuf.clear();
-            self.pos = 0.0;
+    /// Push the audio the filter still holds out with silence and return it.
+    /// The filter then holds only silence. Returns an empty frame when no audio
+    /// went in since the last flush, or when the input runs at the output rate.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RtcError::Media`] if the filter rejects a buffer.
+    pub fn flush(&mut self) -> Result<PcmFrame> {
+        if !self.holds_audio {
+            return Ok(PcmFrame::new(Vec::new(), self.out_rate, self.channels));
         }
+        self.input.clear();
+        self.input
+            .resize(FLUSH_FRAMES * usize::from(self.channels), 0.0);
+        let out = self.run()?;
+        self.holds_audio = false;
+        Ok(out)
+    }
 
-        // Downmix the incoming block to mono f32 and append.
-        let ch = in_channels as usize;
-        self.inbuf.reserve(frame.frames());
-        for chunk in frame.samples.chunks_exact(ch) {
-            let sum: f32 = chunk.iter().map(|&s| f32::from(s)).sum();
-            self.inbuf.push(sum / ch as f32);
-        }
-
-        // Fast path: identical rate → no interpolation, just emit and reset.
-        if in_rate == self.out_rate {
-            let out: Vec<i16> = self
-                .inbuf
-                .drain(..)
-                .map(|v| v.round().clamp(f32::from(i16::MIN), f32::from(i16::MAX)) as i16)
-                .collect();
-            self.pos = 0.0;
-            return out;
-        }
-
-        let step = f64::from(in_rate) / f64::from(self.out_rate);
+    /// Pass `self.input` through the filter.
+    fn run(&mut self) -> Result<PcmFrame> {
+        let ch = usize::from(self.channels);
         let mut out = Vec::new();
-        // Need `floor(pos) + 1` to exist to interpolate.
-        while self.pos + 1.0 < self.inbuf.len() as f64 {
-            let idx = self.pos.floor() as usize;
-            let frac = (self.pos - idx as f64) as f32;
-            let a = self.inbuf[idx];
-            let b = self.inbuf[idx + 1];
-            let v = a + (b - a) * frac;
-            out.push(v.round().clamp(f32::from(i16::MIN), f32::from(i16::MAX)) as i16);
-            self.pos += step;
+        if let Some(filter) = self.filter.as_mut() {
+            for piece in self.input.chunks(filter.input_frames_max() * ch) {
+                let frames = piece.len() / ch;
+                filter
+                    .set_chunk_size(frames)
+                    .map_err(|e| RtcError::Media(e.to_string()))?;
+                let input = InterleavedSlice::new(piece, ch, frames)
+                    .map_err(|e| RtcError::Media(e.to_string()))?;
+                let capacity = self.output.len() / ch;
+                let mut output = InterleavedSlice::new_mut(&mut self.output[..], ch, capacity)
+                    .map_err(|e| RtcError::Media(e.to_string()))?;
+                let (_, written) = filter
+                    .process_into_buffer(&input, &mut output, None)
+                    .map_err(|e| RtcError::Media(e.to_string()))?;
+                out.extend(
+                    self.output[..written * ch]
+                        .iter()
+                        .map(|&v| clamp_to_i16(f64::from(v))),
+                );
+                self.holds_audio = true;
+            }
+        } else {
+            out.extend(self.input.iter().map(|&v| clamp_to_i16(f64::from(v))));
         }
-
-        // Drop fully-consumed input, keeping one sample of history so the next
-        // block interpolates across the boundary.
-        let consumed = self.pos.floor() as usize;
-        if consumed > 0 {
-            let keep_from = consumed.min(self.inbuf.len());
-            self.inbuf.drain(..keep_from);
-            self.pos -= consumed as f64;
-        }
-        out
+        Ok(PcmFrame::new(out, self.out_rate, self.channels))
     }
 }
 
@@ -366,27 +428,123 @@ mod tests {
         assert_eq!(*out.samples.last().unwrap(), i16::MAX);
     }
 
+    /// A silent 20 ms block at `rate` whose last 2 ms carry a loud 1 kHz tone.
+    fn loud_end(rate: u32) -> PcmFrame {
+        let frames = rate as usize / 50;
+        let quiet = frames - rate as usize / 500;
+        let samples = (0..frames)
+            .map(|i| {
+                if i < quiet {
+                    return 0;
+                }
+                let time = i as f64 / f64::from(rate);
+                (20_000.0 * (std::f64::consts::TAU * 1_000.0 * time).sin()) as i16
+            })
+            .collect();
+        PcmFrame::mono(samples, rate)
+    }
+
+    fn peak(samples: &[i16]) -> i16 {
+        samples
+            .iter()
+            .map(|s| s.saturating_abs())
+            .max()
+            .unwrap_or(0)
+    }
+
     #[test]
-    fn stream_identity_rate_passes_through_downmixed() {
-        let mut r = StreamResampler::to_opus_mono();
-        // Stereo 48k -> mono 48k: averages channels, same length per channel.
-        let frame = PcmFrame::new(vec![100, 200, 300, 400], 48_000, 2);
-        let out = r.push(&frame);
-        assert_eq!(out, vec![150, 350]);
+    fn stream_flush_returns_the_audio_the_filter_still_holds() {
+        let mut r = StreamResampler::new(16_000, 48_000, 1).expect("resampler");
+
+        let pushed = r.push(&loud_end(16_000)).expect("push");
+        let flushed = r.flush().expect("flush");
+
+        assert!(
+            peak(&pushed.samples) < 1_000,
+            "the loud end left before the flush"
+        );
+        assert!(
+            peak(&flushed.samples) > 15_000,
+            "the flush did not return the loud end"
+        );
+    }
+
+    #[test]
+    fn stream_flush_leaves_no_old_audio_for_the_next_block() {
+        for rate in [8_000, 16_000, 22_050, 24_000, 32_000, 44_100, 96_000] {
+            let mut r = StreamResampler::new(rate, 48_000, 1).expect("resampler");
+            r.push(&loud_end(rate)).expect("push");
+            r.flush().expect("flush");
+
+            let next = r
+                .push(&PcmFrame::silence(rate as usize / 10, rate, 1))
+                .expect("push");
+
+            assert_eq!(
+                peak(&next.samples),
+                0,
+                "{rate} Hz: old audio after the flush"
+            );
+        }
+    }
+
+    #[test]
+    fn stream_rejects_a_frame_with_other_settings() {
+        let mut r = StreamResampler::new(16_000, 48_000, 1).expect("resampler");
+
+        for frame in [
+            PcmFrame::silence(480, 24_000, 1),
+            PcmFrame::silence(320, 16_000, 2),
+        ] {
+            let error = r.push(&frame).expect_err("settings differ");
+            assert!(
+                matches!(error, RtcError::IllegalState(_)),
+                "error was: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn stream_at_the_same_rate_copies_every_channel_and_holds_nothing() {
+        let mut r = StreamResampler::new(48_000, 48_000, 2).expect("resampler");
+        let frame = PcmFrame::new(vec![100, -200, 300, -400], 48_000, 2);
+
+        let out = r.push(&frame).expect("push");
+
+        assert_eq!(out, frame);
+        assert!(r.flush().expect("flush").is_empty());
+    }
+
+    #[test]
+    fn stream_resamples_each_channel_on_its_own() {
+        let mut r = StreamResampler::new(16_000, 48_000, 2).expect("resampler");
+        let left = loud_end(16_000).samples;
+        let stereo: Vec<i16> = left.iter().flat_map(|&l| [l, 0]).collect();
+
+        let mut out = r.push(&PcmFrame::new(stereo, 16_000, 2)).expect("push");
+        out.append(&r.flush().expect("flush"));
+
+        assert_eq!((out.sample_rate, out.channels), (48_000, 2));
+        let right: Vec<i16> = out.samples.iter().skip(1).step_by(2).copied().collect();
+        assert!(
+            peak(&out.samples) > 15_000,
+            "the left channel lost its audio"
+        );
+        assert_eq!(peak(&right), 0, "the silent right channel picked up audio");
     }
 
     #[test]
     fn stream_downsample_halves_sample_count() {
         // 96k mono -> 48k mono ≈ half as many samples.
-        let mut r = StreamResampler::to_opus_mono();
+        let mut r = StreamResampler::new(96_000, 48_000, 1).expect("resampler");
         let input: Vec<i16> = (0..960).map(|i| (i % 100) as i16).collect();
         let frame = PcmFrame::mono(input, 96_000);
-        let out = r.push(&frame);
+        let out = r.push(&frame).expect("push");
         // ~480 output samples (± a couple for boundary handling).
         assert!(
-            (475..=480).contains(&out.len()),
+            (475..=480).contains(&out.frames()),
             "unexpected out len {}",
-            out.len()
+            out.frames()
         );
     }
 
@@ -394,13 +552,15 @@ mod tests {
     fn stream_upsample_is_continuous_across_blocks() {
         // 24k -> 48k across two blocks should roughly double total samples and
         // not panic on the boundary.
-        let mut r = StreamResampler::to_opus_mono();
+        let mut r = StreamResampler::new(24_000, 48_000, 1).expect("resampler");
         let block: Vec<i16> = (0..240).map(|i| i as i16).collect();
-        let a = r.push(&PcmFrame::mono(block.clone(), 24_000));
-        let b = r.push(&PcmFrame::mono(block, 24_000));
+        let a = r
+            .push(&PcmFrame::mono(block.clone(), 24_000))
+            .expect("push");
+        let b = r.push(&PcmFrame::mono(block, 24_000)).expect("push");
         assert!(!a.is_empty() && !b.is_empty());
         // 480 input samples @2x ≈ 960 output (allow slack for warm-up).
-        let total = a.len() + b.len();
+        let total = a.frames() + b.frames();
         assert!((950..=960).contains(&total), "unexpected total {total}");
     }
 }
