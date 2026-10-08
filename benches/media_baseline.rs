@@ -62,11 +62,12 @@ fn encoded_keyframe(codec: VpxCodec, width: u32, height: u32) -> Vec<u8> {
 fn bench_resampling(criterion: &mut Criterion) {
     let mut group = criterion.benchmark_group("resample");
     for (name, input) in [
-        ("44k1_stereo_to_48k_mono_20ms", tone(44_100, 2, 20)),
+        ("44k1_stereo_to_48k_stereo_20ms", tone(44_100, 2, 20)),
         ("24k_mono_to_48k_mono_20ms", tone(24_000, 1, 20)),
     ] {
         group.throughput(Throughput::Elements(input.frames() as u64));
-        let mut resampler = StreamResampler::to_opus_mono();
+        let mut resampler = StreamResampler::new(input.sample_rate, 48_000, input.channels)
+            .expect("create resampler");
         group.bench_function(name, |bencher| {
             bencher.iter(|| black_box(resampler.push(black_box(&input))));
         });
