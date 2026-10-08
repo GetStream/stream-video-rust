@@ -237,15 +237,22 @@ impl StreamResampler {
     ///
     /// # Errors
     ///
-    /// Returns [`RtcError::IllegalState`] if `frame` has another rate than the
-    /// first frame or another channel count than the resampler, and
-    /// [`RtcError::Media`] if the filter rejects the rate or a buffer.
+    /// Returns [`RtcError::PcmRateMismatch`] if `frame` has another rate than
+    /// the first frame, [`RtcError::IllegalState`] if it has another channel
+    /// count than the resampler, and [`RtcError::Media`] if the filter rejects
+    /// the rate or a buffer.
     pub fn push(&mut self, frame: &PcmFrame) -> Result<PcmFrame> {
         let in_rate = self.in_rate.unwrap_or(frame.sample_rate);
-        if frame.sample_rate != in_rate || frame.channels != self.channels {
+        if frame.sample_rate != in_rate {
+            return Err(RtcError::PcmRateMismatch {
+                expected: in_rate,
+                actual: frame.sample_rate,
+            });
+        }
+        if frame.channels != self.channels {
             return Err(RtcError::IllegalState(format!(
-                "pcm frame at {} Hz with {} channels, resampler input is {in_rate} Hz with {} channels",
-                frame.sample_rate, frame.channels, self.channels
+                "pcm frame with {} channels, resampler input has {} channels",
+                frame.channels, self.channels
             )));
         }
         if self.in_rate.is_none() {
@@ -499,16 +506,27 @@ mod tests {
         let mut r = StreamResampler::new(48_000, 1);
         r.push(&PcmFrame::silence(320, 16_000, 1)).expect("push");
 
-        for frame in [
-            PcmFrame::silence(480, 24_000, 1),
-            PcmFrame::silence(320, 16_000, 2),
-        ] {
-            let error = r.push(&frame).expect_err("settings differ");
-            assert!(
-                matches!(error, RtcError::IllegalState(_)),
-                "error was: {error}"
-            );
-        }
+        let rate = r
+            .push(&PcmFrame::silence(480, 24_000, 1))
+            .expect_err("rate differs");
+        let channels = r
+            .push(&PcmFrame::silence(320, 16_000, 2))
+            .expect_err("channels differ");
+
+        assert!(
+            matches!(
+                rate,
+                RtcError::PcmRateMismatch {
+                    expected: 16_000,
+                    actual: 24_000
+                }
+            ),
+            "error was: {rate}"
+        );
+        assert!(
+            matches!(channels, RtcError::IllegalState(_)),
+            "error was: {channels}"
+        );
     }
 
     #[test]

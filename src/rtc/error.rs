@@ -158,6 +158,16 @@ pub enum RtcError {
         capacity_samples: usize,
     },
 
+    /// A PCM frame is not at the sample rate of the first frame. The frame was
+    /// not written.
+    #[error("pcm frame at {actual} Hz, the first frame was at {expected} Hz")]
+    PcmRateMismatch {
+        /// Sample rate of the first frame, in Hz.
+        expected: u32,
+        /// Sample rate of the rejected frame, in Hz.
+        actual: u32,
+    },
+
     /// Token minting failed for the participant path.
     ///
     /// Retained for source compatibility. New typed token-boundary failures use

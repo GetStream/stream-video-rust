@@ -568,8 +568,8 @@ impl LocalAudioTrack {
     /// Returns [`RtcError::PcmQueueOverflow`] after retaining the newest audio
     /// when this write exceeds the queue capacity. The caller may continue
     /// writing; the typed error makes overload observable without allowing
-    /// stale audio to accumulate. Returns [`RtcError::IllegalState`] when the
-    /// frame is not at the rate of the first frame.
+    /// stale audio to accumulate. Returns [`RtcError::PcmRateMismatch`] when
+    /// the frame is not at the rate of the first frame.
     pub async fn write_pcm(&self, frame: PcmFrame) -> Result<()> {
         if self.inner.core.stopped.load(Ordering::SeqCst) {
             return Err(RtcError::IllegalState(
