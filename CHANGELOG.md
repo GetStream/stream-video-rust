@@ -95,14 +95,13 @@ accepts only H.264 video.
 
 ### PCM has a fixed sample rate
 
-`write_pcm` accepts PCM only at `LocalAudioTrackConfig::pcm_sample_rate`, which
-is 48 kHz by default. Set it with `with_pcm_sample_rate`. A frame at another
+`write_pcm` takes the sample rate of the first frame. A later frame at another
 rate gets `RtcError::IllegalState`. The track still averages the channels of a
 frame to mono.
 
-`StreamResampler::new(in_rate, out_rate, channels)` replaces `new(out_rate)` and
-`to_opus_mono()`. The three settings are fixed: a frame with another rate or
-channel count gets `RtcError::IllegalState`. `push` and `flush` return
+`StreamResampler::new(out_rate, channels)` replaces `new(out_rate)` and
+`to_opus_mono()`. The first `push` sets the input rate. A frame with another
+rate or channel count gets `RtcError::IllegalState`. `push` and `flush` return
 `RtcResult<PcmFrame>` with the same channels as the input. The resampler no
 longer downmixes to mono.
 
