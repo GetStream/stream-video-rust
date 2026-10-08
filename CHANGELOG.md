@@ -93,7 +93,28 @@ Use `vp9` or `vp9_svc` for camera video and `vp8` or `vp8_simulcast` for screen
 share. The `gpt_realtime_bot` example is voice-only, because OpenAI Realtime
 accepts only H.264 video.
 
+### PCM has a fixed sample rate
+
+`write_pcm` accepts PCM only at `LocalAudioTrackConfig::pcm_sample_rate`, which
+is 48 kHz by default. Set it with `with_pcm_sample_rate`. A frame at another
+rate gets `RtcError::IllegalState`. The track still averages the channels of a
+frame to mono.
+
+`StreamResampler::new(in_rate, out_rate, channels)` replaces `new(out_rate)` and
+`to_opus_mono()`. The three settings are fixed: a frame with another rate or
+channel count gets `RtcError::IllegalState`. `push` and `flush` return
+`RtcResult<PcmFrame>` with the same channels as the input. The resampler no
+longer downmixes to mono.
+
 ## New Features
+
+### Drain the end of the PCM
+
+`StreamResampler` holds the newest 128 input frames in its filter: 8 ms at
+16 kHz, 5.3 ms at 24 kHz. `StreamResampler::flush` returns them.
+`LocalAudioTrack::drain` puts them in the pacer queue. Call it when the producer
+stops writing, for example at the end of an utterance. Without it, that audio
+plays at the start of the next write. A track at 48 kHz holds no audio.
 
 ### Pacing control for PCM tracks
 
@@ -192,6 +213,11 @@ on `Call` (`get_call_participant_session_metrics`,
   packets arrive but no frame is decoded for 3 s, and again after each further
   3 s, as libwebrtc does. Before, a stream whose frames could not be assembled
   stayed frozen and sent no keyframe request.
+- `StreamResampler` uses a windowed-sinc filter (rubato) and removes the audio
+  above the lower Nyquist frequency. Before, it interpolated linearly: from
+  48 kHz to 16 kHz, a 12 kHz tone came out at 4 kHz at full level.
+- `LocalAudioTrack::flush` also drops the audio in the resampler. A flush during
+  a `write_pcm` can no longer put audio from before the flush in the queue.
 
 # v0.1.0-preview.2
 
