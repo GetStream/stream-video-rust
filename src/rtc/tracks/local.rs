@@ -4,9 +4,9 @@
 //! Rust analog of videosdk's `track.Local` (`WriteRTP` / `WriteSample` /
 //! `StartWrite`). Three write paths feed the same outbound track:
 //!
-//! - [`LocalAudioTrack::write_pcm`] — raw [`PcmFrame`]s at
-//!   [`LocalAudioTrackConfig::pcm_sample_rate`]. Averaged to mono, resampled to
-//!   48 kHz, queued, and paced into 20 ms Opus frames by a background task that
+//! - [`LocalAudioTrack::write_pcm`] — raw [`PcmFrame`]s at the rate of the
+//!   first frame. Averaged to mono, resampled to 48 kHz, queued, and paced
+//!   into 20 ms Opus frames by a background task that
 //!   emits silence on starve (stream-py `AudioStreamTrack` pacing).
 //!   [`LocalAudioTrack::drain`] queues the audio the resampler still holds. Pacing
 //!   starts at the first write, or at [`LocalAudioTrack::start_pacing`] when
@@ -383,9 +383,6 @@ pub struct LocalAudioTrackConfig {
     /// write above it drops the oldest queued samples. The minimum is one 20 ms
     /// frame.
     pub pcm_queue_capacity: Duration,
-    /// Sample rate of the PCM that [`LocalAudioTrack::write_pcm`] accepts. The
-    /// track resamples it to 48 kHz.
-    pub pcm_sample_rate: u32,
     /// Start pacing at the first [`LocalAudioTrack::write_pcm`]. When `false`,
     /// `write_pcm` only queues until [`LocalAudioTrack::start_pacing`].
     pub pace: bool,
@@ -399,7 +396,6 @@ impl Default for LocalAudioTrackConfig {
             expected_packet_loss_pct: EXPECTED_PACKET_LOSS_PCT,
             dtx: true,
             pcm_queue_capacity: PCM_QUEUE_CAPACITY,
-            pcm_sample_rate: OPUS_SAMPLE_RATE,
             pace: true,
         }
     }
@@ -440,14 +436,6 @@ impl LocalAudioTrackConfig {
     #[must_use]
     pub fn with_pcm_queue_capacity(mut self, pcm_queue_capacity: Duration) -> Self {
         self.pcm_queue_capacity = pcm_queue_capacity;
-        self
-    }
-
-    /// Set the sample rate of the PCM that [`LocalAudioTrack::write_pcm`]
-    /// accepts.
-    #[must_use]
-    pub fn with_pcm_sample_rate(mut self, pcm_sample_rate: u32) -> Self {
-        self.pcm_sample_rate = pcm_sample_rate;
         self
     }
 
@@ -514,11 +502,7 @@ impl LocalAudioTrack {
                 core,
                 pcm: StdMutex::new(VecDeque::new()),
                 pcm_capacity_samples,
-                resampler: StdMutex::new(StreamResampler::new(
-                    config.pcm_sample_rate,
-                    OPUS_SAMPLE_RATE,
-                    1,
-                )?),
+                resampler: StdMutex::new(StreamResampler::new(OPUS_SAMPLE_RATE, 1)),
                 encoder: StdMutex::new(encoder),
                 pacer: StdMutex::new(None),
                 pacer_started: AtomicBool::new(false),
@@ -533,8 +517,9 @@ impl LocalAudioTrack {
 
     /// Queue a PCM frame for the paced 20 ms Opus encoder.
     ///
-    /// The frame must be at [`LocalAudioTrackConfig::pcm_sample_rate`]. Its
-    /// channels are averaged to mono, resampled to 48 kHz, and buffered up to
+    /// The first frame sets the sample rate of the track, and later frames must
+    /// keep it. The channels of a frame are averaged to mono, and the mono
+    /// audio is resampled to 48 kHz and buffered up to
     /// [`LocalAudioTrackConfig::pcm_queue_capacity`]. The first write starts
     /// pacing when [`LocalAudioTrackConfig::pace`] is set (the default);
     /// otherwise [`start_pacing`](Self::start_pacing) does. While pacing runs, a
@@ -550,7 +535,7 @@ impl LocalAudioTrack {
     /// when this write exceeds the queue capacity. The caller may continue
     /// writing; the typed error makes overload observable without allowing
     /// stale audio to accumulate. Returns [`RtcError::IllegalState`] when the
-    /// frame is not at [`LocalAudioTrackConfig::pcm_sample_rate`].
+    /// frame is not at the rate of the first frame.
     pub async fn write_pcm(&self, frame: PcmFrame) -> Result<()> {
         if self.inner.core.stopped.load(Ordering::SeqCst) {
             return Err(RtcError::IllegalState(
@@ -592,7 +577,7 @@ impl LocalAudioTrack {
     /// Queue the audio that the resampler still holds, so the end of the
     /// written audio plays without the next write. Call it when the producer
     /// stops writing, for example at the end of an utterance. It queues nothing
-    /// when [`LocalAudioTrackConfig::pcm_sample_rate`] is 48 kHz.
+    /// when the track takes 48 kHz PCM.
     ///
     /// # Errors
     ///
@@ -2387,18 +2372,14 @@ mod tests {
         queue.iter().map(|s| s.saturating_abs()).max().unwrap_or(0)
     }
 
-    fn track_at_16k() -> LocalAudioTrack {
-        LocalAudioTrack::opus_with_config(
-            LocalAudioTrackConfig::default()
-                .with_pace(false)
-                .with_pcm_sample_rate(16_000),
-        )
-        .expect("opus track")
+    fn unpaced_track() -> LocalAudioTrack {
+        LocalAudioTrack::opus_with_config(LocalAudioTrackConfig::default().with_pace(false))
+            .expect("opus track")
     }
 
     #[tokio::test]
     async fn drain_queues_the_end_of_the_written_audio() {
-        let track = track_at_16k();
+        let track = unpaced_track();
         track.write_pcm(loud_end_16k()).await.expect("write_pcm");
         let before = queued_peak(&track);
 
@@ -2414,7 +2395,7 @@ mod tests {
 
     #[tokio::test]
     async fn flush_drops_the_audio_the_resampler_still_holds() {
-        let track = track_at_16k();
+        let track = unpaced_track();
         track.write_pcm(loud_end_16k()).await.expect("write_pcm");
 
         track.flush();
