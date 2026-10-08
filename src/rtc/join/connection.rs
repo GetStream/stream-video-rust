@@ -2,6 +2,44 @@
 
 use super::*;
 
+impl SfuCallEvent {
+    /// The stable `SfuEvent` field name of the source event, for example
+    /// `participant_joined` or `change_publish_quality`. The names are public
+    /// API and do not change. [`SfuCallEvent::ParticipantCountChanged`] is
+    /// `participant_count_changed`.
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::ParticipantJoined(_) => "participant_joined",
+            Self::ParticipantLeft(_) => "participant_left",
+            Self::ParticipantUpdated(_) => "participant_updated",
+            Self::TrackPublished { .. } => "track_published",
+            Self::TrackUnpublished { .. } => "track_unpublished",
+            Self::DominantSpeakerChanged { .. } => "dominant_speaker_changed",
+            Self::AudioLevelChanged(_) => "audio_level_changed",
+            Self::ConnectionQualityChanged(_) => "connection_quality_changed",
+            Self::ParticipantCountChanged(_) => "participant_count_changed",
+            Self::PinsUpdated(_) => "pins_updated",
+            Self::InboundStateChanged(_) => "inbound_state_notification",
+            Self::PublishOptionsChanged { .. } => "change_publish_options",
+            Self::PublishQualityChanged(_) => "change_publish_quality",
+            Self::CallGrantsUpdated(_) => "call_grants_updated",
+            Self::IceRestarted(_) => "ice_restart",
+            Self::Error(_) => "error",
+            Self::CallEnded { .. } => "call_ended",
+        }
+    }
+}
+
+impl ClientCallEvent {
+    /// The stable name of this event: `calling_state_changed`. The names are
+    /// public API and do not change.
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::CallingStateChanged(_) => "calling_state_changed",
+        }
+    }
+}
+
 /// Build the SFU signaling WebSocket URL from `ws_endpoint`, appending the
 /// informational query params JS attaches (`attempt`, `user_id`, `api_key`,
 /// `user_session_id`, `cid`). Ported from JS `StreamSfuClient.createWebSocket`.
@@ -102,8 +140,8 @@ pub(super) fn register_on_track(
                 reconnect_enabled,
                 track,
                 weak_pc,
-            )
-            .await;
+                None,
+            );
         })
     }));
 }
@@ -127,6 +165,16 @@ pub(super) fn register_connection_state(
         Box::pin(async move {
             tracing::debug!(label, ?state, "stream.rtc.pc.state");
             tracer.trace("connectionstatechange", json!(state.to_string()));
+            // Not awaited: waiting for the media lock here can block ICE
+            // state delivery. The task reads the current publisher state, so
+            // a subscriber change only repeats the check.
+            if state == RTCPeerConnectionState::Connected && core.is_generation_current(generation)
+            {
+                let pacing_core = core.clone();
+                std::mem::drop(core.spawn_generation_task(generation, async move {
+                    pacing_core.start_audio_pacing_if_connected().await;
+                }));
+            }
             if state == RTCPeerConnectionState::Connected {
                 ever_connected.store(true, Ordering::SeqCst);
                 let mut lifecycle = core.lifecycle.lock().unwrap_or_else(|e| e.into_inner());
@@ -151,7 +199,7 @@ pub(super) fn register_connection_state(
 }
 
 /// The SFU WebSocket event loop: negotiate subscriber offers, add remote ICE
-/// candidates, and fan out typed [`CallEvent`]s.
+/// candidates, and fan out typed [`SfuCallEvent`]s.
 pub(super) async fn event_loop(mut receiver: SfuReceiver, context: EventLoopContext) {
     loop {
         let event = match receiver.recv().await {
@@ -253,16 +301,18 @@ pub(super) async fn handle_event(
         }
         E::ConnectionQualityChanged(event) => {
             core.update_connection_quality(&event.connection_quality_updates);
-            let _ = core.events_tx.send(CallEvent::ConnectionQualityChanged(
-                event.connection_quality_updates,
-            ));
+            let _ = core
+                .sfu_events_tx
+                .send(SfuCallEvent::ConnectionQualityChanged(
+                    event.connection_quality_updates,
+                ));
         }
         E::ParticipantJoined(ev) => {
             if let Some(p) = ev.participant {
                 core.upsert_participant(&p);
                 core.recompute_subscriptions_for_generation(context.generation)
                     .await?;
-                let _ = core.events_tx.send(CallEvent::ParticipantJoined(p));
+                let _ = core.sfu_events_tx.send(SfuCallEvent::ParticipantJoined(p));
             }
         }
         E::ParticipantLeft(ev) => {
@@ -270,7 +320,7 @@ pub(super) async fn handle_event(
                 core.remove_participant(&p.session_id);
                 core.recompute_subscriptions_for_generation(context.generation)
                     .await?;
-                let _ = core.events_tx.send(CallEvent::ParticipantLeft(p));
+                let _ = core.sfu_events_tx.send(SfuCallEvent::ParticipantLeft(p));
             }
         }
         E::ParticipantUpdated(ev) => {
@@ -278,7 +328,7 @@ pub(super) async fn handle_event(
                 core.upsert_participant(&p);
                 core.recompute_subscriptions_for_generation(context.generation)
                     .await?;
-                let _ = core.events_tx.send(CallEvent::ParticipantUpdated(p));
+                let _ = core.sfu_events_tx.send(SfuCallEvent::ParticipantUpdated(p));
             }
         }
         E::TrackPublished(ev) => {
@@ -290,64 +340,77 @@ pub(super) async fn handle_event(
             );
             core.recompute_subscriptions_for_generation(context.generation)
                 .await?;
-            let _ = core.events_tx.send(CallEvent::TrackPublished {
+            let _ = core.sfu_events_tx.send(SfuCallEvent::TrackPublished {
                 user_id: ev.user_id,
                 session_id: ev.session_id,
-                track_type: ev.r#type,
+                track_type: TrackType::try_from(ev.r#type).unwrap_or(TrackType::Unspecified),
+                participant: ev.participant,
             });
         }
         E::TrackUnpublished(ev) => {
             core.remove_published_track(&ev.session_id, ev.r#type);
             core.recompute_subscriptions_for_generation(context.generation)
                 .await?;
-            let _ = core.events_tx.send(CallEvent::TrackUnpublished {
+            let _ = core.sfu_events_tx.send(SfuCallEvent::TrackUnpublished {
                 user_id: ev.user_id,
                 session_id: ev.session_id,
-                track_type: ev.r#type,
+                track_type: TrackType::try_from(ev.r#type).unwrap_or(TrackType::Unspecified),
+                cause: models::TrackUnpublishReason::try_from(ev.cause)
+                    .unwrap_or(models::TrackUnpublishReason::Unspecified),
+                participant: ev.participant,
             });
         }
         E::DominantSpeakerChanged(ev) => {
             core.update_dominant_speaker(&ev.session_id);
-            let _ = core.events_tx.send(CallEvent::DominantSpeakerChanged {
-                user_id: ev.user_id,
-                session_id: ev.session_id,
-            });
+            let _ = core
+                .sfu_events_tx
+                .send(SfuCallEvent::DominantSpeakerChanged {
+                    user_id: ev.user_id,
+                    session_id: ev.session_id,
+                });
         }
         E::AudioLevelChanged(ev) => {
             core.update_audio_levels(&ev.audio_levels);
             let _ = core
-                .events_tx
-                .send(CallEvent::AudioLevelChanged(ev.audio_levels));
+                .sfu_events_tx
+                .send(SfuCallEvent::AudioLevelChanged(ev.audio_levels));
         }
         E::HealthCheckResponse(event) => {
-            if let Some(participant_count) = event.participant_count {
-                core.update_participant_count(participant_count);
+            if let Some(participant_count) = event.participant_count
+                && core.update_participant_count(participant_count)
+            {
                 let _ = core
-                    .events_tx
-                    .send(CallEvent::ParticipantCountChanged(participant_count));
+                    .sfu_events_tx
+                    .send(SfuCallEvent::ParticipantCountChanged(participant_count));
             }
         }
         E::PinsUpdated(event) => {
             core.update_pins(event.pins.clone());
-            let _ = core.events_tx.send(CallEvent::PinsUpdated(event.pins));
+            let _ = core
+                .sfu_events_tx
+                .send(SfuCallEvent::PinsUpdated(event.pins));
         }
         E::InboundStateNotification(event) => {
             core.update_inbound_state(&event.inbound_video_states);
-            let _ = core
-                .events_tx
-                .send(CallEvent::InboundStateChanged(event.inbound_video_states));
+            let _ = core.sfu_events_tx.send(SfuCallEvent::InboundStateChanged(
+                event.inbound_video_states,
+            ));
         }
         E::ChangePublishOptions(event) => {
             core.apply_publish_options(context.generation, event.publish_options.clone())
                 .await?;
-            let _ = core.events_tx.send(CallEvent::PublishOptionsChanged {
-                publish_options: event.publish_options,
-                reason: event.reason,
-            });
+            let _ = core
+                .sfu_events_tx
+                .send(SfuCallEvent::PublishOptionsChanged {
+                    publish_options: event.publish_options,
+                    reason: event.reason,
+                });
         }
         E::ChangePublishQuality(event) => {
             core.apply_publish_quality(&event).await;
-            let _ = core.events_tx.send(CallEvent::PublishQualityChanged(event));
+            let _ = core
+                .sfu_events_tx
+                .send(SfuCallEvent::PublishQualityChanged(event));
         }
         E::CallGrantsUpdated(event) => {
             core.update_call_grants(event.current_grants);
@@ -363,7 +426,9 @@ pub(super) async fn handle_event(
                     }
                 }
             }
-            let _ = core.events_tx.send(CallEvent::CallGrantsUpdated(event));
+            let _ = core
+                .sfu_events_tx
+                .send(SfuCallEvent::CallGrantsUpdated(event));
         }
         E::IceRestart(event) => {
             let peer_type =
@@ -371,12 +436,16 @@ pub(super) async fn handle_event(
             if peer_type == PeerType::PublisherUnspecified {
                 core.restart_publisher_ice().await?;
             }
-            let _ = core.events_tx.send(CallEvent::IceRestarted(peer_type));
+            let _ = core
+                .sfu_events_tx
+                .send(SfuCallEvent::IceRestarted(peer_type));
         }
         E::Error(err) => {
             let join_err = SfuJoinError::from_event(err.error, err.reconnect_strategy);
             let strategy = ReconnectStrategy::from_proto(err.reconnect_strategy);
-            let _ = core.events_tx.send(CallEvent::Error(join_err.clone()));
+            let _ = core
+                .sfu_events_tx
+                .send(SfuCallEvent::Error(join_err.clone()));
             if let Some(strategy) = strategy {
                 core.trigger_reconnect(context.generation, strategy, join_err.message.clone());
             }
@@ -391,8 +460,12 @@ pub(super) async fn handle_event(
         E::ParticipantMigrationComplete(_) => {
             core.complete_migration(context.generation);
         }
-        E::CallEnded(_) => {
-            let _ = core.events_tx.send(CallEvent::CallEnded);
+        E::CallEnded(event) => {
+            let _ = core.sfu_events_tx.send(SfuCallEvent::CallEnded {
+                reason: models::CallEndedReason::try_from(event.reason)
+                    .unwrap_or(models::CallEndedReason::Unspecified),
+            });
+            core.end_call(context.generation);
         }
         E::PublisherAnswer(_) | E::JoinResponse(_) => {
             tracing::debug!("stream.rtc.unexpected_handshake_event");

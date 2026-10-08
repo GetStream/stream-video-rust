@@ -4,10 +4,16 @@
 //! Rust analog of videosdk's `track.Local` (`WriteRTP` / `WriteSample` /
 //! `StartWrite`). Three write paths feed the same outbound track:
 //!
-//! - [`LocalAudioTrack::write_pcm`] — raw [`PcmFrame`]s. Resampled to 48 kHz
-//!   mono and paced into 20 ms Opus frames by a background task that emits
-//!   silence on starve (stream-py `AudioStreamTrack` pacing). This is the PCM
-//!   republish / TTS-bot path.
+//! - [`LocalAudioTrack::write_pcm`] — raw [`PcmFrame`]s at the rate of the
+//!   first frame. Averaged to mono, resampled to 48 kHz, queued, and paced
+//!   into 20 ms Opus frames by a background task that
+//!   emits silence on starve (stream-py `AudioStreamTrack` pacing). Before
+//!   the silence, it takes the audio that the resampler still holds. Pacing
+//!   starts at the first write, or at [`LocalAudioTrack::start_pacing`] when
+//!   [`LocalAudioTrackConfig::pace`] is off. A published track holds its queue
+//!   until the SFU publisher first connects and does not pause on a later
+//!   disconnect, so audio written during an outage is lost instead of delayed.
+//!   This is the PCM republish / TTS-bot path.
 //! - [`LocalAudioTrack::write_sample`] / [`LocalVideoTrack::write_sample`] —
 //!   already-encoded media (Opus/VP8/…) plus a frame duration; the SDK
 //!   packetizes and writes. The caller controls pacing.
@@ -27,13 +33,13 @@
 use std::collections::VecDeque;
 use std::num::NonZeroU8;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, AtomicU16, AtomicU32, Ordering};
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::{Arc, Mutex as StdMutex, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
-use tokio::sync::Semaphore;
+use tokio::sync::{Notify, Semaphore};
 use tokio::task::JoinHandle;
-use webrtc::api::media_engine::{MIME_TYPE_H264, MIME_TYPE_OPUS, MIME_TYPE_VP8, MIME_TYPE_VP9};
+use webrtc::api::media_engine::{MIME_TYPE_OPUS, MIME_TYPE_VP8, MIME_TYPE_VP9};
 use webrtc::rtp::extension::HeaderExtension;
 use webrtc::rtp::extension::audio_level_extension::AudioLevelExtension;
 use webrtc::rtp::packetizer::{Packetizer, new_packetizer};
@@ -44,8 +50,6 @@ use webrtc::track::track_local::TrackLocalWriter;
 use webrtc::track::track_local::track_local_static_rtp::TrackLocalStaticRTP;
 
 use super::layers::{PlannedVideoLayer, simulcast_layers, single_layer};
-use crate::rtc::codecs::h264::{H264Encoder, validate_h264_encode_request};
-use crate::rtc::codecs::rtp_h264::H264RtpPacketizer;
 use crate::rtc::codecs::rtp_vpx::VpxRtpPacketizer;
 use crate::rtc::codecs::vpx::{Vp9SvcMode, VpxCodec, VpxEncoder, VpxSvcEncoder};
 use crate::rtc::error::{Result, RtcError};
@@ -70,7 +74,7 @@ const VIDEO_BITRATE_KBPS: u32 = 1_000;
 const MAX_LOCAL_VIDEO_EDGE: u32 = 3_840;
 const MAX_LOCAL_VIDEO_PIXELS: u64 = 3_840 * 2_160;
 const MAX_LOCAL_VIDEO_I420_BYTES: usize = 3_840 * 2_160 * 3 / 2;
-const PCM_QUEUE_CAPACITY_SAMPLES: usize = FRAME_SAMPLES_20MS * 10;
+const PCM_QUEUE_CAPACITY: Duration = Duration::from_secs(60);
 const MAX_OPUS_PACKET_BYTES: usize = 1_500;
 
 const AUDIO_BITRATE_BPS: u32 = 32_000;
@@ -114,6 +118,7 @@ struct TrackCore {
     fwd_seq: AtomicU16,
     fwd_init: AtomicBool,
     stopped: AtomicBool,
+    stop_notify: Notify,
     muted: AtomicBool,
     quality_paused: AtomicBool,
     track_id: String,
@@ -167,6 +172,7 @@ impl TrackCore {
             fwd_seq: AtomicU16::new(0),
             fwd_init: AtomicBool::new(false),
             stopped: AtomicBool::new(false),
+            stop_notify: Notify::new(),
             muted: AtomicBool::new(false),
             quality_paused: AtomicBool::new(false),
             track_id,
@@ -207,6 +213,11 @@ impl TrackCore {
             ));
         }
         if self.muted.load(Ordering::SeqCst) || self.quality_paused.load(Ordering::SeqCst) {
+            // The RTP clock keeps time while no packet goes out.
+            self.packetizer
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .skip_samples(samples);
             return Ok(());
         }
         let payload = Bytes::copy_from_slice(payload);
@@ -290,6 +301,18 @@ impl TrackCore {
 
     fn stop(&self) {
         self.stopped.store(true, Ordering::SeqCst);
+        self.stop_notify.notify_waiters();
+    }
+
+    /// Wait until [`Self::stop`].
+    async fn stopped(&self) {
+        let notified = self.stop_notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        if self.stopped.load(Ordering::SeqCst) {
+            return;
+        }
+        notified.await;
     }
 
     fn set_muted(&self, muted: bool) {
@@ -324,12 +347,54 @@ struct AudioInner {
     core: TrackCore,
     /// Resampled 48 kHz mono PCM awaiting the 20 ms pacer.
     pcm: StdMutex<VecDeque<i16>>,
+    pcm_capacity_samples: usize,
+    /// Locked before `pcm`. A writer keeps it until its audio is queued, so a
+    /// flush cannot fall between the resample and the queue.
     resampler: StdMutex<StreamResampler>,
     encoder: StdMutex<opus::Encoder>,
     pacer: StdMutex<Option<JoinHandle<()>>>,
     pacer_started: AtomicBool,
+    /// Set by `start_pacing`, cleared by `pause_pacing`.
+    pacing_enabled: AtomicBool,
     pcm_pacing: AtomicBool,
+    /// [`LocalAudioTrackConfig::pace`].
+    pace: bool,
+    /// Set while a new publication waits for the first SFU publisher connect.
+    /// The pacer takes no PCM while it is set.
+    held: AtomicBool,
     write_guard: tokio::sync::Mutex<()>,
+}
+
+impl AudioInner {
+    /// Fill `frame` from the queue and then with silence. A queue shorter than
+    /// `frame` first gets the audio that the resampler still holds, so the end
+    /// of the written audio plays without a gap.
+    fn take_pcm(&self, frame: &mut [i16]) {
+        let mut buf = self.pcm.lock().unwrap_or_else(|e| e.into_inner());
+        if buf.len() < frame.len() {
+            drop(buf);
+            let mut resampler = self.resampler.lock().unwrap_or_else(|e| e.into_inner());
+            buf = self.pcm.lock().unwrap_or_else(|e| e.into_inner());
+            if buf.len() < frame.len() {
+                match resampler.flush() {
+                    Ok(mut tail) => {
+                        // The silence after the tail would delay the next write.
+                        let end = tail
+                            .samples
+                            .iter()
+                            .rposition(|&s| s != 0)
+                            .map_or(0, |i| i + 1);
+                        tail.samples.truncate(end);
+                        push_bounded_pcm(&mut buf, tail.samples, self.pcm_capacity_samples);
+                    }
+                    Err(e) => tracing::debug!(error = %e, "stream.rtc.audio.flush_failed"),
+                }
+            }
+        }
+        for slot in frame.iter_mut() {
+            *slot = buf.pop_front().unwrap_or(0);
+        }
+    }
 }
 
 /// Encoder settings for a locally encoded Opus track.
@@ -346,6 +411,13 @@ pub struct LocalAudioTrackConfig {
     pub expected_packet_loss_pct: u8,
     /// Discontinuous transmission: stop emitting packets during silence.
     pub dtx: bool,
+    /// Maximum PCM that [`LocalAudioTrack::write_pcm`] queues for the pacer. A
+    /// write above it drops the oldest queued samples. The minimum is one 20 ms
+    /// frame.
+    pub pcm_queue_capacity: Duration,
+    /// Start pacing at the first [`LocalAudioTrack::write_pcm`]. When `false`,
+    /// `write_pcm` only queues until [`LocalAudioTrack::start_pacing`].
+    pub pace: bool,
 }
 
 impl Default for LocalAudioTrackConfig {
@@ -355,6 +427,8 @@ impl Default for LocalAudioTrackConfig {
             inband_fec: true,
             expected_packet_loss_pct: EXPECTED_PACKET_LOSS_PCT,
             dtx: true,
+            pcm_queue_capacity: PCM_QUEUE_CAPACITY,
+            pace: true,
         }
     }
 }
@@ -387,6 +461,20 @@ impl LocalAudioTrackConfig {
     #[must_use]
     pub fn with_dtx(mut self, dtx: bool) -> Self {
         self.dtx = dtx;
+        self
+    }
+
+    /// Set the maximum PCM that [`LocalAudioTrack::write_pcm`] queues.
+    #[must_use]
+    pub fn with_pcm_queue_capacity(mut self, pcm_queue_capacity: Duration) -> Self {
+        self.pcm_queue_capacity = pcm_queue_capacity;
+        self
+    }
+
+    /// Enable or disable the pacing start at the first `write_pcm`.
+    #[must_use]
+    pub fn with_pace(mut self, pace: bool) -> Self {
+        self.pace = pace;
         self
     }
 }
@@ -433,15 +521,27 @@ impl LocalAudioTrack {
         encoder.set_inband_fec(config.inband_fec)?;
         encoder.set_packet_loss_perc(i32::from(config.expected_packet_loss_pct))?;
         encoder.set_dtx(config.dtx)?;
+        let pcm_capacity_samples =
+            (config.pcm_queue_capacity.as_secs_f64() * f64::from(OPUS_SAMPLE_RATE)) as usize;
+        if pcm_capacity_samples < FRAME_SAMPLES_20MS {
+            return Err(RtcError::Media(format!(
+                "pcm queue capacity below one 20 ms frame: {:?}",
+                config.pcm_queue_capacity
+            )));
+        }
         Ok(Self {
             inner: Arc::new(AudioInner {
                 core,
-                pcm: StdMutex::new(VecDeque::with_capacity(PCM_QUEUE_CAPACITY_SAMPLES)),
-                resampler: StdMutex::new(StreamResampler::to_opus_mono()),
+                pcm: StdMutex::new(VecDeque::new()),
+                pcm_capacity_samples,
+                resampler: StdMutex::new(StreamResampler::new(OPUS_SAMPLE_RATE, 1)),
                 encoder: StdMutex::new(encoder),
                 pacer: StdMutex::new(None),
                 pacer_started: AtomicBool::new(false),
+                pacing_enabled: AtomicBool::new(false),
                 pcm_pacing: AtomicBool::new(true),
+                pace: config.pace,
+                held: AtomicBool::new(false),
                 write_guard: tokio::sync::Mutex::new(()),
             }),
         })
@@ -449,19 +549,27 @@ impl LocalAudioTrack {
 
     /// Queue a PCM frame for the paced 20 ms Opus encoder.
     ///
-    /// The frame is resampled to 48 kHz mono and buffered for at most 200 ms; a
+    /// The first frame sets the sample rate of the track, and later frames must
+    /// keep it. The channels of a frame are averaged to mono, and the mono
+    /// audio is resampled to 48 kHz and buffered up to
+    /// [`LocalAudioTrackConfig::pcm_queue_capacity`]. The first write starts
+    /// pacing when [`LocalAudioTrackConfig::pace`] is set (the default);
+    /// otherwise [`start_pacing`](Self::start_pacing) does. While pacing runs, a
     /// background task emits one Opus packet every 20 ms, writing silence when
-    /// the buffer runs dry. To keep interactive audio current, this method does
-    /// not backpressure a producer: overflow drops the oldest queued samples and
-    /// retains the newest audio. [`flush`](Self::flush) still drops all unsent
-    /// samples immediately for barge-in.
+    /// the buffer runs dry. Before the silence, it takes the audio that the
+    /// resampler still holds (8 ms at 16 kHz), so the end of the written audio
+    /// plays without the next write. This method
+    /// does not backpressure a producer: overflow drops the oldest queued
+    /// samples and retains the newest audio. [`flush`](Self::flush) still drops
+    /// all unsent samples immediately for barge-in.
     ///
     /// # Errors
     ///
     /// Returns [`RtcError::PcmQueueOverflow`] after retaining the newest audio
-    /// when this write exceeds the 200 ms queue. The caller may continue writing;
-    /// the typed error makes overload observable without allowing stale audio to
-    /// accumulate.
+    /// when this write exceeds the queue capacity. The caller may continue
+    /// writing; the typed error makes overload observable without allowing
+    /// stale audio to accumulate. Returns [`RtcError::PcmRateMismatch`] when
+    /// the frame is not at the rate of the first frame.
     pub async fn write_pcm(&self, frame: PcmFrame) -> Result<()> {
         if self.inner.core.stopped.load(Ordering::SeqCst) {
             return Err(RtcError::IllegalState(
@@ -469,35 +577,54 @@ impl LocalAudioTrack {
             ));
         }
         self.inner.pcm_pacing.store(true, Ordering::SeqCst);
-        let resampled = {
+        let frame = if frame.channels > 1 {
+            let channels = usize::from(frame.channels);
+            let samples = frame
+                .samples
+                .chunks_exact(channels)
+                .map(|chunk| {
+                    let sum: f32 = chunk.iter().map(|&s| f32::from(s)).sum();
+                    (sum / channels as f32).round() as i16
+                })
+                .collect();
+            PcmFrame::mono(samples, frame.sample_rate)
+        } else {
+            frame
+        };
+        let queued = {
             let mut r = self
                 .inner
                 .resampler
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
-            r.push(&frame)
+            let resampled = r.push(&frame)?.samples;
+            self.queue_pcm(resampled)
         };
-        let dropped = {
-            let mut buf = self.inner.pcm.lock().unwrap_or_else(|e| e.into_inner());
-            let dropped = push_bounded_pcm(&mut buf, resampled);
-            if dropped > 0 {
-                tracing::debug!(
-                    dropped_samples = dropped,
-                    capacity_samples = PCM_QUEUE_CAPACITY_SAMPLES,
-                    "stream.rtc.audio.pcm_queue_overflow"
-                );
-            }
-            dropped
-        };
-        self.ensure_pacer();
-        if dropped > 0 {
-            Err(RtcError::PcmQueueOverflow {
-                dropped_samples: dropped,
-                capacity_samples: PCM_QUEUE_CAPACITY_SAMPLES,
-            })
-        } else {
-            Ok(())
+        // Only a pacer that never started starts here, so a `pause_pacing`
+        // stays in force.
+        if self.inner.pace && !self.inner.pacer_started.load(Ordering::SeqCst) {
+            self.start_pacing().await;
         }
+        queued
+    }
+
+    /// Append 48 kHz mono samples to the pacer queue, dropping the oldest
+    /// audio above the capacity. Callers hold the `resampler` lock.
+    fn queue_pcm(&self, samples: Vec<i16>) -> Result<()> {
+        let mut buf = self.inner.pcm.lock().unwrap_or_else(|e| e.into_inner());
+        let dropped = push_bounded_pcm(&mut buf, samples, self.inner.pcm_capacity_samples);
+        if dropped == 0 {
+            return Ok(());
+        }
+        tracing::debug!(
+            dropped_samples = dropped,
+            capacity_samples = self.inner.pcm_capacity_samples,
+            "stream.rtc.audio.pcm_queue_overflow"
+        );
+        Err(RtcError::PcmQueueOverflow {
+            dropped_samples: dropped,
+            capacity_samples: self.inner.pcm_capacity_samples,
+        })
     }
 
     /// Write an already-encoded Opus frame of `duration` (packetized immediately;
@@ -563,10 +690,70 @@ impl LocalAudioTrack {
         self.inner.core.forward_rtp(&packet).await
     }
 
-    /// Drop any buffered-but-unsent PCM (barge-in). Does not stop the track.
+    /// Drop any buffered-but-unsent PCM (barge-in), including the audio that
+    /// the resampler still holds. Does not stop the track.
     pub fn flush(&self) {
+        let mut r = self
+            .inner
+            .resampler
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Err(e) = r.flush() {
+            tracing::debug!(error = %e, "stream.rtc.audio.flush_failed");
+        }
         let mut buf = self.inner.pcm.lock().unwrap_or_else(|e| e.into_inner());
         buf.clear();
+    }
+
+    /// Start taking queued PCM: one 20 ms frame every 20 ms, or silence when
+    /// the queue is empty. With [`LocalAudioTrackConfig::pace`] set (the
+    /// default), the first [`write_pcm`](Self::write_pcm) calls this.
+    ///
+    /// [`Call::publish_audio`](crate::Call::publish_audio) holds the queue
+    /// until the SFU publisher first connects, then starts pacing; pacing
+    /// continues through later disconnects. With `pace` off, call this for a
+    /// track on your own PeerConnection (see [`webrtc_track`](Self::webrtc_track))
+    /// after that PeerConnection connects.
+    pub async fn start_pacing(&self) {
+        self.inner.pacing_enabled.store(true, Ordering::SeqCst);
+        self.ensure_pacer();
+    }
+
+    /// Stop taking queued PCM. The queue keeps its audio, so audio written
+    /// while paused is sent late after the next
+    /// [`start_pacing`](Self::start_pacing).
+    pub fn pause_pacing(&self) {
+        self.inner.pacing_enabled.store(false, Ordering::SeqCst);
+    }
+
+    /// Take no PCM until [`Self::release_pacing`]. A new publication holds its
+    /// track until the SFU publisher first connects.
+    pub(crate) fn hold_pacing(&self) {
+        self.inner.held.store(true, Ordering::SeqCst);
+    }
+
+    /// End a [`Self::hold_pacing`]. Returns whether the track was held.
+    pub(crate) fn release_pacing(&self) -> bool {
+        self.inner.held.swap(false, Ordering::SeqCst)
+    }
+
+    /// Continue the RTP sequence numbers and timestamps of `previous`, whose
+    /// sender this track takes over. The SFU drops a stream whose timestamps
+    /// go back.
+    fn continue_rtp_from(&self, previous: &LocalAudioTrack) {
+        let packetizer = previous
+            .inner
+            .core
+            .packetizer
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        *self
+            .inner
+            .core
+            .packetizer
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = packetizer;
     }
 
     /// Stop the pacer and reject further writes. Called by `stop_publish`/`leave`.
@@ -589,7 +776,10 @@ impl LocalAudioTrack {
     /// [`Call::publish_audio`](crate::Call::publish_audio) does this for the
     /// SFU; you only need it to send the same audio to a second peer, such as an
     /// AI provider's Realtime endpoint. Every write path (`write_pcm` and
-    /// friends) feeds all bound senders.
+    /// friends) feeds all bound senders. With [`LocalAudioTrackConfig::pace`]
+    /// set, audio written before this PeerConnection connects is lost; turn it
+    /// off and call [`start_pacing`](Self::start_pacing) at the connect to keep
+    /// that audio.
     pub fn webrtc_track(&self) -> Arc<TrackLocalStaticRTP> {
         self.inner.core.track.clone()
     }
@@ -603,7 +793,7 @@ impl LocalAudioTrack {
     }
 
     /// Spawn the 20 ms PCM/silence pacing task (idempotent).
-    pub(crate) fn ensure_pacer(&self) {
+    fn ensure_pacer(&self) {
         if self
             .inner
             .pacer_started
@@ -612,36 +802,50 @@ impl LocalAudioTrack {
         {
             return;
         }
-        let inner = self.inner.clone();
-        let handle = tokio::spawn(async move { pace_audio(inner).await });
+        let track = Arc::downgrade(&self.inner);
+        let handle = tokio::spawn(async move { pace_audio(track).await });
         *self.inner.pacer.lock().unwrap_or_else(|e| e.into_inner()) = Some(handle);
     }
 }
 
 /// The 20 ms pacing loop: pull one Opus frame worth of PCM (or silence) every
-/// tick, encode it, and packetize it onto the outbound track.
-async fn pace_audio(inner: Arc<AudioInner>) {
+/// tick, encode it, and packetize it onto the outbound track. It ends when the
+/// track is stopped or dropped.
+async fn pace_audio(track: Weak<AudioInner>) {
     let mut interval = tokio::time::interval(Duration::from_millis(20));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut scratch = vec![0i16; FRAME_SAMPLES_20MS];
     let mut encoded = vec![0u8; MAX_OPUS_PACKET_BYTES];
     loop {
         interval.tick().await;
+        let Some(inner) = track.upgrade() else {
+            return;
+        };
         if inner.core.stopped.load(Ordering::SeqCst) {
             return;
         }
-        if !inner.pcm_pacing.load(Ordering::SeqCst) {
+        if !inner.pcm_pacing.load(Ordering::SeqCst)
+            || !inner.pacing_enabled.load(Ordering::SeqCst)
+            || inner.held.load(Ordering::SeqCst)
+        {
             continue;
         }
         let _write = inner.write_guard.lock().await;
         if !inner.pcm_pacing.load(Ordering::SeqCst) {
             continue;
         }
-        {
-            let mut buf = inner.pcm.lock().unwrap_or_else(|e| e.into_inner());
-            for slot in scratch.iter_mut() {
-                *slot = buf.pop_front().unwrap_or(0);
-            }
+        inner.take_pcm(&mut scratch);
+        // A muted track sends nothing, so its audio is dropped without an encode.
+        // The RTP clock keeps time, so the first packet after the mute shows the
+        // gap (RFC 3550 §5.1).
+        if inner.core.is_output_paused() {
+            inner
+                .core
+                .packetizer
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .skip_samples(FRAME_SAMPLES_20MS as u32);
+            continue;
         }
         // Measure what we are about to encode, including any silence fill, so a
         // starved pacer reports silence rather than the last spoken level.
@@ -671,11 +875,11 @@ async fn pace_audio(inner: Arc<AudioInner>) {
     }
 }
 
-fn push_bounded_pcm(queue: &mut VecDeque<i16>, samples: Vec<i16>) -> usize {
+fn push_bounded_pcm(queue: &mut VecDeque<i16>, samples: Vec<i16>, capacity: usize) -> usize {
     let overflow = queue
         .len()
         .saturating_add(samples.len())
-        .saturating_sub(PCM_QUEUE_CAPACITY_SAMPLES);
+        .saturating_sub(capacity);
     let from_queue = overflow.min(queue.len());
     queue.drain(..from_queue);
     let from_samples = overflow - from_queue;
@@ -689,12 +893,6 @@ fn encode_opus_into(encoder: &mut opus::Encoder, pcm: &[i16], output: &mut [u8])
 
 // Video
 
-#[derive(Clone, Copy)]
-enum VideoCodec {
-    Vpx(VpxCodec),
-    H264,
-}
-
 enum VideoCodecState {
     Vpx {
         encoder: VpxEncoder,
@@ -703,11 +901,6 @@ enum VideoCodecState {
     Vp9Svc {
         encoder: VpxSvcEncoder,
         packetizer: VpxRtpPacketizer,
-    },
-    H264 {
-        encoder: Box<H264Encoder>,
-        packetizer: H264RtpPacketizer,
-        encoded: Vec<u8>,
     },
 }
 
@@ -731,6 +924,17 @@ struct VideoClock {
     rtp_ts: u32,
 }
 
+impl VideoClock {
+    /// Return the presentation time and RTP timestamp of the next frame, and
+    /// move the clock past its duration.
+    fn advance(&mut self, dur_ms: i64, samples: u32) -> (i64, u32) {
+        let current = (self.next_pts, self.rtp_ts);
+        self.next_pts = self.next_pts.saturating_add(dur_ms);
+        self.rtp_ts = self.rtp_ts.wrapping_add(samples);
+        current
+    }
+}
+
 struct VideoEncoding {
     core: TrackCore,
     encoder: StdMutex<Option<VideoEncoder>>,
@@ -748,7 +952,7 @@ impl VideoEncoding {
 
 struct VideoInner {
     encodings: Vec<VideoEncoding>,
-    codec_id: VideoCodec,
+    codec_id: VpxCodec,
     /// Serializes frame work before it enters Tokio's blocking pool. The permit
     /// moves into the worker so cancellation cannot build an unbounded queue.
     encode_gate: Arc<Semaphore>,
@@ -773,8 +977,8 @@ pub enum VideoLayering {
     Single,
     /// Build server-managed layering, optionally capped locally.
     ///
-    /// VP9 camera tracks use one-SSRC codec-native SVC. H264 camera and VP8
-    /// screen-share tracks use independent RID simulcast encodings.
+    /// VP9 camera tracks use one-SSRC codec-native SVC. VP8 screen-share tracks
+    /// use independent RID simulcast encodings.
     ServerManaged {
         /// Maximum local spatial layers. `None` allows up to three.
         max_spatial_layers: Option<NonZeroU8>,
@@ -822,7 +1026,7 @@ impl LocalVideoTrackConfig {
     }
 }
 
-/// An outbound video track (VP8, VP9, or H264).
+/// An outbound video track (VP8 or VP9).
 ///
 /// Feed raw frames via [`write_i420`](Self::write_i420) (the SDK encodes to the
 /// track's codec and packetizes), publish pre-encoded frames via
@@ -850,7 +1054,7 @@ impl LocalVideoTrack {
                 sdp_fmtp_line: String::new(),
                 rtcp_feedback: vec![],
             },
-            VideoCodec::Vpx(VpxCodec::Vp8),
+            VpxCodec::Vp8,
             config,
         )
     }
@@ -877,7 +1081,7 @@ impl LocalVideoTrack {
                 sdp_fmtp_line: "profile-id=0".to_owned(),
                 rtcp_feedback: vec![],
             },
-            VideoCodec::Vpx(VpxCodec::Vp9),
+            VpxCodec::Vp9,
             config,
         )
     }
@@ -891,40 +1095,9 @@ impl LocalVideoTrack {
         Self::vp9_with_config(LocalVideoTrackConfig::default().server_managed())
     }
 
-    /// Build an H264 Constrained Baseline, packetization-mode 1 video track.
-    ///
-    /// VP9 remains the SDK's default camera codec. Select H264 for peers that
-    /// require it, including Safari-origin media and OpenAI Realtime video.
-    /// H264 may be covered by patents in some jurisdictions; distributors must
-    /// evaluate their own licensing obligations.
-    pub fn h264() -> Result<Self> {
-        Self::h264_with_config(LocalVideoTrackConfig::default())
-    }
-
-    /// Build an H264 track with explicit local encoder settings.
-    pub fn h264_with_config(config: LocalVideoTrackConfig) -> Result<Self> {
-        Self::with_codec(
-            RTCRtpCodecCapability {
-                mime_type: MIME_TYPE_H264.to_owned(),
-                clock_rate: 90_000,
-                channels: 0,
-                sdp_fmtp_line: crate::rtc::publish_options::H264_FMTP.to_owned(),
-                rtcp_feedback: vec![],
-            },
-            VideoCodec::H264,
-            config,
-        )
-    }
-
-    /// Build an H264 camera track configured for server-managed simulcast.
-    /// Publish it with [`crate::Call::publish_video`].
-    pub fn h264_simulcast() -> Result<Self> {
-        Self::h264_with_config(LocalVideoTrackConfig::default().server_managed())
-    }
-
     fn with_codec(
         codec: RTCRtpCodecCapability,
-        codec_id: VideoCodec,
+        codec_id: VpxCodec,
         config: LocalVideoTrackConfig,
     ) -> Result<Self> {
         if config.target_bitrate_bps == 0 {
@@ -936,8 +1109,10 @@ impl LocalVideoTrack {
         let stream_id = "stream-rust-video".to_owned();
         let rids: &[Option<&str>] = match (config.layering, codec_id) {
             (VideoLayering::Single, _) => &[None],
-            (VideoLayering::ServerManaged { .. }, VideoCodec::Vpx(VpxCodec::Vp9)) => &[Some("q")],
-            (VideoLayering::ServerManaged { .. }, _) => &[Some("q"), Some("h"), Some("f")],
+            (VideoLayering::ServerManaged { .. }, VpxCodec::Vp9) => &[Some("q")],
+            (VideoLayering::ServerManaged { .. }, VpxCodec::Vp8) => {
+                &[Some("q"), Some("h"), Some("f")]
+            }
         };
         let bitrate_kbps = config.target_bitrate_bps.saturating_add(999) / 1_000;
         let mut encodings = Vec::with_capacity(rids.len());
@@ -997,6 +1172,9 @@ impl LocalVideoTrack {
                 "write to a stopped track".to_owned(),
             ));
         }
+        let dur_ms = i64::try_from(duration.as_millis().max(1)).unwrap_or(i64::MAX);
+        let samples =
+            (duration.as_secs_f64() * f64::from(self.inner.encodings[0].core.clock_rate)) as u32;
         if self
             .inner
             .encodings
@@ -1006,6 +1184,12 @@ impl LocalVideoTrack {
             ))
             .all(|encoding| encoding.core.is_output_paused())
         {
+            // The RTP clock keeps time while no frame goes out.
+            self.inner
+                .clock
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .advance(dur_ms, samples);
             return Ok(());
         }
         if width == 0 || height == 0 || !width.is_multiple_of(2) || !height.is_multiple_of(2) {
@@ -1038,9 +1222,6 @@ impl LocalVideoTrack {
                      and {MAX_LOCAL_VIDEO_PIXELS} pixels (got {width}x{height})"
                 ))
             })?;
-        if matches!(self.inner.codec_id, VideoCodec::H264) {
-            validate_h264_encode_request(width, height, duration)?;
-        }
         let expected = usize::try_from(width)
             .ok()
             .and_then(|width| {
@@ -1063,10 +1244,6 @@ impl LocalVideoTrack {
                 data.len()
             )));
         }
-
-        let dur_ms = i64::try_from(duration.as_millis().max(1)).unwrap_or(i64::MAX);
-        let samples =
-            (duration.as_secs_f64() * f64::from(self.inner.encodings[0].core.clock_rate)) as u32;
 
         let permit = self
             .inner
@@ -1113,6 +1290,44 @@ impl LocalVideoTrack {
         for encoding in &self.inner.encodings {
             encoding.core.stop();
         }
+    }
+
+    /// Continue the RTP sequence numbers and timestamps of the single-encoding
+    /// `previous`, whose sender this track takes over. The encoder state moves
+    /// here, so the sequence numbers and the VP9 picture ids continue. The SFU
+    /// drops a stream whose timestamps go back.
+    fn continue_rtp_from(&self, previous: &LocalVideoTrack) {
+        let (next_pts, rtp_ts) = {
+            let clock = previous
+                .inner
+                .clock
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            (clock.next_pts, clock.rtp_ts)
+        };
+        {
+            let mut clock = self.inner.clock.lock().unwrap_or_else(|e| e.into_inner());
+            clock.next_pts = next_pts;
+            clock.rtp_ts = rtp_ts;
+        }
+        let (current, previous) = (&self.inner.encodings[0], &previous.inner.encodings[0]);
+        let state = previous
+            .encoder
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        *current.encoder.lock().unwrap_or_else(|e| e.into_inner()) = state;
+        let packetizer = previous
+            .core
+            .packetizer
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        *current
+            .core
+            .packetizer
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = packetizer;
     }
 
     /// The underlying webrtc-rs track, for attaching this track to a
@@ -1217,12 +1432,10 @@ impl LocalVideoTrack {
                 max_spatial_layers,
                 max_temporal_layers: _,
             } => {
-                let supported = (matches!(self.inner.codec_id, VideoCodec::H264)
-                    && track_type == TrackType::Video)
-                    || (matches!(self.inner.codec_id, VideoCodec::Vpx(VpxCodec::Vp8))
-                        && track_type == TrackType::ScreenShare)
-                    || (matches!(self.inner.codec_id, VideoCodec::Vpx(VpxCodec::Vp9))
-                        && track_type == TrackType::Video);
+                let supported = matches!(
+                    (self.inner.codec_id, track_type),
+                    (VpxCodec::Vp8, TrackType::ScreenShare) | (VpxCodec::Vp9, TrackType::Video)
+                );
                 if !supported {
                     return Err(RtcError::UnsupportedVideoLayering {
                         codec: self.mime_type(),
@@ -1332,7 +1545,7 @@ impl LocalVideoTrack {
     }
 
     fn is_vp9_svc(&self) -> bool {
-        matches!(self.inner.codec_id, VideoCodec::Vpx(VpxCodec::Vp9))
+        matches!(self.inner.codec_id, VpxCodec::Vp9)
             && matches!(self.inner.layering, VideoLayering::ServerManaged { .. })
     }
 
@@ -1487,16 +1700,11 @@ fn encode_i420_layers(
     dur_ms: i64,
     samples: u32,
 ) -> Result<Vec<(usize, Vec<RtpPacket>)>> {
-    let (pts, timestamp) = {
-        let mut clock = inner
-            .clock
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        let current = (clock.next_pts, clock.rtp_ts);
-        clock.next_pts = clock.next_pts.saturating_add(dur_ms);
-        clock.rtp_ts = clock.rtp_ts.wrapping_add(samples);
-        current
-    };
+    let (pts, timestamp) = inner
+        .clock
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .advance(dur_ms, samples);
     let count = usize::from(inner.active_encoding_count.load(Ordering::SeqCst));
     let mut output = Vec::with_capacity(count);
     for (index, encoding) in inner.encodings.iter().take(count).enumerate() {
@@ -1506,13 +1714,6 @@ fn encode_i420_layers(
         let scale = encoding.scale_resolution_down_by();
         let layer_width = scaled_even(width, scale);
         let layer_height = scaled_even(height, scale);
-        if matches!(inner.codec_id, VideoCodec::H264) {
-            validate_h264_encode_request(
-                layer_width,
-                layer_height,
-                Duration::from_millis(dur_ms.max(1) as u64),
-            )?;
-        }
         let scaled;
         let layer_data = if layer_width == width && layer_height == height {
             data
@@ -1529,7 +1730,7 @@ fn encode_i420_layers(
             pts,
             dur_ms,
             timestamp,
-            if matches!(inner.codec_id, VideoCodec::Vpx(VpxCodec::Vp9))
+            if matches!(inner.codec_id, VpxCodec::Vp9)
                 && matches!(inner.layering, VideoLayering::ServerManaged { .. })
             {
                 Some(Vp9SvcMode::new(
@@ -1547,7 +1748,7 @@ fn encode_i420_layers(
 
 #[allow(clippy::too_many_arguments)]
 fn encode_layer_packets(
-    codec_id: VideoCodec,
+    codec_id: VpxCodec,
     encoding: &VideoEncoding,
     data: &[u8],
     width: u32,
@@ -1563,7 +1764,7 @@ fn encode_layer_packets(
         Some(state) => {
             let current_svc_mode = match &state.codec {
                 VideoCodecState::Vp9Svc { encoder, .. } => Some(encoder.mode()),
-                VideoCodecState::Vpx { .. } | VideoCodecState::H264 { .. } => None,
+                VideoCodecState::Vpx { .. } => None,
             };
             state.width != width
                 || state.height != height
@@ -1579,24 +1780,19 @@ fn encode_layer_packets(
             .unwrap_or_else(seed_u16);
         let prior_vp9_packetizer = guard.as_ref().and_then(|state| match &state.codec {
             VideoCodecState::Vp9Svc { packetizer, .. } => Some(packetizer.clone()),
-            VideoCodecState::Vpx { .. } | VideoCodecState::H264 { .. } => None,
+            VideoCodecState::Vpx { .. } => None,
         });
         let codec = match (codec_id, svc_mode) {
-            (VideoCodec::Vpx(VpxCodec::Vp9), Some(mode)) => VideoCodecState::Vp9Svc {
+            (VpxCodec::Vp9, Some(mode)) => VideoCodecState::Vp9Svc {
                 encoder: VpxSvcEncoder::new(width, height, bitrate_kbps, mode)?,
                 packetizer: prior_vp9_packetizer
                     .unwrap_or_else(|| VpxRtpPacketizer::new(VpxCodec::Vp9)),
             },
-            (VideoCodec::Vpx(codec), None) => VideoCodecState::Vpx {
+            (codec, None) => VideoCodecState::Vpx {
                 encoder: VpxEncoder::new(codec, width, height, bitrate_kbps)?,
                 packetizer: VpxRtpPacketizer::new(codec),
             },
-            (VideoCodec::H264, None) => VideoCodecState::H264 {
-                encoder: Box::new(H264Encoder::new(bitrate_kbps.saturating_mul(1_000))?),
-                packetizer: H264RtpPacketizer::default(),
-                encoded: Vec::new(),
-            },
-            (VideoCodec::Vpx(VpxCodec::Vp8), Some(_)) | (VideoCodec::H264, Some(_)) => {
+            (VpxCodec::Vp8, Some(_)) => {
                 return Err(RtcError::Media(
                     "VP9 SVC mode supplied for a non-VP9 encoder".to_owned(),
                 ));
@@ -1699,35 +1895,6 @@ fn encode_layer_packets(
                 out.push(RtpPacket {
                     header,
                     payload: Bytes::from(payload.data),
-                });
-                seq = seq.wrapping_add(1);
-            }
-        }
-        VideoCodecState::H264 {
-            encoder,
-            packetizer,
-            encoded,
-        } => {
-            let key = encoder.encode_into(data, width, height, force_key, encoded)?;
-            tracing::trace!(
-                bytes = encoded.len(),
-                key,
-                mime = %encoding.core.mime_type,
-                "stream.rtc.video.encoded_frame"
-            );
-            for payload in packetizer.packetize(encoded, PACKET_MTU)? {
-                let header = webrtc::rtp::header::Header {
-                    version: 2,
-                    payload_type: PLACEHOLDER_PT,
-                    sequence_number: seq,
-                    timestamp,
-                    ssrc: PLACEHOLDER_SSRC,
-                    marker: payload.last,
-                    ..Default::default()
-                };
-                out.push(RtpPacket {
-                    header,
-                    payload: payload.data,
                 });
                 seq = seq.wrapping_add(1);
             }
@@ -1926,10 +2093,32 @@ impl LocalTrack {
         }
     }
 
-    pub(crate) fn start_media(&self) {
+    /// End the publication hold at the first SFU publisher connect and start
+    /// pacing. A track that is not held keeps its pacing state, so a
+    /// `pause_pacing` stays in force.
+    pub(crate) async fn start_audio_pacing(&self) {
         match self {
             LocalTrack::Audio(track) | LocalTrack::ScreenShareAudio(track) => {
-                track.ensure_pacer();
+                if track.release_pacing() {
+                    track.start_pacing().await;
+                }
+            }
+            LocalTrack::Video { .. } => {}
+        }
+    }
+
+    pub(crate) fn hold_audio_pacing(&self) {
+        match self {
+            LocalTrack::Audio(track) | LocalTrack::ScreenShareAudio(track) => track.hold_pacing(),
+            LocalTrack::Video { .. } => {}
+        }
+    }
+
+    /// End the hold of a publication that did not complete.
+    pub(crate) fn release_audio_pacing(&self) {
+        match self {
+            LocalTrack::Audio(track) | LocalTrack::ScreenShareAudio(track) => {
+                track.release_pacing();
             }
             LocalTrack::Video { .. } => {}
         }
@@ -1939,6 +2128,39 @@ impl LocalTrack {
         match self {
             LocalTrack::Audio(a) | LocalTrack::ScreenShareAudio(a) => a.stop(),
             LocalTrack::Video { track, .. } => track.stop(),
+        }
+    }
+
+    /// Whether the track sends several RID encodings.
+    pub(crate) fn is_simulcast(&self) -> bool {
+        matches!(self, LocalTrack::Video { track, .. } if track.inner.encodings.len() > 1)
+    }
+
+    /// Wait until the track is stopped.
+    pub(crate) async fn stopped(&self) {
+        match self {
+            LocalTrack::Audio(a) | LocalTrack::ScreenShareAudio(a) => a.inner.core.stopped().await,
+            LocalTrack::Video { track, .. } => track.inner.encodings[0].core.stopped().await,
+        }
+    }
+
+    /// Continue the RTP timeline of the audio track `previous`, whose sender
+    /// this audio track takes over.
+    pub(crate) fn continue_rtp_from(&self, previous: &LocalTrack) {
+        match (self, previous) {
+            (
+                LocalTrack::Audio(track) | LocalTrack::ScreenShareAudio(track),
+                LocalTrack::Audio(previous) | LocalTrack::ScreenShareAudio(previous),
+            ) => track.continue_rtp_from(previous),
+            (
+                LocalTrack::Video { track, .. },
+                LocalTrack::Video {
+                    track: previous, ..
+                },
+            ) => {
+                track.continue_rtp_from(previous);
+            }
+            _ => {}
         }
     }
 
@@ -1992,6 +2214,7 @@ impl LocalTrack {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::rtc::peer;
     use crate::rtc::proto::models::{Codec, VideoDimension};
 
     /// One 20 ms frame of 440 Hz tone: FEC and DTX both key off whether the
@@ -2122,22 +2345,89 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn write_pcm_paces_without_binding() {
+    async fn started_pacing_sends_silence_with_truthful_level() {
         let track = LocalAudioTrack::opus().expect("opus track");
-        let frame = PcmFrame::mono(vec![1000; FRAME_SAMPLES_20MS], OPUS_SAMPLE_RATE);
-        track.write_pcm(frame).await.expect("write_pcm");
-        // Give the pacer a couple of ticks; it must not panic writing silence.
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        track.start_pacing().await;
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(track.inner.pacer_started.load(Ordering::SeqCst));
+        assert_eq!(track.inner.core.audio_level.load(Ordering::Relaxed), 127);
+        track.stop();
+    }
+
+    /// A silent 20 ms block at 16 kHz whose last 2 ms carry a loud 1 kHz tone.
+    fn loud_end_16k() -> PcmFrame {
+        let samples = (0..320)
+            .map(|index| {
+                if index < 288 {
+                    return 0;
+                }
+                let time = index as f64 / 16_000.0;
+                (20_000.0 * (std::f64::consts::TAU * 1_000.0 * time).sin()) as i16
+            })
+            .collect();
+        PcmFrame::mono(samples, 16_000)
+    }
+
+    fn unpaced_track() -> LocalAudioTrack {
+        LocalAudioTrack::opus_with_config(LocalAudioTrackConfig::default().with_pace(false))
+            .expect("opus track")
+    }
+
+    fn peak(samples: &[i16]) -> i16 {
+        samples
+            .iter()
+            .map(|s| s.saturating_abs())
+            .max()
+            .unwrap_or(0)
+    }
+
+    #[tokio::test]
+    async fn a_short_queue_takes_the_end_of_the_written_audio() {
+        let track = unpaced_track();
+        track.write_pcm(loud_end_16k()).await.expect("write_pcm");
+        let mut first = vec![0; FRAME_SAMPLES_20MS];
+        let mut second = vec![0; FRAME_SAMPLES_20MS];
+
+        track.inner.take_pcm(&mut first);
+        track.inner.take_pcm(&mut second);
+
+        assert!(peak(&first) < 1_000, "the loud end came before its time");
+        assert!(peak(&second) > 15_000, "the loud end did not play");
         track.stop();
     }
 
     #[tokio::test]
-    async fn publication_starts_paced_silence_with_truthful_level() {
-        let track = LocalAudioTrack::opus().expect("opus track");
-        LocalTrack::Audio(track.clone()).start_media();
-        tokio::time::sleep(Duration::from_millis(30)).await;
-        assert!(track.inner.pacer_started.load(Ordering::SeqCst));
-        assert_eq!(track.inner.core.audio_level.load(Ordering::Relaxed), 127);
+    async fn the_end_of_the_written_audio_leaves_no_silence_in_the_queue() {
+        let track = unpaced_track();
+        let tone_5ms = (0..80)
+            .map(|index| {
+                let time = index as f64 / 16_000.0;
+                (12_000.0 * (std::f64::consts::TAU * 440.0 * time).sin()) as i16
+            })
+            .collect();
+        track
+            .write_pcm(PcmFrame::mono(tone_5ms, 16_000))
+            .await
+            .expect("write_pcm");
+
+        track.inner.take_pcm(&mut vec![0; FRAME_SAMPLES_20MS]);
+
+        let queue = track.inner.pcm.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(queue.is_empty(), "{} samples of silence wait", queue.len());
+        drop(queue);
+        track.stop();
+    }
+
+    #[tokio::test]
+    async fn flush_drops_the_audio_the_resampler_still_holds() {
+        let track = unpaced_track();
+        track.write_pcm(loud_end_16k()).await.expect("write_pcm");
+
+        track.flush();
+        let mut frame = vec![0; FRAME_SAMPLES_20MS];
+        track.inner.take_pcm(&mut frame);
+
+        assert_eq!(peak(&frame), 0, "audio from before the flush played");
         track.stop();
     }
 
@@ -2150,9 +2440,9 @@ mod tests {
                 .pcm
                 .lock()
                 .unwrap_or_else(|error| error.into_inner());
-            queue.extend(std::iter::repeat_n(1, PCM_QUEUE_CAPACITY_SAMPLES - 2));
-            assert_eq!(push_bounded_pcm(&mut queue, vec![2, 3, 4, 5]), 2);
-            assert_eq!(queue.len(), PCM_QUEUE_CAPACITY_SAMPLES);
+            queue.extend(std::iter::repeat_n(1, 4));
+            assert_eq!(push_bounded_pcm(&mut queue, vec![2, 3, 4, 5], 6), 2);
+            assert_eq!(queue.len(), 6);
             assert_eq!(queue.back(), Some(&5));
         }
         track.flush();
@@ -2167,17 +2457,28 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn write_pcm_reports_typed_overflow_after_retaining_newest_audio() {
-        let track = LocalAudioTrack::opus().expect("opus track");
-        let samples = vec![7; PCM_QUEUE_CAPACITY_SAMPLES + FRAME_SAMPLES_20MS];
+    async fn write_pcm_above_the_default_minute_keeps_the_newest_samples() {
+        let track =
+            LocalAudioTrack::opus_with_config(LocalAudioTrackConfig::default().with_pace(false))
+                .expect("opus track");
+        let minute = 60 * OPUS_SAMPLE_RATE as usize;
+        track
+            .write_pcm(PcmFrame::mono(vec![1; minute], OPUS_SAMPLE_RATE))
+            .await
+            .expect("a minute fits the default queue");
+
         let result = track
-            .write_pcm(PcmFrame::mono(samples, OPUS_SAMPLE_RATE))
+            .write_pcm(PcmFrame::mono(
+                vec![2; FRAME_SAMPLES_20MS],
+                OPUS_SAMPLE_RATE,
+            ))
             .await;
+
         assert!(matches!(
             result,
             Err(RtcError::PcmQueueOverflow {
                 dropped_samples: FRAME_SAMPLES_20MS,
-                capacity_samples: PCM_QUEUE_CAPACITY_SAMPLES,
+                capacity_samples: 2_880_000,
             })
         ));
         let queue = track
@@ -2185,10 +2486,333 @@ mod tests {
             .pcm
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        assert_eq!(queue.len(), PCM_QUEUE_CAPACITY_SAMPLES);
-        assert!(queue.iter().all(|sample| *sample == 7));
+        assert_eq!(queue.len(), minute);
+        assert_eq!(queue.front(), Some(&1));
+        assert!(
+            queue
+                .iter()
+                .rev()
+                .take(FRAME_SAMPLES_20MS)
+                .all(|sample| *sample == 2)
+        );
         drop(queue);
         track.stop();
+    }
+
+    #[tokio::test]
+    async fn pcm_queue_capacity_is_set_per_track() {
+        let track = LocalAudioTrack::opus_with_config(
+            LocalAudioTrackConfig::default().with_pcm_queue_capacity(Duration::from_millis(100)),
+        )
+        .expect("opus track");
+
+        let result = track
+            .write_pcm(PcmFrame::mono(
+                vec![7; FRAME_SAMPLES_20MS * 6],
+                OPUS_SAMPLE_RATE,
+            ))
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(RtcError::PcmQueueOverflow {
+                dropped_samples: FRAME_SAMPLES_20MS,
+                capacity_samples: 4_800,
+            })
+        ));
+        track.stop();
+    }
+
+    #[test]
+    fn a_pcm_queue_shorter_than_one_frame_is_rejected() {
+        let with_capacity = |capacity| {
+            LocalAudioTrack::opus_with_config(
+                LocalAudioTrackConfig::default().with_pcm_queue_capacity(capacity),
+            )
+        };
+
+        for capacity in [Duration::ZERO, Duration::from_millis(19)] {
+            assert!(
+                matches!(with_capacity(capacity), Err(RtcError::Media(_))),
+                "{capacity:?} holds less than one 20 ms frame"
+            );
+        }
+        assert!(with_capacity(Duration::from_millis(20)).is_ok());
+    }
+
+    #[tokio::test]
+    async fn the_first_write_starts_pacing_by_default() {
+        let track = LocalAudioTrack::opus().expect("opus track");
+        let sender = peer::new_peer_connection(&[]).await.expect("sender");
+        sender
+            .add_track(track.webrtc_track())
+            .await
+            .expect("add track");
+        let (receiver, mut remote_rx) = peer::connect_audio_receiver(&sender).await;
+
+        track
+            .write_pcm(PcmFrame::mono(tone_20ms(), OPUS_SAMPLE_RATE))
+            .await
+            .expect("write");
+
+        tokio::time::timeout(Duration::from_secs(5), remote_rx.recv())
+            .await
+            .expect("paced audio reaches the receiver")
+            .expect("remote track channel");
+        track.stop();
+        let _ = sender.close().await;
+        let _ = receiver.close().await;
+    }
+
+    #[tokio::test]
+    async fn the_rtp_clock_runs_while_a_paced_track_is_muted() {
+        let track = LocalAudioTrack::opus().expect("opus track");
+        let sender = peer::new_peer_connection(&[]).await.expect("sender");
+        sender
+            .add_track(track.webrtc_track())
+            .await
+            .expect("add track");
+        let (receiver, mut remote_rx) = peer::connect_audio_receiver(&sender).await;
+        track.start_pacing().await;
+        let remote = tokio::time::timeout(Duration::from_secs(5), remote_rx.recv())
+            .await
+            .expect("remote track")
+            .expect("remote track channel");
+        let published = LocalTrack::Audio(track.clone());
+
+        published.set_muted(true);
+        let (mut before, _) = remote.read_rtp().await.expect("packet before the mute");
+        while let Ok(Ok((packet, _))) =
+            tokio::time::timeout(Duration::from_millis(100), remote.read_rtp()).await
+        {
+            before = packet;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        published.set_muted(false);
+        let (after, _) = tokio::time::timeout(Duration::from_secs(5), remote.read_rtp())
+            .await
+            .expect("packet after the mute")
+            .expect("packet after the mute");
+
+        // The mute lasts at least 600 ms; a slow runtime can skip some ticks.
+        let skipped = after.header.timestamp.wrapping_sub(before.header.timestamp);
+        assert!(
+            skipped >= 10 * FRAME_SAMPLES_20MS as u32,
+            "the timestamp advanced {skipped} samples over the mute"
+        );
+        track.stop();
+        let _ = sender.close().await;
+        let _ = receiver.close().await;
+    }
+
+    #[tokio::test]
+    async fn the_rtp_clock_runs_while_encoded_audio_is_muted() {
+        let track = LocalAudioTrack::opus().expect("opus track");
+        let sender = peer::new_peer_connection(&[]).await.expect("sender");
+        sender
+            .add_track(track.webrtc_track())
+            .await
+            .expect("add track");
+        let (receiver, mut remote_rx) = peer::connect_audio_receiver(&sender).await;
+        let silence = [0xf8u8, 0xff, 0xfe];
+        let frame = Duration::from_millis(20);
+        let published = LocalTrack::Audio(track.clone());
+
+        for _ in 0..3 {
+            track.write_sample(&silence, frame).await.expect("write");
+        }
+        let remote = tokio::time::timeout(Duration::from_secs(5), remote_rx.recv())
+            .await
+            .expect("remote track")
+            .expect("remote track channel");
+        let mut before = None;
+        while let Ok(Ok((packet, _))) =
+            tokio::time::timeout(Duration::from_millis(100), remote.read_rtp()).await
+        {
+            before = Some(packet);
+        }
+        published.set_muted(true);
+        for _ in 0..10 {
+            track
+                .write_sample(&silence, frame)
+                .await
+                .expect("muted write");
+        }
+        published.set_muted(false);
+        track.write_sample(&silence, frame).await.expect("write");
+        let (after, _) = tokio::time::timeout(Duration::from_secs(5), remote.read_rtp())
+            .await
+            .expect("packet after the mute")
+            .expect("packet after the mute");
+
+        let before = before.expect("packets before the mute");
+        assert_eq!(
+            after.header.timestamp.wrapping_sub(before.header.timestamp),
+            11 * FRAME_SAMPLES_20MS as u32
+        );
+        let _ = sender.close().await;
+        let _ = receiver.close().await;
+    }
+
+    #[tokio::test]
+    async fn the_rtp_clock_runs_while_a_video_track_is_muted() {
+        use webrtc::rtp_transceiver::rtp_codec::RTPCodecType;
+
+        let track = LocalVideoTrack::vp9().expect("vp9 track");
+        let sender = peer::new_peer_connection(&[]).await.expect("sender");
+        sender
+            .add_track(track.webrtc_track())
+            .await
+            .expect("add track");
+        let (receiver, mut remote_rx) = peer::connect_receiver(&sender, RTPCodecType::Video).await;
+        let frame = vec![128_u8; 320 * 240 * 3 / 2];
+        let frame_time = Duration::from_millis(33);
+
+        for _ in 0..3 {
+            track
+                .write_i420(&frame, 320, 240, frame_time)
+                .await
+                .expect("frame");
+        }
+        let remote = tokio::time::timeout(Duration::from_secs(5), remote_rx.recv())
+            .await
+            .expect("remote track")
+            .expect("remote track channel");
+        let mut before = None;
+        while let Ok(Ok((packet, _))) =
+            tokio::time::timeout(Duration::from_millis(100), remote.read_rtp()).await
+        {
+            before = Some(packet);
+        }
+        track.set_muted(true);
+        for _ in 0..10 {
+            track
+                .write_i420(&frame, 320, 240, frame_time)
+                .await
+                .expect("muted frame");
+        }
+        track.set_muted(false);
+        track
+            .write_i420(&frame, 320, 240, frame_time)
+            .await
+            .expect("frame");
+        let (after, _) = tokio::time::timeout(Duration::from_secs(5), remote.read_rtp())
+            .await
+            .expect("packet after the mute")
+            .expect("packet after the mute");
+
+        let before = before.expect("packets before the mute");
+        assert_eq!(
+            after.header.timestamp.wrapping_sub(before.header.timestamp),
+            11 * 2_970
+        );
+        let _ = sender.close().await;
+        let _ = receiver.close().await;
+    }
+
+    #[tokio::test]
+    async fn pcm_written_before_pacing_starts_stays_queued() {
+        let track = LocalAudioTrack::opus_with_config(
+            LocalAudioTrackConfig::default()
+                .with_pcm_queue_capacity(Duration::from_millis(100))
+                .with_pace(false),
+        )
+        .expect("opus track");
+        track
+            .write_pcm(PcmFrame::mono(vec![7; 4_800], OPUS_SAMPLE_RATE))
+            .await
+            .expect("100 ms fits the queue");
+
+        // A running pacer takes 960 samples every 20 ms.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let result = track
+            .write_pcm(PcmFrame::mono(
+                vec![7; FRAME_SAMPLES_20MS],
+                OPUS_SAMPLE_RATE,
+            ))
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(RtcError::PcmQueueOverflow {
+                dropped_samples: FRAME_SAMPLES_20MS,
+                ..
+            })
+        ));
+        track.stop();
+    }
+
+    #[tokio::test]
+    async fn dropping_a_started_track_ends_its_pacer() {
+        let alive_tasks = || {
+            tokio::runtime::Handle::current()
+                .metrics()
+                .num_alive_tasks()
+        };
+        let before = alive_tasks();
+        let track = LocalAudioTrack::opus().expect("opus track");
+        track.start_pacing().await;
+        assert_eq!(alive_tasks(), before + 1);
+
+        drop(track);
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while alive_tasks() != before {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the pacer ends with its track");
+    }
+
+    #[tokio::test]
+    async fn pcm_queued_before_the_connection_is_sent_from_its_first_sample() {
+        let track =
+            LocalAudioTrack::opus_with_config(LocalAudioTrackConfig::default().with_pace(false))
+                .expect("opus track");
+        let minute = tone_20ms().repeat(3_000);
+        let queued = minute.len();
+        track
+            .write_pcm(PcmFrame::mono(minute, OPUS_SAMPLE_RATE))
+            .await
+            .expect("a minute fits the default queue");
+
+        let sender = peer::new_peer_connection(&[]).await.expect("sender");
+        sender
+            .add_track(track.webrtc_track())
+            .await
+            .expect("add track");
+        let (receiver, mut remote_rx) = peer::connect_audio_receiver(&sender).await;
+
+        track.start_pacing().await;
+        let remote = tokio::time::timeout(Duration::from_secs(5), remote_rx.recv())
+            .await
+            .expect("remote track")
+            .expect("remote track channel");
+        let mut received = 0;
+        let paced_until = tokio::time::Instant::now() + Duration::from_secs(1);
+        while tokio::time::Instant::now() < paced_until {
+            remote.read_rtp().await.expect("paced packet");
+            received += 1;
+        }
+        track.pause_pacing();
+        while let Ok(Ok(_)) =
+            tokio::time::timeout(Duration::from_millis(200), remote.read_rtp()).await
+        {
+            received += 1;
+        }
+
+        let taken = queued
+            - track
+                .inner
+                .pcm
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .len();
+        assert_eq!(taken, received * FRAME_SAMPLES_20MS);
+        track.stop();
+        let _ = sender.close().await;
+        let _ = receiver.close().await;
     }
 
     #[test]
@@ -2222,6 +2846,7 @@ mod tests {
         );
         let loud = PcmFrame::mono(vec![i16::MAX / 2; FRAME_SAMPLES_20MS * 4], OPUS_SAMPLE_RATE);
         track.write_pcm(loud).await.expect("write_pcm");
+        track.start_pacing().await;
         tokio::time::sleep(Duration::from_millis(60)).await;
         let level = track.inner.core.audio_level.load(Ordering::Relaxed);
         track.stop();
@@ -2283,10 +2908,6 @@ mod tests {
         assert!(track.track_id().starts_with("video-"));
     }
 
-    fn layered_config() -> LocalVideoTrackConfig {
-        LocalVideoTrackConfig::default().server_managed()
-    }
-
     fn layered_option(track_type: TrackType, codec: &str) -> PublishOption {
         PublishOption {
             id: 41,
@@ -2305,29 +2926,6 @@ mod tests {
             }),
             ..Default::default()
         }
-    }
-
-    #[test]
-    fn layered_h264_camera_builds_three_rid_encodings() {
-        let track = LocalVideoTrack::h264_with_config(layered_config()).expect("layered H264");
-        let layers = track
-            .configure_for_publish(TrackType::Video, &layered_option(TrackType::Video, "H264"))
-            .expect("supported H264 camera topology");
-        assert_eq!(
-            layers
-                .iter()
-                .map(|layer| layer.rid.as_str())
-                .collect::<Vec<_>>(),
-            ["q", "h", "f"]
-        );
-        assert_eq!(
-            track
-                .webrtc_tracks()
-                .iter()
-                .filter_map(|track| track.rid())
-                .collect::<Vec<_>>(),
-            ["q", "h", "f"]
-        );
     }
 
     #[test]
@@ -2554,9 +3152,12 @@ mod tests {
 
     #[test]
     fn publish_quality_updates_only_the_named_rid_and_forces_keyframe_on_resume() {
-        let track = LocalVideoTrack::h264_with_config(layered_config()).expect("layered H264");
+        let track = LocalVideoTrack::vp8_simulcast().expect("layered VP8");
         track
-            .configure_for_publish(TrackType::Video, &layered_option(TrackType::Video, "H264"))
+            .configure_for_publish(
+                TrackType::ScreenShare,
+                &layered_option(TrackType::ScreenShare, "VP8"),
+            )
             .expect("configure layers");
         track.apply_layer_setting(&VideoLayerSetting {
             name: "h".to_owned(),
@@ -2649,40 +3250,6 @@ mod tests {
                 .await
                 .expect("write_i420 blue frame");
         }
-    }
-
-    #[tokio::test]
-    async fn h264_write_i420_encodes_blue_frame() {
-        let track = LocalVideoTrack::h264().expect("H264 track");
-        let (w, h) = (320u32, 240u32);
-        let mut buf = vec![41u8; (w * h) as usize];
-        buf.extend(std::iter::repeat_n(240u8, ((w / 2) * (h / 2)) as usize));
-        buf.extend(std::iter::repeat_n(110u8, ((w / 2) * (h / 2)) as usize));
-        track
-            .write_i420(&buf, w, h, Duration::from_millis(100))
-            .await
-            .expect("write_i420 H264 blue frame");
-        assert_eq!(track.mime_type(), MIME_TYPE_H264);
-    }
-
-    #[tokio::test]
-    async fn h264_write_i420_rejects_frames_beyond_level_3_1_before_copy() {
-        let track = LocalVideoTrack::h264().expect("H264 track");
-        let max_fs_error = track
-            .write_i420(&[], 1_920, 1_080, Duration::from_millis(100))
-            .await
-            .expect_err("1080p exceeds level 3.1 MaxFS");
-        assert!(max_fs_error.to_string().contains("level 3.1"));
-
-        let frame_rate_error = track
-            .write_i420(&[], 1_280, 720, Duration::from_millis(16))
-            .await
-            .expect_err("720p60 exceeds the configured level 3.1 rate");
-        assert!(
-            frame_rate_error
-                .to_string()
-                .contains("duration is too short")
-        );
     }
 
     #[tokio::test]

@@ -8,10 +8,17 @@
 //! the concrete `TrackSubscriptionDetails` list and (re)sends it whenever the
 //! participants change.
 //!
-//! The default policy subscribes to remote **audio** only (the backend-bot
-//! default); video and screen-share are opt-in.
+//! The policy has the shape of the stream-py `SubscriptionConfig`: a default
+//! rule, rules by participant role, and a limit on the number of tracks.
 
-use super::proto::models::TrackType;
+use std::collections::{HashMap, HashSet};
+
+use super::proto::models::{self, TrackType};
+use super::proto::signal;
+
+/// Video dimension requested when a subscription gives none. The SFU rejects a
+/// video or screen-share subscription without a dimension.
+pub(crate) const DEFAULT_VIDEO_DIMENSION: (u32, u32) = (1920, 1080);
 
 /// A precise subscription to one participant session and track kind.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -21,12 +28,13 @@ pub struct SubscriptionTarget {
     pub session_id: String,
     /// The remote track kind to receive.
     pub track_type: TrackType,
-    /// Optional preferred video dimensions sent as an SFU adaptation hint.
+    /// Preferred video dimensions sent as an SFU adaptation hint. `None`
+    /// requests 1920×1080 for video and screen-share.
     pub dimension: Option<(u32, u32)>,
 }
 
 impl SubscriptionTarget {
-    /// Subscribe to `track_type` from `session_id` using the SFU's default size.
+    /// Subscribe to `track_type` from `session_id`, at 1920×1080 for video.
     pub fn new(session_id: impl Into<String>, track_type: TrackType) -> Self {
         Self {
             session_id: session_id.into(),
@@ -43,78 +51,136 @@ impl SubscriptionTarget {
     }
 }
 
-/// Which remote track kinds to subscribe to.
-///
-/// Reactive: the call subscribes to every matching track published by every
-/// other participant, and updates as participants publish/unpublish.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SubscriptionConfig {
-    /// Subscribe to remote audio.
-    pub audio: bool,
-    /// Subscribe to remote video.
-    pub video: bool,
-    /// Subscribe to remote screen-share (video + audio).
-    pub screen_share: bool,
-    /// Preferred video dimension hint sent to the SFU (width, height).
-    pub video_dimension: Option<(u32, u32)>,
+/// The subscription rule for a group of participants.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrackSubscriptionConfig {
+    /// The remote track kinds to receive.
+    pub track_types: Vec<TrackType>,
+    /// Preferred camera video dimension (width, height), sent to the SFU as an
+    /// adaptation hint.
+    pub video_dimension: (u32, u32),
+    /// Preferred screen-share dimension (width, height), sent to the SFU as an
+    /// adaptation hint.
+    pub screenshare_dimension: (u32, u32),
 }
 
-impl Default for SubscriptionConfig {
-    /// Audio-only — the backend-bot default (matches stream-py's usual path).
+impl Default for TrackSubscriptionConfig {
+    /// No track kinds, 1920×1080 for video and screen-share.
     fn default() -> Self {
         Self {
-            audio: true,
-            video: false,
-            screen_share: false,
-            video_dimension: None,
+            track_types: Vec::new(),
+            video_dimension: DEFAULT_VIDEO_DIMENSION,
+            screenshare_dimension: DEFAULT_VIDEO_DIMENSION,
         }
     }
 }
 
+/// Which remote tracks to subscribe to.
+///
+/// Reactive: the call subscribes to the matching tracks of every other
+/// participant, and updates as participants join, leave, change, and publish.
+/// The default subscribes to nothing.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SubscriptionConfig {
+    /// The rule for a participant whose roles have no rule in `role_filters`.
+    pub default: TrackSubscriptionConfig,
+    /// Rules by participant role. The first role of the participant that has a
+    /// rule selects it.
+    pub role_filters: HashMap<String, TrackSubscriptionConfig>,
+    /// The maximum number of subscribed tracks.
+    pub max_subscriptions: Option<usize>,
+}
+
 impl SubscriptionConfig {
-    /// Subscribe to audio from all participants (the default).
+    /// Subscribe to audio from all participants.
     pub fn audio_all() -> Self {
-        Self::default()
+        Self {
+            default: TrackSubscriptionConfig {
+                track_types: vec![TrackType::Audio],
+                ..Default::default()
+            },
+            ..Default::default()
+        }
     }
 
     /// Subscribe to audio and video from all participants.
     pub fn audio_video() -> Self {
         Self {
-            audio: true,
-            video: true,
-            video_dimension: Some((1280, 720)),
-            ..Self::default()
+            default: TrackSubscriptionConfig {
+                track_types: vec![TrackType::Audio, TrackType::Video],
+                ..Default::default()
+            },
+            ..Default::default()
         }
     }
 
-    /// Subscribe to audio, video, and screen-share.
+    /// Subscribe to audio, video, screen-share, and screen-share audio.
     pub fn all() -> Self {
         Self {
-            audio: true,
-            video: true,
-            screen_share: true,
-            video_dimension: Some((1280, 720)),
+            default: TrackSubscriptionConfig {
+                track_types: vec![
+                    TrackType::Audio,
+                    TrackType::Video,
+                    TrackType::ScreenShare,
+                    TrackType::ScreenShareAudio,
+                ],
+                ..Default::default()
+            },
+            ..Default::default()
         }
     }
 
     /// Subscribe to nothing (unsubscribe from all).
     pub fn none() -> Self {
-        Self {
-            audio: false,
-            video: false,
-            screen_share: false,
-            video_dimension: None,
-        }
+        Self::default()
     }
 
-    /// Whether this policy subscribes to `track_type`.
-    pub fn matches(&self, track_type: TrackType) -> bool {
-        match track_type {
-            TrackType::Audio => self.audio,
-            TrackType::Video => self.video,
-            TrackType::ScreenShare | TrackType::ScreenShareAudio => self.screen_share,
-            TrackType::Unspecified => false,
+    /// The subscriptions to the tracks of `participants`, in their order, except
+    /// the tracks in `unsubscribed`.
+    pub(crate) fn track_subscriptions<'a>(
+        &self,
+        participants: impl IntoIterator<Item = &'a models::Participant>,
+        unsubscribed: &HashSet<TrackKey>,
+    ) -> Vec<signal::TrackSubscriptionDetails> {
+        let mut tracks = Vec::new();
+        for participant in participants {
+            let rule = self.rule_for(participant);
+            for &published in &participant.published_tracks {
+                let Ok(track_type) = TrackType::try_from(published) else {
+                    continue;
+                };
+                if !rule.track_types.contains(&track_type)
+                    || unsubscribed
+                        .contains(&TrackKey::new(participant.session_id.clone(), track_type))
+                {
+                    continue;
+                }
+                let dimension = match track_type {
+                    TrackType::Video => Some(rule.video_dimension),
+                    TrackType::ScreenShare => Some(rule.screenshare_dimension),
+                    _ => None,
+                };
+                tracks.push(signal::TrackSubscriptionDetails {
+                    user_id: participant.user_id.clone(),
+                    session_id: participant.session_id.clone(),
+                    track_type: published,
+                    dimension: dimension
+                        .map(|(width, height)| models::VideoDimension { width, height }),
+                });
+            }
         }
+        if let Some(max) = self.max_subscriptions {
+            tracks.truncate(max);
+        }
+        tracks
+    }
+
+    fn rule_for(&self, participant: &models::Participant) -> &TrackSubscriptionConfig {
+        participant
+            .roles
+            .iter()
+            .find_map(|role| self.role_filters.get(role))
+            .unwrap_or(&self.default)
     }
 }
 
@@ -138,27 +204,150 @@ impl TrackKey {
 mod tests {
     use super::*;
 
-    #[test]
-    fn default_is_audio_only() {
-        let c = SubscriptionConfig::default();
-        assert!(c.matches(TrackType::Audio));
-        assert!(!c.matches(TrackType::Video));
-        assert!(!c.matches(TrackType::ScreenShare));
+    fn participant(
+        session_id: &str,
+        roles: &[&str],
+        published: &[TrackType],
+    ) -> models::Participant {
+        models::Participant {
+            user_id: format!("user-{session_id}"),
+            session_id: session_id.to_owned(),
+            roles: roles.iter().map(|role| (*role).to_owned()).collect(),
+            published_tracks: published
+                .iter()
+                .map(|track_type| *track_type as i32)
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    fn subscribed(
+        config: &SubscriptionConfig,
+        participants: &[models::Participant],
+    ) -> Vec<(String, TrackType)> {
+        config
+            .track_subscriptions(participants, &HashSet::new())
+            .into_iter()
+            .map(|track| (track.session_id.clone(), track.track_type()))
+            .collect()
+    }
+
+    fn rule(track_types: &[TrackType]) -> TrackSubscriptionConfig {
+        TrackSubscriptionConfig {
+            track_types: track_types.to_vec(),
+            ..Default::default()
+        }
     }
 
     #[test]
-    fn audio_video_opts_in_video() {
-        let c = SubscriptionConfig::audio_video();
-        assert!(c.matches(TrackType::Audio));
-        assert!(c.matches(TrackType::Video));
-        assert!(!c.matches(TrackType::ScreenShare));
+    fn a_role_rule_replaces_the_default_rule() {
+        let config = SubscriptionConfig {
+            default: rule(&[TrackType::Audio]),
+            role_filters: HashMap::from([("host".to_owned(), rule(&[TrackType::Video]))]),
+            ..Default::default()
+        };
+        let both = [TrackType::Audio, TrackType::Video];
+        let participants = [
+            participant("host", &["host"], &both),
+            participant("guest", &["user"], &both),
+        ];
+
+        assert_eq!(
+            subscribed(&config, &participants),
+            [
+                ("host".to_owned(), TrackType::Video),
+                ("guest".to_owned(), TrackType::Audio),
+            ]
+        );
     }
 
     #[test]
-    fn none_matches_nothing() {
-        let c = SubscriptionConfig::none();
-        assert!(!c.matches(TrackType::Audio));
-        assert!(!c.matches(TrackType::Video));
+    fn the_first_role_of_the_participant_with_a_rule_wins() {
+        let config = SubscriptionConfig {
+            role_filters: HashMap::from([
+                ("admin".to_owned(), rule(&[TrackType::Audio])),
+                ("host".to_owned(), rule(&[TrackType::Video])),
+            ]),
+            ..Default::default()
+        };
+        let both = [TrackType::Audio, TrackType::Video];
+        let participants = [
+            participant("a", &["user", "host", "admin"], &both),
+            participant("b", &["admin", "host"], &both),
+        ];
+
+        assert_eq!(
+            subscribed(&config, &participants),
+            [
+                ("a".to_owned(), TrackType::Video),
+                ("b".to_owned(), TrackType::Audio),
+            ]
+        );
+    }
+
+    #[test]
+    fn video_and_screen_share_get_their_own_dimensions() {
+        let config = SubscriptionConfig {
+            default: TrackSubscriptionConfig {
+                track_types: vec![TrackType::Audio, TrackType::Video, TrackType::ScreenShare],
+                video_dimension: (640, 360),
+                screenshare_dimension: (2560, 1440),
+            },
+            ..Default::default()
+        };
+        let presenter = participant(
+            "presenter",
+            &[],
+            &[
+                TrackType::Audio,
+                TrackType::Video,
+                TrackType::ScreenShare,
+                TrackType::ScreenShareAudio,
+            ],
+        );
+
+        let dimensions: Vec<_> = config
+            .track_subscriptions(&[presenter], &HashSet::new())
+            .into_iter()
+            .map(|track| {
+                let dimension = track.dimension.map(|d| (d.width, d.height));
+                (track.track_type(), dimension)
+            })
+            .collect();
+
+        assert_eq!(
+            dimensions,
+            [
+                (TrackType::Audio, None),
+                (TrackType::Video, Some((640, 360))),
+                (TrackType::ScreenShare, Some((2560, 1440))),
+            ]
+        );
+    }
+
+    #[test]
+    fn the_limit_keeps_the_first_tracks_in_participant_order() {
+        let config = SubscriptionConfig {
+            max_subscriptions: Some(2),
+            ..SubscriptionConfig::audio_all()
+        };
+        let participants = ["c", "a", "b"].map(|id| participant(id, &[], &[TrackType::Audio]));
+        let first = |tracks: Vec<signal::TrackSubscriptionDetails>| {
+            tracks
+                .into_iter()
+                .map(|track| track.session_id)
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(
+            first(config.track_subscriptions(&participants, &HashSet::new())),
+            ["c", "a"]
+        );
+        let unsubscribed = HashSet::from([TrackKey::new("c", TrackType::Audio)]);
+        assert_eq!(
+            first(config.track_subscriptions(&participants, &unsubscribed)),
+            ["a", "b"]
+        );
     }
 
     #[test]

@@ -23,12 +23,17 @@ pub(super) struct CallStateCache {
     pub(super) started_at: Option<prost_types::Timestamp>,
     pub(super) e2ee_enabled: bool,
     pub(super) current_grants: Option<models::CallGrants>,
+    /// Set by the first report of the call end.
+    pub(super) ended: bool,
+    /// The local session id of the last join response.
+    pub(super) local_session_id: String,
 }
 
 impl RtcCore {
     /// A snapshot of the participants currently known in the call (including this
-    /// session), built from the SFU participant state. Updated as
-    /// `ParticipantJoined` / `ParticipantLeft` events arrive.
+    /// session), built from the SFU participant state, in the order the call
+    /// learned about them. Updated as `ParticipantJoined` / `ParticipantLeft`
+    /// events arrive.
     pub fn participants(&self) -> Vec<RemoteParticipant> {
         let participants = self.participants.lock().unwrap_or_else(|e| e.into_inner());
         participants
@@ -84,7 +89,8 @@ impl RtcCore {
     }
 
     /// Replace the participants from an authoritative SFU join response when
-    /// its lifecycle generation is still active.
+    /// its lifecycle generation is still active, and report the participants
+    /// that joined, changed, or left since the previous join response.
     pub(super) fn apply_join_call_state_if_current(
         &self,
         generation: u64,
@@ -98,19 +104,36 @@ impl RtcCore {
         }
         let state = call_state.unwrap_or_default();
         let joined = state.participants.clone();
-        *self
-            .call_state
-            .lock()
-            .unwrap_or_else(|error| error.into_inner()) = CallStateCache {
-            participant_count: state.participant_count.unwrap_or_default(),
-            pins: state.pins,
-            started_at: state.started_at,
-            e2ee_enabled: state.e2ee_enabled,
-            current_grants: None,
-        };
-        {
+        let previous_session_id = std::mem::replace(
+            &mut *self
+                .call_state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()),
+            CallStateCache {
+                participant_count: state.participant_count.unwrap_or_default(),
+                pins: state.pins,
+                started_at: state.started_at,
+                e2ee_enabled: state.e2ee_enabled,
+                current_grants: None,
+                ended: false,
+                local_session_id: session_id.to_owned(),
+            },
+        )
+        .local_session_id;
+        let mut previous = {
             let mut participants = self.participants.lock().unwrap_or_else(|e| e.into_inner());
-            participants.clear();
+            let previous = std::mem::take(&mut *participants);
+            // Known participants keep the order in which the call learned them.
+            let current: HashSet<&str> = joined
+                .iter()
+                .map(|participant| participant.session_id.as_str())
+                .chain([session_id])
+                .collect();
+            for id in previous.keys() {
+                if current.contains(id.as_str()) {
+                    participants.insert(id.clone(), ParticipantState::default());
+                }
+            }
             let me = participants.entry(session_id.to_owned()).or_default();
             me.user_id = user_id.to_owned();
             me.session_id = session_id.to_owned();
@@ -136,12 +159,40 @@ impl RtcCore {
                     .published
                     .extend(participant.published_tracks.iter().copied());
             }
-        }
+            previous
+        };
+        // The local sessions, before and after a REJOIN, produce no events.
+        let is_local = |id: &str| id == session_id || id == previous_session_id;
         for participant in joined {
-            if participant.session_id != session_id {
+            let known = previous.shift_remove(&participant.session_id);
+            if is_local(&participant.session_id) {
+                continue;
+            }
+            let event = match known {
+                None => SfuCallEvent::ParticipantJoined(participant),
+                Some(ParticipantState {
+                    participant: mut known,
+                    ..
+                }) => {
+                    // Their own SFU events report these fields, not
+                    // `ParticipantUpdated`.
+                    known.audio_level = participant.audio_level;
+                    known.is_speaking = participant.is_speaking;
+                    known.connection_quality = participant.connection_quality;
+                    known.is_dominant_speaker = participant.is_dominant_speaker;
+                    if known == participant {
+                        continue;
+                    }
+                    SfuCallEvent::ParticipantUpdated(participant)
+                }
+            };
+            let _ = self.sfu_events_tx.send(event);
+        }
+        for (id, entry) in previous {
+            if !is_local(&id) {
                 let _ = self
-                    .events_tx
-                    .send(CallEvent::ParticipantJoined(participant));
+                    .sfu_events_tx
+                    .send(SfuCallEvent::ParticipantLeft(entry.participant));
             }
         }
         true
@@ -168,7 +219,7 @@ impl RtcCore {
         self.participants
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .remove(session_id);
+            .shift_remove(session_id);
     }
 
     /// Record a newly-published track for a participant, learning the
@@ -262,11 +313,16 @@ impl RtcCore {
         }
     }
 
-    pub(super) fn update_participant_count(&self, participant_count: models::ParticipantCount) {
-        self.call_state
+    /// Returns whether the stored count changed.
+    pub(super) fn update_participant_count(
+        &self,
+        participant_count: models::ParticipantCount,
+    ) -> bool {
+        let mut state = self
+            .call_state
             .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .participant_count = participant_count;
+            .unwrap_or_else(|error| error.into_inner());
+        std::mem::replace(&mut state.participant_count, participant_count) != participant_count
     }
 
     pub(super) fn update_pins(&self, pins: Vec<models::Pin>) {

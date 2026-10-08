@@ -3,8 +3,7 @@
 use super::*;
 use crate::client::ClientConfig;
 use crate::rtc::{
-    ClientPublishOptions, LocalAudioTrack, LocalVideoTrack, LocalVideoTrackConfig,
-    PreferredVideoCodec, publish_options::H264_FMTP,
+    ClientPublishOptions, LocalAudioTrack, LocalVideoTrack, PcmFrame, PreferredVideoCodec,
 };
 use std::io::{Read, Write};
 use std::net::TcpListener;
@@ -162,6 +161,13 @@ async fn fake_sfu(
 /// A local coordinator WebSocket that sends `connection.ok`. It returns the
 /// REST base URL and a task that ends when the client socket closes.
 async fn fake_coordinator() -> (String, tokio::task::JoinHandle<()>) {
+    fake_coordinator_sending(Vec::new()).await
+}
+
+/// [`fake_coordinator`] that also sends `events` after `connection.ok`.
+async fn fake_coordinator_sending(
+    events: Vec<serde_json::Value>,
+) -> (String, tokio::task::JoinHandle<()>) {
     use futures_util::{SinkExt, StreamExt};
     use tokio_tungstenite::tungstenite::Message;
 
@@ -187,6 +193,12 @@ async fn fake_coordinator() -> (String, tokio::task::JoinHandle<()>) {
             ))
             .await
             .expect("send connection.ok");
+        for event in events {
+            socket
+                .send(Message::Text(event.to_string().into()))
+                .await
+                .expect("send coordinator event");
+        }
         while let Some(Ok(_)) = socket.next().await {}
     });
     (format!("ws://{address}"), server)
@@ -236,6 +248,21 @@ async fn establish_fake(
     (connection, sfu)
 }
 
+/// The event loop context of the current `connection`.
+fn event_context(core: &Arc<RtcCore>, connection: &Connection) -> EventLoopContext {
+    EventLoopContext {
+        core: core.clone(),
+        subscriber: connection.subscriber.clone(),
+        publisher: connection.publisher.clone(),
+        signal: connection.signal.clone(),
+        session_id: connection.session_id.clone(),
+        pending_ice: connection.pending_ice.clone(),
+        generation: connection.generation,
+        ws_healthy: connection.ws_healthy.clone(),
+        reconnect_enabled: connection.reconnect_enabled.clone(),
+    }
+}
+
 /// The event loop context of `connection` after a migration detached it.
 fn detached_context(core: &Arc<RtcCore>, connection: &Connection) -> EventLoopContext {
     connection.reconnect_enabled.store(false, Ordering::SeqCst);
@@ -261,23 +288,23 @@ fn preferred_codec(core: &RtcCore, generation: u64) -> Option<models::Codec> {
 }
 
 #[test]
-fn pre_join_h264_preference_builds_canonical_join_option() {
+fn pre_join_vp8_preference_builds_canonical_join_option() {
     let core = test_core();
     core.update_publish_options(ClientPublishOptions {
-        preferred_codec: Some(PreferredVideoCodec::H264),
+        preferred_codec: Some(PreferredVideoCodec::Vp8),
     });
     let generation = core.begin_join().expect("join generation");
 
-    let codec = preferred_codec(&core, generation).expect("H264 preference");
-    assert_eq!(codec.name, "H264");
-    assert_eq!(codec.fmtp, H264_FMTP);
+    let codec = preferred_codec(&core, generation).expect("VP8 preference");
+    assert_eq!(codec.name, "VP8");
+    assert_eq!(codec.fmtp, "");
 }
 
 #[test]
 fn update_after_join_starts_has_no_effect() {
     let core = test_core();
     core.update_publish_options(ClientPublishOptions {
-        preferred_codec: Some(PreferredVideoCodec::H264),
+        preferred_codec: Some(PreferredVideoCodec::Vp8),
     });
     let generation = core.begin_join().expect("join generation");
     assert!(core.set_state_if_current(generation, CallingState::Joined));
@@ -286,8 +313,8 @@ fn update_after_join_starts_has_no_effect() {
         preferred_codec: Some(PreferredVideoCodec::Vp9),
     });
 
-    let codec = preferred_codec(&core, generation).expect("active H264 preference");
-    assert_eq!(codec.name, "H264");
+    let codec = preferred_codec(&core, generation).expect("active VP8 preference");
+    assert_eq!(codec.name, "VP8");
 
     let leave_generation = core.cancel_generation();
     assert!(core.set_state_if_current(leave_generation, CallingState::Left));
@@ -300,15 +327,15 @@ fn update_after_join_starts_has_no_effect() {
 async fn publish_preference_persists_across_leave_and_rejoin() {
     let core = test_core();
     core.update_publish_options(ClientPublishOptions {
-        preferred_codec: Some(PreferredVideoCodec::H264),
+        preferred_codec: Some(PreferredVideoCodec::Vp8),
     });
     core.begin_join().expect("first generation");
     core.leave("test leave").await.expect("leave");
     let second = core.begin_join().expect("second generation");
 
-    let codec = preferred_codec(&core, second).expect("retained H264 preference");
-    assert_eq!(codec.name, "H264");
-    assert_eq!(codec.fmtp, H264_FMTP);
+    let codec = preferred_codec(&core, second).expect("retained VP8 preference");
+    assert_eq!(codec.name, "VP8");
+    assert_eq!(codec.fmtp, "");
 
     core.leave("test reset").await.expect("second leave");
     core.update_publish_options(ClientPublishOptions::default());
@@ -366,6 +393,385 @@ async fn leave_tears_down_the_stored_connection() {
     let (active, spawned, completed) = core.runtime_task_snapshot();
     assert_eq!(active, 0);
     assert_eq!(spawned, completed);
+}
+
+#[tokio::test]
+async fn call_ended_from_the_coordinator_is_forwarded_and_leaves_the_call() {
+    let (coordinator_ws_url, _coordinator) = fake_coordinator_sending(vec![
+        json!({ "type": "call.ended", "call_cid": "default:test-call" }),
+    ])
+    .await;
+    let core = test_core_with_config(ClientConfig {
+        coordinator_ws_url,
+        ..ClientConfig::default()
+    });
+    let generation = prepare_joined_core(&core, "alice");
+    let (connection, sfu) = establish_fake(&core, generation).await;
+    *core.connection.lock().await = Some(connection);
+    let mut events = core.coordinator_events();
+    let token = core.current_user_token().expect("user token");
+
+    core.connect_coordinator_events(generation, &token, "alice")
+        .await
+        .expect("coordinator events");
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if let Ok(event) = events.recv().await
+                && event.event_type == "call.ended"
+            {
+                return;
+            }
+        }
+    })
+    .await
+    .expect("call.ended event");
+
+    wait_for(
+        Duration::from_secs(2),
+        || core.state() == CallingState::Left,
+        "the ended call is left",
+    )
+    .await;
+    let requests = requests_until_close(sfu).await;
+    assert!(requests.iter().any(|request| matches!(
+        request.request_payload,
+        Some(event::sfu_request::RequestPayload::LeaveCallRequest(_))
+    )));
+}
+
+#[tokio::test]
+async fn sfu_call_ended_is_forwarded_with_its_reason_and_leaves_once() {
+    let core = test_core();
+    let generation = prepare_joined_core(&core, "alice");
+    let (connection, sfu) = establish_fake(&core, generation).await;
+    let context = event_context(&core, &connection);
+    *core.connection.lock().await = Some(connection);
+    let mut events = core.sfu_events();
+
+    // Neither call yields, so the spawned leave cannot run between them.
+    for _ in 0..2 {
+        connection::handle_event(
+            &context,
+            sfu_event::EventPayload::CallEnded(event::CallEnded {
+                reason: models::CallEndedReason::Kicked as i32,
+            }),
+        )
+        .await
+        .expect("handle SFU call ended");
+    }
+
+    wait_for(
+        Duration::from_secs(2),
+        || core.state() == CallingState::Left,
+        "the ended call is left",
+    )
+    .await;
+    let mut forwarded = 0;
+    while let Ok(event) = events.try_recv() {
+        if matches!(
+            event,
+            SfuCallEvent::CallEnded {
+                reason: models::CallEndedReason::Kicked
+            }
+        ) {
+            forwarded += 1;
+        }
+    }
+    assert_eq!(forwarded, 2, "each SFU call_ended is forwarded");
+    let leaves = requests_until_close(sfu)
+        .await
+        .into_iter()
+        .filter(|request| {
+            matches!(
+                request.request_payload,
+                Some(event::sfu_request::RequestPayload::LeaveCallRequest(_))
+            )
+        })
+        .count();
+    assert_eq!(leaves, 1, "the call is left once");
+}
+
+#[tokio::test]
+async fn each_event_goes_only_to_the_stream_of_its_source() {
+    let core = test_core();
+    let generation = prepare_joined_core(&core, "alice");
+    let (connection, _sfu) = establish_fake(&core, generation).await;
+    let context = event_context(&core, &connection);
+    *core.connection.lock().await = Some(connection);
+    let mut sfu = core.sfu_events();
+    let mut client = core.client_events();
+    let mut coordinator = core.coordinator_events();
+
+    connection::handle_event(
+        &context,
+        sfu_event::EventPayload::PinsUpdated(event::PinsChanged::default()),
+    )
+    .await
+    .expect("handle pins");
+    assert!(core.set_state_if_current(generation, CallingState::Reconnecting));
+
+    assert!(matches!(sfu.try_recv(), Ok(SfuCallEvent::PinsUpdated(_))));
+    assert!(sfu.try_recv().is_err());
+    assert!(matches!(
+        client.try_recv(),
+        Ok(ClientCallEvent::CallingStateChanged(
+            CallingState::Reconnecting
+        ))
+    ));
+    assert!(client.try_recv().is_err());
+    assert!(coordinator.try_recv().is_err());
+}
+
+#[test]
+fn a_call_event_stream_keeps_the_configured_number_of_events() {
+    let core = test_core_with_config(ClientConfig {
+        call_event_capacity: 2,
+        ..ClientConfig::default()
+    });
+    let generation = core.begin_join().expect("test generation");
+    let mut events = core.client_events();
+    for state in [
+        CallingState::Joined,
+        CallingState::Reconnecting,
+        CallingState::Joined,
+    ] {
+        assert!(core.set_state_if_current(generation, state));
+    }
+
+    assert!(matches!(
+        events.try_recv(),
+        Err(broadcast::error::TryRecvError::Lagged(1))
+    ));
+}
+
+#[tokio::test]
+async fn track_events_report_the_track_type_cause_and_participant() {
+    let core = test_core();
+    let generation = prepare_joined_core(&core, "alice");
+    let (connection, _sfu) = establish_fake(&core, generation).await;
+    let context = event_context(&core, &connection);
+    *core.connection.lock().await = Some(connection);
+    let mut events = core.sfu_events();
+    let bob = models::Participant {
+        user_id: "bob".to_owned(),
+        session_id: "bob-session".to_owned(),
+        ..Default::default()
+    };
+
+    connection::handle_event(
+        &context,
+        sfu_event::EventPayload::TrackPublished(event::TrackPublished {
+            user_id: "bob".to_owned(),
+            session_id: "bob-session".to_owned(),
+            r#type: TrackType::Audio as i32,
+            participant: Some(bob.clone()),
+        }),
+    )
+    .await
+    .expect("handle track published");
+
+    let Ok(SfuCallEvent::TrackPublished {
+        track_type,
+        participant,
+        ..
+    }) = events.try_recv()
+    else {
+        panic!("expected a track published event");
+    };
+    assert_eq!(track_type, TrackType::Audio);
+    assert_eq!(participant.as_ref(), Some(&bob));
+
+    connection::handle_event(
+        &context,
+        sfu_event::EventPayload::TrackUnpublished(event::TrackUnpublished {
+            user_id: "bob".to_owned(),
+            session_id: "bob-session".to_owned(),
+            r#type: TrackType::Audio as i32,
+            cause: models::TrackUnpublishReason::Moderation as i32,
+            participant: Some(bob.clone()),
+        }),
+    )
+    .await
+    .expect("handle track unpublished");
+
+    let Ok(SfuCallEvent::TrackUnpublished {
+        track_type,
+        cause,
+        participant,
+        ..
+    }) = events.try_recv()
+    else {
+        panic!("expected a track unpublished event");
+    };
+    assert_eq!(track_type, TrackType::Audio);
+    assert_eq!(cause, models::TrackUnpublishReason::Moderation);
+    assert_eq!(participant, Some(bob));
+}
+
+#[tokio::test]
+async fn participant_count_event_is_sent_only_when_the_count_changes() {
+    let core = test_core();
+    let generation = prepare_joined_core(&core, "alice");
+    let (connection, _sfu) = establish_fake(&core, generation).await;
+    let context = event_context(&core, &connection);
+    *core.connection.lock().await = Some(connection);
+    let mut events = core.sfu_events();
+
+    for total in [2, 2, 3] {
+        connection::handle_event(
+            &context,
+            sfu_event::EventPayload::HealthCheckResponse(event::HealthCheckResponse {
+                participant_count: Some(models::ParticipantCount {
+                    total,
+                    anonymous: 0,
+                }),
+            }),
+        )
+        .await
+        .expect("handle health check response");
+    }
+
+    let mut totals = Vec::new();
+    while let Ok(event) = events.try_recv() {
+        if let SfuCallEvent::ParticipantCountChanged(count) = event {
+            totals.push(count.total);
+        }
+    }
+    assert_eq!(totals, vec![2, 3]);
+}
+
+#[tokio::test]
+async fn dropped_join_allows_a_new_join() {
+    let (coordinator_ws_url, coordinator) = fake_coordinator().await;
+    // Accepts connections but never answers, so the coordinator join call waits.
+    let silent = TcpListener::bind("127.0.0.1:0").expect("bind silent server");
+    let core = test_core_with_config(ClientConfig {
+        coordinator_ws_url,
+        base_url: format!("http://{}", silent.local_addr().expect("silent address")),
+        ..ClientConfig::default()
+    });
+    let token = crate::token::create_user_token(
+        b"test-secret",
+        "alice",
+        &crate::token::TokenOptions::default(),
+    )
+    .expect("test user token");
+    let mut data = JoinCallData::new("alice");
+    data.location = Some("test-location".to_owned());
+
+    let join = tokio::time::timeout(Duration::from_millis(500), core.join(token, data)).await;
+    assert!(join.is_err(), "join waits for the coordinator");
+
+    assert_eq!(core.state(), CallingState::Idle);
+    tokio::time::timeout(Duration::from_secs(2), coordinator)
+        .await
+        .expect("coordinator socket closed")
+        .expect("fake coordinator task");
+    core.begin_join().expect("a new join can start");
+}
+
+#[tokio::test]
+async fn dropped_leave_still_leaves_the_call() {
+    let core = test_core();
+    let generation = prepare_joined_core(&core, "alice");
+    let (connection, sfu) = establish_fake(&core, generation).await;
+    let (subscriber, publisher) = (connection.subscriber.clone(), connection.publisher.clone());
+    *core.connection.lock().await = Some(connection);
+    let connection_slot = core.connection.lock().await;
+
+    let leave = tokio::time::timeout(Duration::from_millis(50), core.leave("dropped leave")).await;
+    assert!(leave.is_err(), "leave waits for the connection lock");
+    drop(connection_slot);
+
+    assert_eq!(core.state(), CallingState::Left);
+    let requests = requests_until_close(sfu).await;
+    assert!(requests.iter().any(|request| matches!(
+        request.request_payload,
+        Some(event::sfu_request::RequestPayload::LeaveCallRequest(_))
+    )));
+    wait_for(
+        Duration::from_secs(2),
+        || {
+            subscriber.connection_state() == RTCPeerConnectionState::Closed
+                && publisher.connection_state() == RTCPeerConnectionState::Closed
+        },
+        "closed peer connections",
+    )
+    .await;
+    core.begin_join().expect("a new join can start");
+}
+
+#[tokio::test]
+async fn leave_stops_the_published_tracks() {
+    let core = test_core();
+    let generation = prepare_joined_core(&core, "alice");
+    let (connection, _sfu) = establish_fake(&core, generation).await;
+    *core.connection.lock().await = Some(connection);
+    let audio = LocalAudioTrack::opus().expect("opus track");
+    core.media
+        .lock()
+        .await
+        .begin_publish(LocalTrack::Audio(audio.clone()), 0);
+
+    core.leave("test leave").await.expect("leave");
+
+    let write = audio.write_pcm(PcmFrame::mono(vec![0; 960], 48_000)).await;
+    assert!(
+        matches!(write, Err(RtcError::IllegalState(_))),
+        "a track published before leave is stopped: {write:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_dropped_leave_keeps_the_tracks_of_a_later_join() {
+    let core = test_core();
+    prepare_joined_core(&core, "alice");
+    let connection_slot = core.connection.lock().await;
+    let leave = tokio::time::timeout(Duration::from_millis(50), core.leave("dropped leave")).await;
+    assert!(leave.is_err(), "leave waits for the connection lock");
+
+    core.begin_join().expect("a new join can start");
+    let audio = LocalAudioTrack::opus().expect("opus track");
+    core.media
+        .lock()
+        .await
+        .begin_publish(LocalTrack::Audio(audio.clone()), 0);
+    let (_, _, completed) = core.runtime_task_snapshot();
+    drop(connection_slot);
+    wait_for(
+        Duration::from_secs(2),
+        || core.runtime_task_snapshot().2 > completed,
+        "the leave task",
+    )
+    .await;
+
+    audio
+        .write_pcm(PcmFrame::mono(vec![0; 960], 48_000))
+        .await
+        .expect("the later join keeps its track");
+}
+
+#[tokio::test]
+async fn a_dropped_leave_keeps_the_connection_of_a_later_join() {
+    let core = test_core();
+    prepare_joined_core(&core, "alice");
+    let mut connection_slot = core.connection.lock().await;
+    let leave = tokio::time::timeout(Duration::from_millis(50), core.leave("dropped leave")).await;
+    assert!(leave.is_err(), "leave waits for the connection lock");
+
+    let generation = core.begin_join().expect("a new join can start");
+    let (connection, _sfu) = establish_fake(&core, generation).await;
+    *connection_slot = Some(connection);
+    let (_, _, completed) = core.runtime_task_snapshot();
+    drop(connection_slot);
+    wait_for(
+        Duration::from_secs(2),
+        || core.runtime_task_snapshot().2 > completed,
+        "the leave task",
+    )
+    .await;
+
+    assert!(core.connection.lock().await.is_some());
 }
 
 #[tokio::test]
@@ -577,6 +983,324 @@ async fn stale_coordinator_stop_keeps_the_current_coordinator() {
 }
 
 #[tokio::test]
+async fn published_audio_paces_from_the_first_connect_through_a_disconnect() {
+    let core = test_core();
+    let generation = prepare_joined_core(&core, "alice");
+    let (connection, _sfu) = establish_fake(&core, generation).await;
+    let publisher = connection.publisher.clone();
+    *core.connection.lock().await = Some(connection);
+    let audio = LocalAudioTrack::opus().expect("opus track");
+    publisher
+        .add_track(audio.webrtc_track())
+        .await
+        .expect("add track");
+    core.media
+        .lock()
+        .await
+        .begin_publish(LocalTrack::Audio(audio.clone()), 0);
+    // A second peer on the same track receives every paced packet.
+    let observer = peer::new_peer_connection(&[]).await.expect("observer");
+    observer
+        .add_track(audio.webrtc_track())
+        .await
+        .expect("add observed track");
+    let (observer_receiver, mut observed) = peer::connect_audio_receiver(&observer).await;
+    audio
+        .write_pcm(PcmFrame::mono(vec![0; 960], 48_000))
+        .await
+        .expect("write before the publisher connects");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), observed.recv())
+            .await
+            .is_err(),
+        "a publication takes no audio before the publisher connects"
+    );
+    let (receiver, _remote) = peer::connect_audio_receiver(&publisher).await;
+    let observed = tokio::time::timeout(Duration::from_secs(5), observed.recv())
+        .await
+        .expect("pacing starts when the publisher connects")
+        .expect("observed track");
+
+    publisher.close().await.expect("close publisher");
+    let (at_close, _) = observed.read_rtp().await.expect("observed packet");
+    let second_later = at_close.header.timestamp.wrapping_add(48_000);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let (packet, _) = observed.read_rtp().await.expect("observed packet");
+            if packet.header.timestamp.wrapping_sub(second_later) < u32::MAX / 2 {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("pacing continues after the publisher closes");
+
+    let _ = receiver.close().await;
+    let _ = observer_receiver.close().await;
+    let _ = observer.close().await;
+    core.leave("test cleanup").await.expect("leave");
+}
+
+#[tokio::test]
+async fn a_failed_publish_does_not_hold_the_track() {
+    let core = test_core();
+    let generation = prepare_joined_core(&core, "alice");
+    let (mut connection, _sfu) = establish_fake(&core, generation).await;
+    connection.publish_options = vec![models::PublishOption {
+        track_type: TrackType::Audio as i32,
+        codec: Some(models::Codec {
+            name: "opus".to_owned(),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }];
+    *core.connection.lock().await = Some(connection);
+    core.own_capabilities
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .insert("send-audio".to_owned());
+    let audio = LocalAudioTrack::opus().expect("opus track");
+
+    // The fake SFU has no SetPublisher endpoint.
+    core.publish(LocalTrack::Audio(audio.clone()))
+        .await
+        .expect_err("publish without SetPublisher");
+
+    let sender = peer::new_peer_connection(&[]).await.expect("sender");
+    sender
+        .add_track(audio.webrtc_track())
+        .await
+        .expect("add track");
+    let (receiver, mut remote) = peer::connect_audio_receiver(&sender).await;
+    audio
+        .write_pcm(PcmFrame::mono(vec![0; 960], 48_000))
+        .await
+        .expect("write");
+    tokio::time::timeout(Duration::from_secs(5), remote.recv())
+        .await
+        .expect("the track paces on its own PeerConnection")
+        .expect("remote track");
+    audio.stop();
+    let _ = sender.close().await;
+    let _ = receiver.close().await;
+    core.leave("test cleanup").await.expect("leave");
+}
+
+#[tokio::test]
+async fn a_stopped_simulcast_publication_is_not_replaced() {
+    let core = test_core();
+    let generation = prepare_joined_core(&core, "alice");
+    let (mut connection, _sfu) = establish_fake(&core, generation).await;
+    connection.publish_options = vec![models::PublishOption {
+        id: 1,
+        track_type: TrackType::ScreenShare as i32,
+        codec: Some(models::Codec {
+            name: "vp8".to_owned(),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }];
+    let stopped = LocalTrack::Video {
+        track: LocalVideoTrack::vp8_simulcast().expect("simulcast track"),
+        track_type: TrackType::ScreenShare,
+    };
+    let reader_tasks = crate::rtc::peer::publisher::add_transceiver_for_track(
+        &connection.publisher,
+        &stopped,
+        &connection.publish_options,
+    )
+    .await
+    .expect("simulcast transceiver");
+    *core.connection.lock().await = Some(connection);
+    core.own_capabilities
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .insert("screenshare".to_owned());
+    {
+        let mut media = core.media.lock().await;
+        media.begin_publish(stopped.clone(), 1);
+        media.retire(&stopped.track_id());
+    }
+    stopped.stop();
+
+    for track in [
+        LocalVideoTrack::vp8_simulcast().expect("new simulcast track"),
+        LocalVideoTrack::vp8().expect("new single-layer track"),
+    ] {
+        let result = core
+            .publish(LocalTrack::Video {
+                track,
+                track_type: TrackType::ScreenShare,
+            })
+            .await;
+        assert!(
+            matches!(
+                result,
+                Err(RtcError::SimulcastReplace {
+                    track_type: TrackType::ScreenShare
+                })
+            ),
+            "{result:?}"
+        );
+    }
+    for task in reader_tasks {
+        task.abort();
+    }
+    core.leave("test cleanup").await.expect("leave");
+}
+
+#[tokio::test]
+async fn only_the_latest_remote_track_unsubscribes_when_dropped_without_a_runtime() {
+    let core = test_core();
+    let generation = prepare_joined_core(&core, "alice");
+    let (connection, _sfu) = establish_fake(&core, generation).await;
+    let (epoch, reconnect_enabled) = (connection.epoch, connection.reconnect_enabled.clone());
+    *core.connection.lock().await = Some(connection);
+    let (remote_tx, remote_rx) = std::sync::mpsc::channel();
+    *core
+        .on_track_cb
+        .lock()
+        .unwrap_or_else(|error| error.into_inner()) = Some(Arc::new(move |remote| {
+        let _ = remote_tx.send(remote);
+    }));
+    let audio = LocalAudioTrack::opus().expect("opus track");
+    let sender = peer::new_peer_connection(&[]).await.expect("sender");
+    sender
+        .add_track(audio.webrtc_track())
+        .await
+        .expect("add track");
+    let (receiver, mut inbound) = peer::connect_audio_receiver(&sender).await;
+    audio.start_pacing().await;
+    let inbound = tokio::time::timeout(Duration::from_secs(5), inbound.recv())
+        .await
+        .expect("inbound track")
+        .expect("inbound track channel");
+    for _ in 0..2 {
+        core.clone().handle_incoming_track(
+            generation,
+            epoch,
+            reconnect_enabled.clone(),
+            inbound.clone(),
+            Arc::downgrade(&receiver),
+            None,
+        );
+    }
+    let stale = remote_rx.recv().expect("stale remote track");
+    let remote = remote_rx.recv().expect("latest remote track");
+    let key = TrackKey::new(remote.participant().session_id.clone(), remote.track_type());
+    let baseline = alive_tasks();
+
+    thread::spawn(move || drop(stale))
+        .join()
+        .expect("a drop without a runtime does not panic");
+    wait_for(
+        Duration::from_secs(2),
+        || alive_tasks() == baseline,
+        "the stale drop is handled",
+    )
+    .await;
+    assert!(
+        !core
+            .manual_unsub
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .contains(&key),
+        "a stale drop must not unsubscribe the latest track"
+    );
+
+    thread::spawn(move || drop(remote))
+        .join()
+        .expect("a drop without a runtime does not panic");
+
+    wait_for(
+        Duration::from_secs(2),
+        || {
+            core.manual_unsub
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .contains(&key)
+        },
+        "unsubscribe after the drop",
+    )
+    .await;
+    audio.stop();
+    let _ = sender.close().await;
+    let _ = receiver.close().await;
+    core.leave("test cleanup").await.expect("leave");
+}
+
+#[tokio::test]
+async fn a_dropped_track_is_delivered_again_only_after_it_is_published_again() {
+    let core = test_core();
+    let generation = prepare_joined_core(&core, "alice");
+    let (connection, _sfu) = establish_fake(&core, generation).await;
+    let (epoch, reconnect_enabled) = (connection.epoch, connection.reconnect_enabled.clone());
+    *core.connection.lock().await = Some(connection);
+    let (remote_tx, mut remote_rx) = tokio::sync::mpsc::unbounded_channel();
+    *core
+        .on_track_cb
+        .lock()
+        .unwrap_or_else(|error| error.into_inner()) = Some(Arc::new(move |remote| {
+        let _ = remote_tx.send(remote);
+    }));
+    let audio = LocalAudioTrack::opus().expect("opus track");
+    let sender = peer::new_peer_connection(&[]).await.expect("sender");
+    sender
+        .add_track(audio.webrtc_track())
+        .await
+        .expect("add track");
+    let (receiver, mut inbound) = peer::connect_audio_receiver(&sender).await;
+    audio.start_pacing().await;
+    let inbound = tokio::time::timeout(Duration::from_secs(5), inbound.recv())
+        .await
+        .expect("inbound track")
+        .expect("inbound track channel");
+    core.clone().handle_incoming_track(
+        generation,
+        epoch,
+        reconnect_enabled,
+        inbound,
+        Arc::downgrade(&receiver),
+        None,
+    );
+    let remote = remote_rx.recv().await.expect("remote track");
+    let session_id = remote.participant().session_id.clone();
+    // The SFU was asked to send the track.
+    *core
+        .active_subs
+        .lock()
+        .unwrap_or_else(|error| error.into_inner()) = vec![signal::TrackSubscriptionDetails {
+        session_id: session_id.clone(),
+        track_type: TrackType::Audio as i32,
+        ..Default::default()
+    }];
+
+    // The publisher keeps sending after the drop.
+    drop(remote);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(500), remote_rx.recv())
+            .await
+            .is_err(),
+        "a dropped live track does not come back"
+    );
+
+    core.add_published_track("bob", &session_id, TrackType::Audio as i32, None);
+    let again = tokio::time::timeout(Duration::from_secs(5), remote_rx.recv())
+        .await
+        .expect("the track is delivered again after the republish")
+        .expect("remote track");
+    tokio::time::timeout(Duration::from_secs(5), again.next_pcm())
+        .await
+        .expect("audio of the track delivered again")
+        .expect("pcm frame");
+
+    audio.stop();
+    let _ = sender.close().await;
+    let _ = receiver.close().await;
+    core.leave("test cleanup").await.expect("leave");
+}
+
+#[tokio::test]
 async fn detached_connection_ignores_publish_options_from_its_sfu() {
     let core = test_core();
     let generation = prepare_joined_core(&core, "alice");
@@ -731,7 +1455,7 @@ async fn leave_cancels_reconnect_task_before_next_generation() {
 fn state_events_arrive_in_the_order_of_the_state_changes() {
     let core = test_core();
     let generation = core.begin_join().expect("join generation");
-    let mut events = core.subscribe();
+    let mut events = core.client_events();
     let rounds = 20_000;
     let barrier = Arc::new(std::sync::Barrier::new(3));
     let workers = [CallingState::Joined, CallingState::Reconnecting].map(|state| {
@@ -750,10 +1474,8 @@ fn state_events_arrive_in_the_order_of_the_state_changes() {
         barrier.wait();
         barrier.wait();
         let mut last = None;
-        while let Ok(event) = events.try_recv() {
-            if let CallEvent::CallingStateChanged(state) = event {
-                last = Some(state);
-            }
+        while let Ok(ClientCallEvent::CallingStateChanged(state)) = events.try_recv() {
+            last = Some(state);
         }
         assert_eq!(last, Some(core.state()), "round {round}");
     }
@@ -766,14 +1488,16 @@ fn state_events_arrive_in_the_order_of_the_state_changes() {
 fn setting_the_same_state_again_sends_no_event() {
     let core = test_core();
     let generation = core.begin_join().expect("join generation");
-    let mut events = core.subscribe();
+    let mut events = core.client_events();
 
     assert!(core.set_state_if_current(generation, CallingState::Reconnecting));
     assert!(core.set_state_if_current(generation, CallingState::Reconnecting));
 
     assert!(matches!(
         events.try_recv(),
-        Ok(CallEvent::CallingStateChanged(CallingState::Reconnecting))
+        Ok(ClientCallEvent::CallingStateChanged(
+            CallingState::Reconnecting
+        ))
     ));
     assert!(events.try_recv().is_err());
 }
@@ -781,20 +1505,20 @@ fn setting_the_same_state_again_sends_no_event() {
 #[test]
 fn join_start_sends_joining() {
     let core = test_core();
-    let mut events = core.subscribe();
+    let mut events = core.client_events();
 
     core.begin_join().expect("join generation");
 
     assert!(matches!(
         events.try_recv(),
-        Ok(CallEvent::CallingStateChanged(CallingState::Joining))
+        Ok(ClientCallEvent::CallingStateChanged(CallingState::Joining))
     ));
 }
 
 #[tokio::test]
 async fn state_during_leave_matches_the_last_state_event() {
     let core = test_core();
-    let mut events = core.subscribe();
+    let mut events = core.client_events();
     core.begin_join().expect("join generation");
     let connection_slot = core.connection.lock().await;
     let generation = core.generation();
@@ -808,10 +1532,8 @@ async fn state_during_leave_matches_the_last_state_event() {
     .await;
 
     let mut last = None;
-    while let Ok(event) = events.try_recv() {
-        if let CallEvent::CallingStateChanged(state) = event {
-            last = Some(state);
-        }
+    while let Ok(ClientCallEvent::CallingStateChanged(state)) = events.try_recv() {
+        last = Some(state);
     }
     assert_eq!(last, Some(core.state()));
     drop(connection_slot);
@@ -1120,9 +1842,7 @@ async fn video_track_with_a_non_video_type_is_not_published() {
         .lock()
         .unwrap_or_else(|error| error.into_inner())
         .insert("send-video".to_owned());
-    let track =
-        LocalVideoTrack::h264_with_config(LocalVideoTrackConfig::default().server_managed())
-            .expect("video track");
+    let track = LocalVideoTrack::vp9_svc().expect("video track");
 
     let result = core
         .publish(LocalTrack::Video {
@@ -1199,6 +1919,7 @@ async fn stale_remote_track_drop_does_not_change_new_generation_subscriptions() 
             first,
             0,
             TrackKey::new("remote-session".to_owned(), TrackType::Audio),
+            0,
         )
         .await;
 
@@ -1227,6 +1948,93 @@ fn participant_refresh_replaces_published_track_state() {
     let entry = participants.get("session-a").expect("participant");
     assert_eq!(entry.published.len(), 1);
     assert!(entry.published.contains(&(TrackType::Audio as i32)));
+}
+
+#[tokio::test]
+async fn turning_incoming_video_off_and_on_keeps_the_video_dimension() {
+    let core = test_core();
+    let config = SubscriptionConfig {
+        default: crate::rtc::TrackSubscriptionConfig {
+            track_types: vec![TrackType::Video],
+            video_dimension: (640, 360),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    core.update_subscriptions(config.clone())
+        .await
+        .expect("update subscriptions");
+    core.set_incoming_video_enabled(false)
+        .await
+        .expect("video off");
+    core.set_incoming_video_enabled(true)
+        .await
+        .expect("video on");
+
+    assert_eq!(
+        *core.sub_config.lock().unwrap_or_else(|e| e.into_inner()),
+        config
+    );
+}
+
+#[test]
+fn a_join_response_keeps_the_order_of_known_participants() {
+    let core = test_core();
+    let generation = core.begin_join().expect("test generation");
+    let call_state = |session_ids: &[&str]| {
+        Some(models::CallState {
+            participants: session_ids
+                .iter()
+                .map(|session_id| models::Participant {
+                    user_id: format!("user-{session_id}"),
+                    session_id: (*session_id).to_owned(),
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        })
+    };
+    assert!(core.apply_join_call_state_if_current(
+        generation,
+        "me",
+        "me",
+        call_state(&["c", "a", "b"])
+    ));
+    assert!(core.apply_join_call_state_if_current(
+        generation,
+        "me",
+        "me",
+        call_state(&["d", "b", "a"])
+    ));
+
+    let order: Vec<_> = core
+        .participants()
+        .into_iter()
+        .map(|participant| participant.session_id)
+        .collect();
+    assert_eq!(order, ["me", "a", "b", "d"]);
+}
+
+#[test]
+fn participants_keep_the_order_in_which_the_call_learned_them() {
+    let core = test_core();
+    let participant = |session_id: &str, user_id: &str| models::Participant {
+        user_id: user_id.to_owned(),
+        session_id: session_id.to_owned(),
+        ..Default::default()
+    };
+    for session_id in ["h", "c", "f", "a", "g", "b", "e", "d"] {
+        core.upsert_participant(&participant(session_id, "user"));
+    }
+    core.remove_participant("f");
+    core.upsert_participant(&participant("c", "changed"));
+
+    let order: Vec<_> = core
+        .participants()
+        .into_iter()
+        .map(|participant| participant.session_id)
+        .collect();
+    assert_eq!(order, ["h", "c", "a", "g", "b", "e", "d"]);
 }
 
 #[test]
@@ -1291,6 +2099,257 @@ fn call_state_snapshot_combines_join_state_and_incremental_sfu_updates() {
 }
 
 #[test]
+fn every_call_event_has_its_stable_name() {
+    let sfu = [
+        (
+            SfuCallEvent::ParticipantJoined(models::Participant::default()),
+            "participant_joined",
+        ),
+        (
+            SfuCallEvent::ParticipantLeft(models::Participant::default()),
+            "participant_left",
+        ),
+        (
+            SfuCallEvent::ParticipantUpdated(models::Participant::default()),
+            "participant_updated",
+        ),
+        (
+            SfuCallEvent::TrackPublished {
+                user_id: String::new(),
+                session_id: String::new(),
+                track_type: TrackType::Audio,
+                participant: None,
+            },
+            "track_published",
+        ),
+        (
+            SfuCallEvent::TrackUnpublished {
+                user_id: String::new(),
+                session_id: String::new(),
+                track_type: TrackType::Audio,
+                cause: models::TrackUnpublishReason::UserMuted,
+                participant: None,
+            },
+            "track_unpublished",
+        ),
+        (
+            SfuCallEvent::DominantSpeakerChanged {
+                user_id: String::new(),
+                session_id: String::new(),
+            },
+            "dominant_speaker_changed",
+        ),
+        (
+            SfuCallEvent::AudioLevelChanged(Vec::new()),
+            "audio_level_changed",
+        ),
+        (
+            SfuCallEvent::ConnectionQualityChanged(Vec::new()),
+            "connection_quality_changed",
+        ),
+        (
+            SfuCallEvent::ParticipantCountChanged(models::ParticipantCount::default()),
+            "participant_count_changed",
+        ),
+        (SfuCallEvent::PinsUpdated(Vec::new()), "pins_updated"),
+        (
+            SfuCallEvent::InboundStateChanged(Vec::new()),
+            "inbound_state_notification",
+        ),
+        (
+            SfuCallEvent::PublishOptionsChanged {
+                publish_options: Vec::new(),
+                reason: String::new(),
+            },
+            "change_publish_options",
+        ),
+        (
+            SfuCallEvent::PublishQualityChanged(event::ChangePublishQuality::default()),
+            "change_publish_quality",
+        ),
+        (
+            SfuCallEvent::CallGrantsUpdated(event::CallGrantsUpdated::default()),
+            "call_grants_updated",
+        ),
+        (
+            SfuCallEvent::IceRestarted(PeerType::Subscriber),
+            "ice_restart",
+        ),
+        (
+            SfuCallEvent::Error(SfuJoinError::from_event(None, 0)),
+            "error",
+        ),
+        (
+            SfuCallEvent::CallEnded {
+                reason: models::CallEndedReason::Ended,
+            },
+            "call_ended",
+        ),
+    ];
+
+    for (event, name) in sfu {
+        assert_eq!(event.name(), name, "{event:?}");
+    }
+    assert_eq!(
+        ClientCallEvent::CallingStateChanged(CallingState::Joined).name(),
+        "calling_state_changed"
+    );
+}
+
+#[test]
+fn join_state_reports_only_the_participant_changes_since_the_last_join() {
+    let core = test_core();
+    let generation = core.begin_join().expect("join generation");
+    let mut events = core.sfu_events();
+    let participant = |user_id: &str, session_id: &str| models::Participant {
+        user_id: user_id.to_owned(),
+        session_id: session_id.to_owned(),
+        ..Default::default()
+    };
+    let call_state = |participants| {
+        Some(models::CallState {
+            participants,
+            ..Default::default()
+        })
+    };
+    let bob = participant("bob", "session-b");
+
+    assert!(core.apply_join_call_state_if_current(
+        generation,
+        "local-1",
+        "agent",
+        call_state(vec![
+            participant("agent", "local-1"),
+            participant("alice", "session-a"),
+            bob.clone(),
+        ]),
+    ));
+    // A REJOIN: the local session changes, alice left, bob changed, carol joined.
+    assert!(core.apply_join_call_state_if_current(
+        generation,
+        "local-2",
+        "agent",
+        call_state(vec![
+            participant("agent", "local-2"),
+            models::Participant {
+                name: "Bob".to_owned(),
+                ..bob
+            },
+            participant("carol", "session-c"),
+        ]),
+    ));
+
+    let mut reported = Vec::new();
+    while let Ok(event) = events.try_recv() {
+        match event {
+            SfuCallEvent::ParticipantJoined(p) => reported.push(("joined", p.session_id)),
+            SfuCallEvent::ParticipantUpdated(p) => reported.push(("updated", p.session_id)),
+            SfuCallEvent::ParticipantLeft(p) => reported.push(("left", p.session_id)),
+            _ => {}
+        }
+    }
+    assert_eq!(
+        reported,
+        [
+            ("joined", "session-a".to_owned()),
+            ("joined", "session-b".to_owned()),
+            ("updated", "session-b".to_owned()),
+            ("joined", "session-c".to_owned()),
+            ("left", "session-a".to_owned()),
+        ]
+    );
+}
+
+#[test]
+fn speaking_and_quality_events_do_not_mark_a_participant_updated_after_a_rejoin() {
+    let core = test_core();
+    let generation = core.begin_join().expect("join generation");
+    let mut events = core.sfu_events();
+    let bob = models::Participant {
+        user_id: "bob".to_owned(),
+        session_id: "session-b".to_owned(),
+        ..Default::default()
+    };
+    let call_state = || {
+        Some(models::CallState {
+            participants: vec![bob.clone()],
+            ..Default::default()
+        })
+    };
+
+    assert!(core.apply_join_call_state_if_current(generation, "local-1", "agent", call_state()));
+    core.update_audio_levels(&[event::AudioLevel {
+        user_id: "bob".to_owned(),
+        session_id: "session-b".to_owned(),
+        level: 0.37,
+        is_speaking: true,
+    }]);
+    core.update_connection_quality(&[event::ConnectionQualityInfo {
+        user_id: "bob".to_owned(),
+        session_id: "session-b".to_owned(),
+        connection_quality: models::ConnectionQuality::Excellent as i32,
+    }]);
+    core.update_dominant_speaker("session-b");
+    // A REJOIN: bob has not changed.
+    assert!(core.apply_join_call_state_if_current(generation, "local-2", "agent", call_state()));
+
+    let mut reported = Vec::new();
+    while let Ok(event) = events.try_recv() {
+        match event {
+            SfuCallEvent::ParticipantJoined(p) => reported.push(("joined", p.session_id)),
+            SfuCallEvent::ParticipantUpdated(p) => reported.push(("updated", p.session_id)),
+            SfuCallEvent::ParticipantLeft(p) => reported.push(("left", p.session_id)),
+            _ => {}
+        }
+    }
+    assert_eq!(reported, [("joined", "session-b".to_owned())]);
+}
+
+#[test]
+fn a_join_after_a_failed_join_reports_only_its_own_participants() {
+    let core = test_core();
+    let call_state = |user_id: &str, session_id: &str| {
+        Some(models::CallState {
+            participants: vec![models::Participant {
+                user_id: user_id.to_owned(),
+                session_id: session_id.to_owned(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        })
+    };
+    let failed = core.begin_join().expect("first join");
+    assert!(core.apply_join_call_state_if_current(
+        failed,
+        "local-1",
+        "agent",
+        call_state("alice", "session-a"),
+    ));
+    // The join fails after its join response.
+    assert!(core.set_state_if_current(failed, CallingState::Idle));
+
+    let mut events = core.sfu_events();
+    let generation = core.begin_join().expect("second join");
+    assert!(core.apply_join_call_state_if_current(
+        generation,
+        "local-2",
+        "agent",
+        call_state("bob", "session-b"),
+    ));
+
+    let mut reported = Vec::new();
+    while let Ok(event) = events.try_recv() {
+        match event {
+            SfuCallEvent::ParticipantJoined(p) => reported.push(("joined", p.session_id)),
+            SfuCallEvent::ParticipantUpdated(p) => reported.push(("updated", p.session_id)),
+            SfuCallEvent::ParticipantLeft(p) => reported.push(("left", p.session_id)),
+            _ => {}
+        }
+    }
+    assert_eq!(reported, [("joined", "session-b".to_owned())]);
+}
+
+#[test]
 fn mute_state_builder_deduplicates_track_types() {
     let first = LocalTrack::Audio(LocalAudioTrack::opus().expect("first audio track"));
     let second = LocalTrack::Audio(LocalAudioTrack::opus().expect("second audio track"));
@@ -1304,19 +2363,18 @@ fn mute_state_builder_deduplicates_track_types() {
 
 #[test]
 fn publish_quality_routes_by_option_id_and_track_type() {
-    let config = LocalVideoTrackConfig::default().server_managed();
     let first = LocalTrack::Video {
-        track: LocalVideoTrack::h264_with_config(config).expect("first layered track"),
-        track_type: TrackType::Video,
+        track: LocalVideoTrack::vp8_simulcast().expect("first layered track"),
+        track_type: TrackType::ScreenShare,
     };
     let second = LocalTrack::Video {
-        track: LocalVideoTrack::h264_with_config(config).expect("second layered track"),
-        track_type: TrackType::Video,
+        track: LocalVideoTrack::vp8_simulcast().expect("second layered track"),
+        track_type: TrackType::ScreenShare,
     };
     let option = models::PublishOption {
-        track_type: TrackType::Video as i32,
+        track_type: TrackType::ScreenShare as i32,
         codec: Some(models::Codec {
-            name: "H264".to_owned(),
+            name: "VP8".to_owned(),
             ..Default::default()
         }),
         bitrate: 1_200_000,
@@ -1336,7 +2394,7 @@ fn publish_quality_routes_by_option_id_and_track_type() {
 
     let matched = media.apply_publish_quality(&event::ChangePublishQuality {
         video_senders: vec![event::VideoSender {
-            track_type: TrackType::Video as i32,
+            track_type: TrackType::ScreenShare as i32,
             publish_option_id: 11,
             layers: vec![event::VideoLayerSetting {
                 name: "h".to_owned(),
@@ -1355,22 +2413,19 @@ fn publish_quality_routes_by_option_id_and_track_type() {
 }
 
 #[test]
-fn publish_quality_routes_to_vp9_without_mutating_an_h264_publication() {
-    let h264_track =
-        LocalVideoTrack::h264_with_config(LocalVideoTrackConfig::default().server_managed())
-            .expect("layered H264");
-    let vp9_track = LocalVideoTrack::vp9_svc().expect("VP9 SVC");
-    let h264 = LocalTrack::Video {
-        track: h264_track,
-        track_type: TrackType::Video,
+fn publish_quality_routes_to_vp9_without_mutating_a_vp8_publication() {
+    let vp8 = LocalTrack::Video {
+        track: LocalVideoTrack::vp8_simulcast().expect("layered VP8"),
+        track_type: TrackType::ScreenShare,
     };
+    let vp9_track = LocalVideoTrack::vp9_svc().expect("VP9 SVC");
     let vp9 = LocalTrack::Video {
         track: vp9_track.clone(),
         track_type: TrackType::Video,
     };
-    let option = |id, codec: &str| models::PublishOption {
+    let option = |id, track_type: TrackType, codec: &str| models::PublishOption {
         id,
-        track_type: TrackType::Video as i32,
+        track_type: track_type as i32,
         codec: Some(models::Codec {
             name: codec.to_owned(),
             ..Default::default()
@@ -1385,13 +2440,13 @@ fn publish_quality_routes_to_vp9_without_mutating_an_h264_publication() {
         }),
         ..Default::default()
     };
-    h264.configure_for_publish(&option(10, "H264"))
-        .expect("H264 plan");
-    vp9.configure_for_publish(&option(11, "VP9"))
+    vp8.configure_for_publish(&option(10, TrackType::ScreenShare, "VP8"))
+        .expect("VP8 plan");
+    vp9.configure_for_publish(&option(11, TrackType::Video, "VP9"))
         .expect("VP9 plan");
-    let h264_before = h264.video_layer_control_state("q").expect("H264 low layer");
+    let vp8_before = vp8.video_layer_control_state("q").expect("VP8 low layer");
     let mut media = MediaState::default();
-    media.begin_publish(h264.clone(), 10);
+    media.begin_publish(vp8.clone(), 10);
     media.begin_publish(vp9.clone(), 11);
 
     let matched = media.apply_publish_quality(&event::ChangePublishQuality {
@@ -1413,7 +2468,7 @@ fn publish_quality_routes_to_vp9_without_mutating_an_h264_publication() {
     });
 
     assert_eq!(matched, 1);
-    assert_eq!(h264.video_layer_control_state("q"), Some(h264_before));
+    assert_eq!(vp8.video_layer_control_state("q"), Some(vp8_before));
     assert_eq!(vp9_track.svc_mode(), Some((1, 2)));
     assert_eq!(
         vp9.video_layer_control_state("q"),
@@ -1511,9 +2566,8 @@ fn refreshed_vp9_publish_option_restores_cached_svc_quality() {
 fn refreshed_publish_options_preserve_pair_scoped_quality() {
     let audio = LocalTrack::Audio(LocalAudioTrack::opus().expect("audio track"));
     let video = LocalTrack::Video {
-        track: LocalVideoTrack::h264_with_config(LocalVideoTrackConfig::default().server_managed())
-            .expect("layered video"),
-        track_type: TrackType::Video,
+        track: LocalVideoTrack::vp8_simulcast().expect("layered video"),
+        track_type: TrackType::ScreenShare,
     };
     let options = vec![
         models::PublishOption {
@@ -1527,9 +2581,9 @@ fn refreshed_publish_options_preserve_pair_scoped_quality() {
         },
         models::PublishOption {
             id: 41,
-            track_type: TrackType::Video as i32,
+            track_type: TrackType::ScreenShare as i32,
             codec: Some(models::Codec {
-                name: "H264".to_owned(),
+                name: "VP8".to_owned(),
                 ..Default::default()
             }),
             bitrate: 1_200_000,
@@ -1551,7 +2605,7 @@ fn refreshed_publish_options_preserve_pair_scoped_quality() {
     assert_eq!(
         media.apply_publish_quality(&event::ChangePublishQuality {
             video_senders: vec![event::VideoSender {
-                track_type: TrackType::Video as i32,
+                track_type: TrackType::ScreenShare as i32,
                 publish_option_id: 41,
                 layers: vec![event::VideoLayerSetting {
                     name: "h".to_owned(),
@@ -1584,7 +2638,7 @@ fn refreshed_publish_options_preserve_pair_scoped_quality() {
     assert!(
         media
             .publish_quality
-            .contains_key(&(41, TrackType::Video as i32))
+            .contains_key(&(41, TrackType::ScreenShare as i32))
     );
     assert!(
         !media

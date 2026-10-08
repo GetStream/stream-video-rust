@@ -4,9 +4,7 @@ use std::sync::Arc;
 
 use serde_json::json;
 use webrtc::api::interceptor_registry::register_default_interceptors;
-use webrtc::api::media_engine::{
-    MIME_TYPE_H264, MIME_TYPE_OPUS, MIME_TYPE_VP8, MIME_TYPE_VP9, MediaEngine,
-};
+use webrtc::api::media_engine::{MIME_TYPE_OPUS, MIME_TYPE_VP8, MIME_TYPE_VP9, MediaEngine};
 use webrtc::api::{API, APIBuilder};
 use webrtc::ice_transport::ice_server::RTCIceServer;
 use webrtc::interceptor::registry::Registry;
@@ -23,19 +21,18 @@ use webrtc::sdp::extmap::{
 
 use crate::rtc::coordinator::IceServer;
 use crate::rtc::error::Result;
-use crate::rtc::publish_options::H264_FMTP;
 use crate::rtc::tracer::Tracer;
 
 const OPUS_PAYLOAD_TYPE: u8 = 111;
 const VP8_PAYLOAD_TYPE: u8 = 96;
 const VP9_PAYLOAD_TYPE: u8 = 98;
-const H264_PAYLOAD_TYPE: u8 = 125;
 
 /// Register exactly the codecs that the SDK can encode or decode.
 ///
 /// `MediaEngine::register_default_codecs` also advertises legacy audio, VP9
-/// profile 1, AV1, and HEVC. Negotiating any of those would deliver a track
-/// that the decoded [`RemoteTrack`](crate::rtc::RemoteTrack) APIs cannot consume.
+/// profile 1, H264, AV1, and HEVC. Negotiating any of those would deliver a
+/// track that the decoded [`RemoteTrack`](crate::rtc::RemoteTrack) APIs cannot
+/// consume.
 fn register_supported_codecs(media_engine: &mut MediaEngine) -> Result<()> {
     media_engine.register_codec(
         RTCRtpCodecParameters {
@@ -73,7 +70,6 @@ fn register_supported_codecs(media_engine: &mut MediaEngine) -> Result<()> {
     for (mime_type, payload_type, fmtp) in [
         (MIME_TYPE_VP8, VP8_PAYLOAD_TYPE, ""),
         (MIME_TYPE_VP9, VP9_PAYLOAD_TYPE, "profile-id=0"),
-        (MIME_TYPE_H264, H264_PAYLOAD_TYPE, H264_FMTP),
     ] {
         media_engine.register_codec(
             RTCRtpCodecParameters {
@@ -256,6 +252,86 @@ async fn build_generic_offer(
     Ok(offer.sdp)
 }
 
+/// Connect a receive-only audio peer to `sender` in this process, and return it
+/// with the channel of its inbound tracks. Returns when `sender` is connected.
+#[cfg(test)]
+pub(crate) async fn connect_audio_receiver(
+    sender: &RTCPeerConnection,
+) -> (
+    Arc<RTCPeerConnection>,
+    tokio::sync::mpsc::Receiver<Arc<webrtc::track::track_remote::TrackRemote>>,
+) {
+    connect_receiver(sender, RTPCodecType::Audio).await
+}
+
+/// [`connect_audio_receiver`] for a receive-only peer of `kind`.
+#[cfg(test)]
+pub(crate) async fn connect_receiver(
+    sender: &RTCPeerConnection,
+    kind: RTPCodecType,
+) -> (
+    Arc<RTCPeerConnection>,
+    tokio::sync::mpsc::Receiver<Arc<webrtc::track::track_remote::TrackRemote>>,
+) {
+    use std::time::Duration;
+    use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
+    use webrtc::rtp_transceiver::RTCRtpTransceiverInit;
+
+    // DTLS needs a process-default provider; `Call::join` installs it too.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let receiver = new_peer_connection(&[]).await.expect("receiver");
+    receiver
+        .add_transceiver_from_kind(
+            kind,
+            Some(RTCRtpTransceiverInit {
+                direction: RTCRtpTransceiverDirection::Recvonly,
+                send_encodings: vec![],
+            }),
+        )
+        .await
+        .expect("receive transceiver");
+    let (track_tx, track_rx) = tokio::sync::mpsc::channel(1);
+    receiver.on_track(Box::new(move |track, _, _| {
+        let track_tx = track_tx.clone();
+        Box::pin(async move {
+            let _ = track_tx.send(track).await;
+        })
+    }));
+
+    let offer = sender.create_offer(None).await.expect("offer");
+    let mut gathered = sender.gathering_complete_promise().await;
+    sender
+        .set_local_description(offer)
+        .await
+        .expect("set offer");
+    let _ = gathered.recv().await;
+    let offer = sender.local_description().await.expect("offer");
+    receiver
+        .set_remote_description(offer)
+        .await
+        .expect("apply offer");
+    let answer = receiver.create_answer(None).await.expect("answer");
+    let mut gathered = receiver.gathering_complete_promise().await;
+    receiver
+        .set_local_description(answer)
+        .await
+        .expect("set answer");
+    let _ = gathered.recv().await;
+    let answer = receiver.local_description().await.expect("answer");
+    sender
+        .set_remote_description(answer)
+        .await
+        .expect("apply answer");
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while sender.connection_state() != RTCPeerConnectionState::Connected {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("sender connects");
+    (receiver, track_rx)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -306,13 +382,13 @@ mod tests {
             );
         }
 
-        for supported in ["VP8/90000", "VP9/90000", "H264/90000"] {
+        for supported in ["VP8/90000", "VP9/90000"] {
             assert!(
                 video.contains(supported),
                 "missing supported video codec {supported}:\n{video}"
             );
         }
-        for unsupported in ["AV1/90000", "H265/90000"] {
+        for unsupported in ["H264/90000", "AV1/90000", "H265/90000"] {
             assert!(
                 !video.contains(unsupported),
                 "advertised unsupported video codec {unsupported}:\n{video}"

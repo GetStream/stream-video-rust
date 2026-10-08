@@ -841,40 +841,50 @@ impl Call {
     /// Mints a finite, call-CID-scoped user token internally from the server secret, runs the
     /// coordinator join, establishes the publisher/subscriber PeerConnections,
     /// and completes the SFU handshake. Illegal (typed error) if already
-    /// `JOINING`/`JOINED`. Observe participants via [`Call::subscribe`].
+    /// `JOINING`/`JOINED`. Observe participants via [`Call::sfu_events`].
     pub async fn join(&self, data: crate::rtc::JoinCallData) -> crate::rtc::RtcResult<()> {
-        let source = crate::rtc::client::UserTokenSource::ServerMinted {
-            client: self.client.clone(),
-            user_id: data.user_id.clone(),
-            call_cid: self.cid(),
-            expiration: INTERNAL_RTC_TOKEN_LIFETIME,
-        };
-        self.rtc.join_with_token_source(source, data).await
+        self.rtc().join(data).await
+    }
+
+    /// The participant session of this handle as an [`RtcCall`](crate::rtc::RtcCall).
+    /// Both share one session; its join mints the user token as [`Call::join`] does.
+    pub fn rtc(&self) -> crate::rtc::RtcCall {
+        crate::rtc::RtcCall::new(
+            self.rtc.clone(),
+            crate::rtc::client::UserTokenSource::ServerMinted {
+                client: self.client.clone(),
+                call_cid: self.cid(),
+                expiration: INTERNAL_RTC_TOKEN_LIFETIME,
+            },
+        )
     }
 
     /// Leave the call, closing the SFU connection and PeerConnections. Succeeds
-    /// from any state, including `JOINING`.
+    /// from any state, including `JOINING`. The published tracks stop; a later
+    /// join needs new tracks.
     pub async fn leave(&self) -> crate::rtc::RtcResult<()> {
         self.rtc.leave("user requested leave").await
     }
 
-    /// Subscribe to the typed SFU event stream (participant joined/left, tracks,
-    /// errors). Subscribe before or after [`Call::join`].
-    pub fn subscribe(&self) -> tokio::sync::broadcast::Receiver<crate::rtc::CallEvent> {
-        self.rtc.subscribe()
+    /// Subscribe to the events from the SFU (participant joined/left, tracks,
+    /// errors). A receiver gets only events sent after it subscribes. Subscribe
+    /// before [`Call::join`] to get the join events, or read [`Call::participants`].
+    pub fn sfu_events(&self) -> tokio::sync::broadcast::Receiver<crate::rtc::SfuCallEvent> {
+        self.rtc.sfu_events()
     }
 
-    /// Register a callback for typed call events.
-    pub fn on<F>(&self, callback: F) -> tokio::task::AbortHandle
-    where
-        F: Fn(crate::rtc::CallEvent) + Send + 'static,
-    {
-        self.rtc.on(callback)
+    /// Subscribe to the call-scoped coordinator events. A receiver gets only
+    /// events sent after it subscribes.
+    pub fn coordinator_events(
+        &self,
+    ) -> tokio::sync::broadcast::Receiver<crate::rtc::CoordinatorEvent> {
+        self.rtc.coordinator_events()
     }
 
-    /// Remove a callback registered with [`Call::on`].
-    pub fn off(&self, handler: &tokio::task::AbortHandle) {
-        self.rtc.off(handler);
+    /// Subscribe to the events that the SDK itself produces. See
+    /// [`RtcCore::client_events`](crate::rtc::RtcCore::client_events).
+    pub fn client_events(&self) -> tokio::sync::broadcast::Receiver<crate::rtc::ClientCallEvent> {
+        self.rtc.client_events()
     }
 
     /// The current calling state (`Idle` / `Joining` / `Joined` / …).
@@ -987,13 +997,18 @@ impl Call {
     /// Stop publishing a previously published track. The publisher keeps its
     /// transceiver in the negotiated envelope and signals the stop to the SFU
     /// via `UpdateMuteStates` (no publisher renegotiation), matching
-    /// `stream-video-js`.
+    /// `stream-video-js`. A new track of the same kind that is published later
+    /// takes over that transceiver. A simulcast track cannot do this
+    /// ([`RtcError::SimulcastReplace`](crate::rtc::RtcError::SimulcastReplace));
+    /// turn it off and on with [`mute_track`](Self::mute_track) and
+    /// [`unmute_track`](Self::unmute_track).
     pub async fn stop_publish(&self, track: crate::rtc::LocalTrack) -> crate::rtc::RtcResult<()> {
         self.rtc.stop_publish(track).await
     }
 
     /// Set the subscription policy and (re)send `UpdateSubscriptions`. The SFU
-    /// forwards no media until this is called; the default policy is audio-only.
+    /// forwards no media until this is called; `SubscriptionConfig::default()`
+    /// subscribes to nothing.
     pub async fn update_subscriptions(
         &self,
         config: crate::rtc::SubscriptionConfig,
@@ -1010,6 +1025,11 @@ impl Call {
     }
 
     /// Enable or disable incoming video from every remote participant.
+    ///
+    /// This adds or removes `TrackType::Video` in every rule of the current
+    /// [`SubscriptionConfig`](crate::rtc::SubscriptionConfig) and keeps the
+    /// other track types. The default config has no track types, so before an
+    /// `update_subscriptions` call, `true` subscribes to video only.
     pub async fn set_incoming_video_enabled(&self, enabled: bool) -> crate::rtc::RtcResult<()> {
         self.rtc.set_incoming_video_enabled(enabled).await
     }

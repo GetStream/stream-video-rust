@@ -14,9 +14,13 @@ use crate::client::{Client, ClientConfig, NetworkLimits};
 use crate::error::Result as CrateResult;
 use crate::token::{self, TokenOptions};
 
+use super::coordinator::ws::CoordinatorEvent;
 use super::error::{Result, RtcError};
-use super::join::{CallEvent, CallStateSnapshot, CallingState, JoinCallData, RtcCore};
+use super::join::{
+    CallStateSnapshot, CallingState, ClientCallEvent, JoinCallData, RtcCore, SfuCallEvent,
+};
 use super::proto::models::TrackType;
+use super::publish_options::ClientPublishOptions;
 use super::subscriptions::{SubscriptionConfig, SubscriptionTarget};
 use super::tracks::{LocalAudioTrack, LocalTrack, LocalVideoTrack, RemoteParticipant, RemoteTrack};
 
@@ -47,9 +51,9 @@ where
 pub(crate) enum UserTokenSource {
     Static(String),
     Provider(Arc<dyn TokenProvider>),
+    /// Mints a call-scoped token for the joining user from the API secret.
     ServerMinted {
         client: Arc<Client>,
-        user_id: String,
         call_cid: String,
         expiration: Duration,
     },
@@ -61,13 +65,11 @@ impl std::fmt::Debug for UserTokenSource {
             Self::Static(_) => f.debug_tuple("Static").field(&"<redacted>").finish(),
             Self::Provider(_) => f.debug_tuple("Provider").field(&"<provider>").finish(),
             Self::ServerMinted {
-                user_id,
                 call_cid,
                 expiration,
                 ..
             } => f
                 .debug_struct("ServerMinted")
-                .field("user_id", user_id)
                 .field("call_cid", call_cid)
                 .field("expiration", expiration)
                 .finish_non_exhaustive(),
@@ -82,12 +84,11 @@ impl UserTokenSource {
             Self::Provider(provider) => provider.load_token().await.map_err(RtcError::from)?,
             Self::ServerMinted {
                 client,
-                user_id,
                 call_cid,
                 expiration,
             } => token::create_user_token(
                 client.api_secret(),
-                user_id,
+                expected_user_id,
                 &TokenOptions {
                     expiration: Some(*expiration),
                     call_cids: Some(vec![call_cid.clone()]),
@@ -221,6 +222,18 @@ impl RtcClient {
         self
     }
 
+    /// A handle for `<call_type>:<call_id>` that is not joined yet. Register
+    /// callbacks and subscribe before [`RtcCall::join`] to get the join events
+    /// and tracks.
+    pub fn call(&self, call_type: impl Into<String>, call_id: impl Into<String>) -> RtcCall {
+        let core = RtcCore::new(self.client.clone(), call_type.into(), call_id.into());
+        core.set_disconnection_timeout(self.disconnection_timeout);
+        RtcCall {
+            core,
+            token_source: self.token_source.clone(),
+        }
+    }
+
     /// Join `<call_type>:<call_id>` and return a live [`RtcCall`] handle.
     pub async fn join(
         &self,
@@ -228,37 +241,63 @@ impl RtcClient {
         call_id: impl Into<String>,
         data: JoinCallData,
     ) -> Result<RtcCall> {
-        let core = RtcCore::new(self.client.clone(), call_type.into(), call_id.into());
-        core.set_disconnection_timeout(self.disconnection_timeout);
-        core.join_with_token_source(self.token_source.clone(), data)
-            .await?;
-        Ok(RtcCall { core })
+        let call = self.call(call_type, call_id);
+        call.join(data).await?;
+        Ok(call)
     }
 }
 
-/// A joined call handle from [`RtcClient::join`].
+/// A call handle from [`RtcClient::call`], [`RtcClient::join`], or
+/// [`Call::rtc`](crate::Call::rtc).
 #[derive(Clone)]
 pub struct RtcCall {
     core: Arc<RtcCore>,
+    token_source: UserTokenSource,
 }
 
 impl RtcCall {
-    /// Subscribe to the typed SFU event stream.
-    pub fn subscribe(&self) -> tokio::sync::broadcast::Receiver<CallEvent> {
-        self.core.subscribe()
+    pub(crate) fn new(core: Arc<RtcCore>, token_source: UserTokenSource) -> Self {
+        Self { core, token_source }
     }
 
-    /// Register a callback for typed call events.
-    pub fn on<F>(&self, callback: F) -> tokio::task::AbortHandle
-    where
-        F: Fn(CallEvent) + Send + 'static,
-    {
-        self.core.on(callback)
+    /// Join the call as an SFU participant with the user token of its client.
+    /// Illegal (typed error) if already `JOINING`/`JOINED`.
+    pub async fn join(&self, data: JoinCallData) -> Result<()> {
+        self.core
+            .join_with_token_source(self.token_source.clone(), data)
+            .await
     }
 
-    /// Remove a callback registered with [`Self::on`].
-    pub fn off(&self, handler: &tokio::task::AbortHandle) {
-        self.core.off(handler);
+    /// Set the maximum reconnect duration. Zero keeps reconnecting indefinitely.
+    pub fn set_disconnection_timeout(&self, timeout: Duration) {
+        self.core.set_disconnection_timeout(timeout);
+    }
+
+    /// Update publishing preferences for the next join generation.
+    ///
+    /// Call this before [`Self::join`]. Updates after joining starts emit a
+    /// warning and cannot affect the active join generation.
+    pub fn update_publish_options(&self, options: ClientPublishOptions) {
+        self.core.update_publish_options(options);
+    }
+
+    /// Subscribe to the events from the SFU. A receiver gets only events sent
+    /// after it subscribes. Subscribe before [`Self::join`] to get the join
+    /// events, or read [`Self::participants`] and [`Self::call_state`].
+    pub fn sfu_events(&self) -> tokio::sync::broadcast::Receiver<SfuCallEvent> {
+        self.core.sfu_events()
+    }
+
+    /// Subscribe to the call-scoped coordinator events. A receiver gets only
+    /// events sent after it subscribes.
+    pub fn coordinator_events(&self) -> tokio::sync::broadcast::Receiver<CoordinatorEvent> {
+        self.core.coordinator_events()
+    }
+
+    /// Subscribe to the events that the SDK itself produces. See
+    /// [`RtcCore::client_events`].
+    pub fn client_events(&self) -> tokio::sync::broadcast::Receiver<ClientCallEvent> {
+        self.core.client_events()
     }
 
     /// The current calling state.
@@ -339,7 +378,10 @@ impl RtcCall {
         self.core.stop_noise_cancellation().await
     }
 
-    /// Stop publishing a local media track.
+    /// Stop publishing a local media track. A new track of the same kind that
+    /// is published later takes over its sender, except for a simulcast track
+    /// ([`RtcError::SimulcastReplace`]); use [`mute_track`](Self::mute_track)
+    /// for that.
     pub async fn stop_publish(&self, track: LocalTrack) -> Result<()> {
         self.core.stop_publish(track).await
     }
@@ -358,11 +400,17 @@ impl RtcCall {
     }
 
     /// Enable or disable incoming video from every remote participant.
+    ///
+    /// This adds or removes `TrackType::Video` in every rule of the current
+    /// [`SubscriptionConfig`] and keeps the other track types. The default
+    /// config has no track types, so before an `update_subscriptions` call,
+    /// `true` subscribes to video only.
     pub async fn set_incoming_video_enabled(&self, enabled: bool) -> Result<()> {
         self.core.set_incoming_video_enabled(enabled).await
     }
 
-    /// Leave the call, closing the SFU connection and PeerConnections.
+    /// Leave the call, closing the SFU connection and PeerConnections. The
+    /// published tracks stop; a later join needs new tracks.
     pub async fn leave(&self) -> Result<()> {
         self.core.leave("user requested leave").await
     }
@@ -460,13 +508,13 @@ mod tests {
         );
         let source = UserTokenSource::ServerMinted {
             client: client.clone(),
-            user_id: "user".to_owned(),
             call_cid: "default:call".to_owned(),
             expiration: Duration::from_secs(600),
         };
 
         let token = source.load("user").await.expect("mint token");
         let claims = token::decode_token(client.api_secret(), &token).expect("verify token");
+        assert_eq!(claims.user_id, "user");
         assert_eq!(claims.call_cids, Some(vec!["default:call".to_owned()]));
         assert_eq!(
             claims.exp.zip(claims.iat).map(|(exp, iat)| exp - iat),

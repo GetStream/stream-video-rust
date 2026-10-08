@@ -42,20 +42,31 @@ impl RtcCore {
     }
 
     /// Enable or disable incoming video for every remote participant.
+    ///
+    /// This adds or removes `TrackType::Video` in every rule of the current
+    /// [`SubscriptionConfig`] and keeps the other track types. The default
+    /// config has no track types, so before an `update_subscriptions` call,
+    /// `true` subscribes to video only.
     pub async fn set_incoming_video_enabled(&self, enabled: bool) -> Result<()> {
-        let config = {
-            let mut config = self.sub_config.lock().unwrap_or_else(|e| e.into_inner());
-            config.video = enabled;
-            config.video_dimension = None;
-            *config
-        };
+        {
+            let mut guard = self.sub_config.lock().unwrap_or_else(|e| e.into_inner());
+            let config = &mut *guard;
+            for rule in std::iter::once(&mut config.default).chain(config.role_filters.values_mut())
+            {
+                rule.track_types
+                    .retain(|track_type| *track_type != TrackType::Video);
+                if enabled {
+                    rule.track_types.push(TrackType::Video);
+                }
+            }
+        }
         *self
             .manual_subscriptions
             .lock()
             .unwrap_or_else(|error| error.into_inner()) = None;
         self.subs_active.store(true, Ordering::SeqCst);
         self.recompute_subscriptions().await?;
-        tracing::debug!(enabled = config.video, "stream.rtc.incoming_video_updated");
+        tracing::debug!(enabled, "stream.rtc.incoming_video_updated");
         Ok(())
     }
 
@@ -85,7 +96,11 @@ impl RtcCore {
             }
         };
 
-        let config = *self.sub_config.lock().unwrap_or_else(|e| e.into_inner());
+        let config = self
+            .sub_config
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
         let targets = self
             .manual_subscriptions
             .lock()
@@ -116,41 +131,21 @@ impl RtcCore {
                         user_id: entry.user_id.clone(),
                         session_id: entry.session_id.clone(),
                         track_type: target.track_type as i32,
-                        dimension: target.dimension.and_then(|(width, height)| {
-                            is_video_type(target.track_type)
-                                .then_some(models::VideoDimension { width, height })
+                        dimension: is_video_type(target.track_type).then(|| {
+                            let (width, height) =
+                                target.dimension.unwrap_or(DEFAULT_VIDEO_DIMENSION);
+                            models::VideoDimension { width, height }
                         }),
                     });
                 }
             } else {
-                for entry in participants.values() {
-                    if entry.session_id == session_id {
-                        continue;
-                    }
-                    for &tt_i in &entry.published {
-                        let Ok(track_type) = TrackType::try_from(tt_i) else {
-                            continue;
-                        };
-                        if !config.matches(track_type)
-                            || manual.contains(&TrackKey::new(entry.session_id.clone(), track_type))
-                        {
-                            continue;
-                        }
-                        let dimension = if is_video_type(track_type) {
-                            config
-                                .video_dimension
-                                .map(|(width, height)| models::VideoDimension { width, height })
-                        } else {
-                            None
-                        };
-                        tracks.push(signal::TrackSubscriptionDetails {
-                            user_id: entry.user_id.clone(),
-                            session_id: entry.session_id.clone(),
-                            track_type: tt_i,
-                            dimension,
-                        });
-                    }
-                }
+                tracks = config.track_subscriptions(
+                    participants
+                        .values()
+                        .map(|entry| &entry.participant)
+                        .filter(|participant| participant.session_id != session_id),
+                    &manual,
+                );
             }
         }
         tracks.sort_by(|a, b| {
@@ -187,14 +182,15 @@ impl RtcCore {
     /// Correlate an inbound track to a participant, build a [`RemoteTrack`], and
     /// deliver it to the `on_track` callback. Called by the subscriber PC, which
     /// passes itself as `subscriber` so the track can send RTCP keyframe
-    /// requests.
-    pub(super) async fn handle_incoming_track(
+    /// requests. `first_packet` is a packet already read from `track`.
+    pub(super) fn handle_incoming_track(
         self: Arc<Self>,
         generation: u64,
         connection_epoch: u64,
         reconnect_enabled: Arc<AtomicBool>,
         track: Arc<TrackRemote>,
         subscriber: Weak<RTCPeerConnection>,
+        first_packet: Option<RtpPacket>,
     ) {
         if !self.is_generation_current(generation) || !reconnect_enabled.load(Ordering::SeqCst) {
             return;
@@ -230,35 +226,80 @@ impl RtcCore {
             return;
         }
         let key = TrackKey::new(participant.session_id.clone(), track_type);
+        let track_id = self.next_remote_track_id.fetch_add(1, Ordering::SeqCst);
+        self.delivered_tracks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(key.clone(), track_id);
         let weak = Arc::downgrade(&self);
+        let (kept_track, kept_subscriber) = (track.clone(), subscriber.clone());
+        // The caller can drop the track on a thread without a runtime.
+        let runtime = tokio::runtime::Handle::current();
         let on_drop = Box::new(move || {
             if let Some(core) = weak.upgrade() {
+                let _runtime = runtime.enter();
                 let task_core = core.clone();
                 std::mem::drop(core.spawn_generation_task(generation, async move {
-                    task_core
-                        .on_remote_track_dropped(generation, connection_epoch, key)
-                        .await;
+                    if task_core
+                        .clone()
+                        .on_remote_track_dropped(
+                            generation,
+                            connection_epoch,
+                            key.clone(),
+                            track_id,
+                        )
+                        .await
+                    {
+                        task_core
+                            .deliver_again_when_published(
+                                generation,
+                                connection_epoch,
+                                reconnect_enabled,
+                                key,
+                                kept_track,
+                                kept_subscriber,
+                            )
+                            .await;
+                    }
                 }));
             }
         });
-        let remote = RemoteTrack::new(track, participant, track_type, subscriber, on_drop);
+        let remote = RemoteTrack::new(
+            track,
+            participant,
+            track_type,
+            subscriber,
+            on_drop,
+            first_packet,
+        );
         cb(remote);
     }
 
-    /// The publisher dropped their inbound track handle → unsubscribe from it.
+    /// The consumer dropped their inbound track handle → unsubscribe from it.
+    /// Returns whether the dropped track was the latest one for its key.
     pub(super) async fn on_remote_track_dropped(
         self: Arc<Self>,
         generation: u64,
         connection_epoch: u64,
         key: TrackKey,
-    ) {
+        track_id: u64,
+    ) -> bool {
         {
             let connection = self.connection.lock().await;
             if !connection.as_ref().is_some_and(|current| {
                 current.generation == generation && current.epoch == connection_epoch
             }) {
-                return;
+                return false;
             }
+            let mut delivered = self
+                .delivered_tracks
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if delivered.get(&key) != Some(&track_id) {
+                return false;
+            }
+            delivered.remove(&key);
+            drop(delivered);
             self.manual_unsub
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
@@ -268,10 +309,68 @@ impl RtcCore {
             .is_connection_current(generation, connection_epoch)
             .await
         {
-            return;
+            return false;
         }
         if let Err(e) = self.recompute_subscriptions().await {
             tracing::debug!(error = %e, "stream.rtc.unsubscribe_on_drop_failed");
+        }
+        true
+    }
+
+    /// Read and drop the packets of a dropped track. When a packet arrives
+    /// after a republish subscribed the track again, deliver the track again
+    /// with that packet first: webrtc-rs fires `on_track` only once for each
+    /// receiver.
+    async fn deliver_again_when_published(
+        self: Arc<Self>,
+        generation: u64,
+        connection_epoch: u64,
+        reconnect_enabled: Arc<AtomicBool>,
+        key: TrackKey,
+        track: Arc<TrackRemote>,
+        subscriber: Weak<RTCPeerConnection>,
+    ) {
+        while let Ok((packet, _)) = track.read_rtp().await {
+            // A track that a new receiver delivered, or a new connection, ends
+            // the wait.
+            let replaced = self
+                .delivered_tracks
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains_key(&key);
+            if replaced
+                || !self
+                    .is_connection_current(generation, connection_epoch)
+                    .await
+            {
+                return;
+            }
+            // The drop set `manual_unsub`, and only a republish clears it.
+            let dropped = self
+                .manual_unsub
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains(&key);
+            let subscribed = !dropped
+                && self
+                    .active_subs
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .iter()
+                    .any(|details| {
+                        details.session_id == key.session_id && details.track_type == key.track_type
+                    });
+            if subscribed {
+                self.handle_incoming_track(
+                    generation,
+                    connection_epoch,
+                    reconnect_enabled,
+                    track,
+                    subscriber,
+                    Some(packet),
+                );
+                return;
+            }
         }
     }
 }

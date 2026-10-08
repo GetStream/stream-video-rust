@@ -63,9 +63,34 @@ impl RtcCore {
         };
         let mut publisher_rtcp_tasks = Vec::new();
         if status.is_none() {
-            publisher_rtcp_tasks =
-                match publisher::add_transceiver_for_track(&publisher, &track, &publish_options)
-                    .await
+            // Reuse the sender that `stop_publish` kept, as JS `replaceTrack`
+            // does: a second m-line for the same publish option fails the SFU
+            // negotiation.
+            if media
+                .retired(track.track_type(), publish_option_id)
+                .is_some_and(|retired| retired.is_simulcast() || track.is_simulcast())
+            {
+                return Err(RtcError::SimulcastReplace {
+                    track_type: track.track_type(),
+                });
+            }
+            let reader = match media.take_retired(track.track_type(), publish_option_id) {
+                Some(retired) => {
+                    publisher::replace_retired_track(&publisher, &retired, &track, &publish_options)
+                        .await?
+                }
+                None => None,
+            };
+            let reused = reader.is_some();
+            if let Some(reader) = reader {
+                self.register_publisher_tasks(vec![reader]).await;
+            } else {
+                publisher_rtcp_tasks = match publisher::add_transceiver_for_track(
+                    &publisher,
+                    &track,
+                    &publish_options,
+                )
+                .await
                 {
                     Ok(tasks) => tasks,
                     Err(error) => {
@@ -77,7 +102,11 @@ impl RtcCore {
                         return Err(error);
                     }
                 };
+            }
             media.begin_publish(track.clone(), publish_option_id);
+            if reused {
+                media.set_status(&track_id, PublicationStatus::PendingPublishMute);
+            }
             if let Some(layers) = media
                 .publish_quality
                 .get(&(publish_option_id, track.track_type() as i32))
@@ -123,7 +152,9 @@ impl RtcCore {
             .user_id
             .clone();
         self.add_published_track(&user_id, &session_id, track.track_type() as i32, None);
-        track.start_media();
+        if publisher.connection_state() == RTCPeerConnectionState::Connected {
+            track.start_audio_pacing().await;
+        }
         signal
             .update_mute_states(signal::UpdateMuteStatesRequest {
                 session_id: session_id.clone(),
@@ -136,6 +167,26 @@ impl RtcCore {
         media.set_status(&track_id, PublicationStatus::Published);
         tracing::info!(cid = %self.cid(), "stream.rtc.published");
         Ok(())
+    }
+
+    /// End the hold of each new audio publication once the current publisher
+    /// connects, and start its pacing. Pacing continues through later
+    /// disconnects, so a reconnect adds no delay; stream-py `AudioStreamTrack`
+    /// also catches up after a gap.
+    pub(super) async fn start_audio_pacing_if_connected(&self) {
+        let media = self.media.lock().await;
+        let connected = self
+            .publisher_handles()
+            .await
+            .is_some_and(|(publisher, ..)| {
+                publisher.connection_state() == RTCPeerConnectionState::Connected
+            });
+        if !connected {
+            return;
+        }
+        for track in media.active_tracks() {
+            track.start_audio_pacing().await;
+        }
     }
 
     pub(super) async fn register_publisher_tasks(&self, tasks: Vec<JoinHandle<()>>) {
@@ -160,6 +211,8 @@ impl RtcCore {
     /// (`Invalid SetPublisher request; ... new track must have the same envelope as
     /// previous`), so removing the sole sender and renegotiating an empty envelope
     /// fails on the wire; muting the track type is the wire-correct way to stop.
+    /// A later [`Self::publish`] of the same kind and publish option puts its
+    /// track on the kept sender.
     pub async fn stop_publish(self: &Arc<Self>, track: LocalTrack) -> Result<()> {
         let mut media = self.media.lock().await;
         let track_id = track.track_id();
@@ -198,7 +251,7 @@ impl RtcCore {
         if muted {
             self.remove_published_track(&session_id, track_type as i32);
         }
-        if let Some(removed) = media.remove(&track_id) {
+        if let Some(removed) = media.retire(&track_id) {
             removed.stop();
         }
         Ok(())

@@ -4,8 +4,8 @@ use super::*;
 
 impl RtcCore {
     /// Re-publish every local track on the fresh publisher PC after a
-    /// REJOIN/MIGRATE. The tracks are the same `Arc`-backed handles, so the pacer
-    /// keeps running and simply binds to the new PeerConnection.
+    /// REJOIN/MIGRATE. The tracks are the same `Arc`-backed handles, so they bind
+    /// to the new PeerConnection and their pacing continues.
     pub(super) async fn restore_published_tracks(&self) -> Result<()> {
         let mut media = self.media.lock().await;
         let capabilities = self
@@ -103,7 +103,6 @@ impl RtcCore {
             } else {
                 self.add_published_track(&user_id, session_id, track.track_type() as i32, None);
             }
-            track.start_media();
         }
         Ok(())
     }

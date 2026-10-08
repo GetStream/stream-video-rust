@@ -132,7 +132,20 @@ pub enum RtcError {
         track_type: models::TrackType,
     },
 
-    /// A PCM write exceeded the track's low-latency queue. The newest samples
+    /// A stopped simulcast publication and a new track cannot share a sender:
+    /// webrtc-rs replaces the track only on a sender with one encoding. Turn a
+    /// simulcast track off and on with `mute_track` and `unmute_track` instead
+    /// of a stop.
+    #[error(
+        "a stopped {track_type:?} publication cannot change its track when either \
+         track is simulcast; use mute_track and unmute_track"
+    )]
+    SimulcastReplace {
+        /// Publication kind requested by the caller.
+        track_type: models::TrackType,
+    },
+
+    /// A PCM write exceeded the track's PCM queue capacity. The newest samples
     /// were retained and this many oldest samples were discarded.
     #[error(
         "pcm queue overflow: dropped {dropped_samples} oldest samples \
@@ -143,6 +156,16 @@ pub enum RtcError {
         dropped_samples: usize,
         /// Maximum number of resampled 48 kHz mono samples retained.
         capacity_samples: usize,
+    },
+
+    /// A PCM frame is not at the sample rate of the first frame. The frame was
+    /// not written.
+    #[error("pcm frame at {actual} Hz, the first frame was at {expected} Hz")]
+    PcmRateMismatch {
+        /// Sample rate of the first frame, in Hz.
+        expected: u32,
+        /// Sample rate of the rejected frame, in Hz.
+        actual: u32,
     },
 
     /// Token minting failed for the participant path.

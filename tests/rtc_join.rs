@@ -13,13 +13,13 @@ use std::time::Duration;
 use getstream::TokenOptions;
 use getstream::models::UserRequest;
 use getstream::models::{CallRequest, DeleteCallRequest, GetOrCreateCallRequest, MemberRequest};
-use getstream::rtc::{CallEvent, JoinCallData, RtcClient};
+use getstream::rtc::{CallingState, ClientCallEvent, JoinCallData, RtcClient, SfuCallEvent};
 use tokio::sync::broadcast::Receiver;
 
 /// Wait (up to `timeout`) for a `ParticipantJoined` whose `user_id` matches
 /// `other`. Returns `true` if observed.
 async fn observe_participant(
-    mut rx: Receiver<CallEvent>,
+    mut rx: Receiver<SfuCallEvent>,
     other: String,
     timeout: Duration,
 ) -> bool {
@@ -29,7 +29,7 @@ async fn observe_participant(
         tokio::select! {
             () = &mut deadline => return false,
             event = rx.recv() => match event {
-                Ok(CallEvent::ParticipantJoined(p)) if p.user_id == other => return true,
+                Ok(SfuCallEvent::ParticipantJoined(p)) if p.user_id == other => return true,
                 Ok(_) => continue,
                 // Lagged: keep waiting; the join event may still arrive.
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
@@ -96,11 +96,12 @@ async fn two_sessions_join_and_observe_each_other() {
     // The whole join/observe/leave dance must finish well within a minute.
     let outcome = tokio::time::timeout(Duration::from_secs(90), async {
         let call_a = client.video().call("default", &call_id);
-        let call_b = client.video().call("default", &call_id);
+        // Session B joins through the `RtcCall` view of a server-client call.
+        let call_b = client.video().call("default", &call_id).rtc();
 
         // Subscribe BEFORE joining so no participant event is missed.
-        let rx_a = call_a.subscribe();
-        let rx_b = call_b.subscribe();
+        let rx_a = call_a.sfu_events();
+        let rx_b = call_b.sfu_events();
 
         // Session A joins first.
         call_a
@@ -191,9 +192,11 @@ async fn provider_backed_client_loads_token_and_joins() {
 }
 
 /// Local decoding is not sufficient proof of authenticity: Stream must reject
-/// a validly shaped participant token whose HS256 signature was altered.
+/// a validly shaped participant token whose HS256 signature was altered. A
+/// valid pre-minted token joins a call handle made before the join, and a
+/// receiver subscribed before the join gets the join states.
 #[tokio::test]
-async fn participant_token_signature_is_enforced() {
+async fn preminted_token_client_gets_join_events_and_signature_is_enforced() {
     let Some(client) = common::client_or_skip() else {
         return;
     };
@@ -232,9 +235,22 @@ async fn participant_token_signature_is_enforced() {
     let outcome: Result<(), String> = tokio::time::timeout(Duration::from_secs(120), async {
         let allowed = RtcClient::new(client.api_key(), token)
             .map_err(|error| format!("build RTC client: {error}"))?
-            .join("default", &call_id, JoinCallData::new(&user_id))
+            .call("default", &call_id);
+        let mut events = allowed.client_events();
+        allowed
+            .join(JoinCallData::new(&user_id))
             .await
             .map_err(|error| format!("valid token failed to join: {error}"))?;
+        let mut states = Vec::new();
+        while let Ok(event) = events.try_recv() {
+            if let ClientCallEvent::CallingStateChanged(state) = event {
+                states.push(state);
+            }
+        }
+        if states != [CallingState::Joining, CallingState::Joined] {
+            let _ = allowed.leave().await;
+            return Err(format!("join states seen before the join: {states:?}"));
+        }
         allowed
             .leave()
             .await
