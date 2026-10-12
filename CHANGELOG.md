@@ -230,8 +230,9 @@ on `Call` (`get_call_participant_session_metrics`,
   48 kHz to 16 kHz, a 12 kHz tone came out at 4 kHz at full level.
   `write_pcm` runs the filter on a blocking thread, so a long frame does not
   stop the runtime or the pacer.
-- `LocalAudioTrack::flush` also drops the audio in the resampler. A flush during
-  a `write_pcm` can no longer put audio from before the flush in the queue.
+- `LocalAudioTrack::flush` also drops the audio in the resampler and the audio
+  of a `write_pcm` that started before the flush. It does not wait for a
+  `write_pcm` in progress.
 
 # v0.1.0-preview.2
 
