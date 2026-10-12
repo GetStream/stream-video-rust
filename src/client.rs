@@ -33,6 +33,7 @@ const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(55);
 const DEFAULT_MAX_CONNS_PER_HOST: usize = 5;
 const DEFAULT_CALL_EVENT_CAPACITY: usize = 256;
+const MAX_CALL_EVENT_CAPACITY: usize = 65_536;
 /// Default maximum body accepted from coordinator HTTP endpoints (16 MiB).
 pub const DEFAULT_MAX_RESPONSE_BODY_BYTES: usize = 16 * 1024 * 1024;
 /// Default maximum inbound SFU/coordinator WebSocket frame and message size (4 MiB).
@@ -124,7 +125,9 @@ pub struct ClientConfig {
     /// Events that each call event stream (`sfu_events`, `coordinator_events`,
     /// `client_events`) keeps for a slow receiver, rounded up to a power of two.
     /// A receiver that falls further behind loses the oldest events. Each call
-    /// allocates all slots. Must be at least 1. Default 256.
+    /// allocates all slots of the three streams: approximately 0.5 KiB for each
+    /// event of capacity, 30 MiB at the maximum. Must be between 1 and 65,536.
+    /// Default 256.
     pub call_event_capacity: usize,
 }
 
@@ -214,12 +217,12 @@ impl Client {
                 config.coordinator_ws_url
             )));
         }
-        // tokio broadcast channels panic outside this range.
-        if config.call_event_capacity == 0 || config.call_event_capacity > usize::MAX >> 1 {
+        // Each call allocates all slots of three broadcast channels when it is
+        // created. tokio panics on a capacity of 0.
+        if config.call_event_capacity == 0 || config.call_event_capacity > MAX_CALL_EVENT_CAPACITY {
             return Err(Error::Config(format!(
-                "call event capacity {} must be between 1 and {}",
-                config.call_event_capacity,
-                usize::MAX >> 1
+                "call event capacity {} must be between 1 and {MAX_CALL_EVENT_CAPACITY}",
+                config.call_event_capacity
             )));
         }
 
@@ -681,6 +684,19 @@ mod tests {
         };
         let error = Client::new("key".to_owned(), "secret".to_owned(), config)
             .expect_err("zero call event capacity");
+        assert!(matches!(error, Error::Config(_)));
+    }
+
+    #[test]
+    fn call_event_capacity_must_be_at_most_65_536() {
+        let config = |call_event_capacity| ClientConfig {
+            call_event_capacity,
+            ..ClientConfig::default()
+        };
+        Client::new("key".to_owned(), "secret".to_owned(), config(65_536))
+            .expect("maximum call event capacity");
+        let error = Client::new("key".to_owned(), "secret".to_owned(), config(65_537))
+            .expect_err("call event capacity above the maximum");
         assert!(matches!(error, Error::Config(_)));
     }
 
