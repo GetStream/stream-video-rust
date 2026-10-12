@@ -1220,6 +1220,72 @@ async fn a_failed_replace_keeps_the_stopped_sender_for_the_next_publish() {
 }
 
 #[tokio::test]
+async fn a_stopped_publication_is_not_replaced_by_a_track_with_other_layers() {
+    let core = test_core();
+    let generation = prepare_joined_core(&core, "alice");
+    let (mut connection, _sfu) = establish_fake(&core, generation).await;
+    connection.publish_options = vec![models::PublishOption {
+        id: 1,
+        track_type: TrackType::Video as i32,
+        codec: Some(models::Codec {
+            name: "vp9".to_owned(),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }];
+    let stopped = LocalTrack::Video {
+        track: LocalVideoTrack::vp9().expect("single-layer track"),
+        track_type: TrackType::Video,
+    };
+    let reader_tasks = crate::rtc::peer::publisher::add_transceiver_for_track(
+        &connection.publisher,
+        &stopped,
+        &connection.publish_options,
+    )
+    .await
+    .expect("video transceiver");
+    let publisher = connection.publisher.clone();
+    *core.connection.lock().await = Some(connection);
+    core.own_capabilities
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .insert("send-video".to_owned());
+    {
+        let mut media = core.media.lock().await;
+        media.begin_publish(stopped.clone(), 1);
+        media.retire(&stopped.track_id());
+    }
+    stopped.stop();
+
+    let result = core
+        .publish(LocalTrack::Video {
+            track: LocalVideoTrack::vp9_svc().expect("SVC track"),
+            track_type: TrackType::Video,
+        })
+        .await;
+
+    assert!(
+        matches!(
+            result,
+            Err(RtcError::SimulcastReplace {
+                track_type: TrackType::Video
+            })
+        ),
+        "{result:?}"
+    );
+    let mut sender_tracks = Vec::new();
+    for transceiver in publisher.get_transceivers().await {
+        let track = transceiver.sender().await.track().await;
+        sender_tracks.push(track.map(|track| track.id().to_owned()));
+    }
+    assert_eq!(sender_tracks, vec![Some(stopped.track_id())]);
+    for task in reader_tasks {
+        task.abort();
+    }
+    core.leave("test cleanup").await.expect("leave");
+}
+
+#[tokio::test]
 async fn only_the_latest_remote_track_unsubscribes_when_dropped_without_a_runtime() {
     let core = test_core();
     let generation = prepare_joined_core(&core, "alice");

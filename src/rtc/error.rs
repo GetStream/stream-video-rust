@@ -132,13 +132,15 @@ pub enum RtcError {
         track_type: models::TrackType,
     },
 
-    /// A stopped simulcast publication and a new track cannot share a sender:
-    /// webrtc-rs replaces the track only on a sender with one encoding. Turn a
-    /// simulcast track off and on with `mute_track` and `unmute_track` instead
-    /// of a stop.
+    /// A stopped publication and a new track cannot share a sender when either
+    /// track is simulcast or the two tracks have different layers: webrtc-rs
+    /// replaces the track only on a sender with one encoding, and the replace
+    /// sends no new layers to the SFU. Turn such a track off and on with
+    /// `mute_track` and `unmute_track` instead of a stop.
     #[error(
         "a stopped {track_type:?} publication cannot change its track when either \
-         track is simulcast; use mute_track and unmute_track"
+         track is simulcast or the tracks have different layers; use mute_track and \
+         unmute_track"
     )]
     SimulcastReplace {
         /// Publication kind requested by the caller.

@@ -998,7 +998,8 @@ impl Call {
     /// transceiver in the negotiated envelope and signals the stop to the SFU
     /// via `UpdateMuteStates` (no publisher renegotiation), matching
     /// `stream-video-js`. A new track of the same kind that is published later
-    /// takes over that transceiver. A simulcast track cannot do this
+    /// takes over that transceiver. A simulcast track, or a track with
+    /// different layers than the stopped track, cannot do this
     /// ([`RtcError::SimulcastReplace`](crate::rtc::RtcError::SimulcastReplace));
     /// turn it off and on with [`mute_track`](Self::mute_track) and
     /// [`unmute_track`](Self::unmute_track).
