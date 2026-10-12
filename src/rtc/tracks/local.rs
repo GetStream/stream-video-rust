@@ -7,8 +7,9 @@
 //! - [`LocalAudioTrack::write_pcm`] — raw [`PcmFrame`]s at the rate of the
 //!   first frame. Averaged to mono, resampled to 48 kHz, queued, and paced
 //!   into 20 ms Opus frames by a background task that
-//!   emits silence on starve (stream-py `AudioStreamTrack` pacing). Before
-//!   the silence, it takes the audio that the resampler still holds. Pacing
+//!   emits silence on starve (stream-py `AudioStreamTrack` pacing). After a
+//!   tick without a write, it takes the audio that the resampler still holds
+//!   before the silence. Pacing
 //!   starts at the first write, or at [`LocalAudioTrack::start_pacing`] when
 //!   [`LocalAudioTrackConfig::pace`] is off. A published track holds its queue
 //!   until the SFU publisher first connects and does not pause on a later
@@ -351,6 +352,9 @@ struct AudioInner {
     /// Locked before `pcm`. A writer keeps it until its audio is queued, so a
     /// flush cannot fall between the resample and the queue.
     resampler: StdMutex<StreamResampler>,
+    /// Set by `write_pcm` and cleared at each pacer tick. A resampler flush
+    /// makes the next write start with silence.
+    pcm_written: AtomicBool,
     encoder: StdMutex<opus::Encoder>,
     pacer: StdMutex<Option<JoinHandle<()>>>,
     pacer_started: AtomicBool,
@@ -366,10 +370,11 @@ struct AudioInner {
 }
 
 impl AudioInner {
-    /// Fill `frame` from the queue and then with silence. A queue shorter than
-    /// `frame` first gets the audio that the resampler still holds, so the end
-    /// of the written audio plays without a gap. While a write holds the
-    /// resampler, the pacer does not wait and takes no such audio.
+    /// Fill `frame` from the queue and then with silence. When no write came
+    /// since the last tick, a queue shorter than `frame` first gets the audio
+    /// that the resampler still holds, so the end of the written audio plays.
+    /// While a write holds the resampler, the pacer does not wait and takes no
+    /// such audio.
     fn take_pcm(&self, frame: &mut [i16]) {
         let mut buf = self.pcm.lock().unwrap_or_else(|e| e.into_inner());
         if buf.len() < frame.len() {
@@ -381,6 +386,7 @@ impl AudioInner {
             };
             buf = self.pcm.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(mut resampler) = resampler
+                && !self.pcm_written.load(Ordering::SeqCst)
                 && buf.len() < frame.len()
             {
                 match resampler.flush() {
@@ -398,6 +404,7 @@ impl AudioInner {
                 }
             }
         }
+        self.pcm_written.store(false, Ordering::SeqCst);
         for slot in frame.iter_mut() {
             *slot = buf.pop_front().unwrap_or(0);
         }
@@ -542,6 +549,7 @@ impl LocalAudioTrack {
                 pcm: StdMutex::new(VecDeque::new()),
                 pcm_capacity_samples,
                 resampler: StdMutex::new(StreamResampler::new(OPUS_SAMPLE_RATE, 1)),
+                pcm_written: AtomicBool::new(false),
                 encoder: StdMutex::new(encoder),
                 pacer: StdMutex::new(None),
                 pacer_started: AtomicBool::new(false),
@@ -563,9 +571,9 @@ impl LocalAudioTrack {
     /// pacing when [`LocalAudioTrackConfig::pace`] is set (the default);
     /// otherwise [`start_pacing`](Self::start_pacing) does. While pacing runs, a
     /// background task emits one Opus packet every 20 ms, writing silence when
-    /// the buffer runs dry. Before the silence, it takes the audio that the
-    /// resampler still holds (8 ms at 16 kHz), so the end of the written audio
-    /// plays without the next write. This method
+    /// the buffer runs dry. After a tick without a write, it takes the audio
+    /// that the resampler still holds (8 ms at 16 kHz) before the silence, so
+    /// the end of the written audio plays without the next write. This method
     /// does not backpressure a producer: overflow drops the oldest queued
     /// samples and retains the newest audio. [`flush`](Self::flush) still drops
     /// all unsent samples immediately for barge-in.
@@ -607,6 +615,7 @@ impl LocalAudioTrack {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
             let resampled = r.push(&frame)?.samples;
+            track.inner.pcm_written.store(true, Ordering::SeqCst);
             Ok(track.queue_pcm(resampled))
         })
         .await
@@ -2410,23 +2419,60 @@ mod tests {
     #[tokio::test]
     async fn the_end_of_the_written_audio_leaves_no_silence_in_the_queue() {
         let track = unpaced_track();
-        let tone_5ms = (0..80)
+        let tone_25ms = (0..400)
             .map(|index| {
                 let time = index as f64 / 16_000.0;
                 (12_000.0 * (std::f64::consts::TAU * 440.0 * time).sin()) as i16
             })
             .collect();
         track
-            .write_pcm(PcmFrame::mono(tone_5ms, 16_000))
+            .write_pcm(PcmFrame::mono(tone_25ms, 16_000))
             .await
             .expect("write_pcm");
 
+        track.inner.take_pcm(&mut vec![0; FRAME_SAMPLES_20MS]);
         track.inner.take_pcm(&mut vec![0; FRAME_SAMPLES_20MS]);
 
         let queue = track.inner.pcm.lock().unwrap_or_else(|e| e.into_inner());
         assert!(queue.is_empty(), "{} samples of silence wait", queue.len());
         drop(queue);
         track.stop();
+    }
+
+    #[tokio::test]
+    async fn pcm_written_in_real_time_plays_without_a_gap() {
+        for rate in [16_000, 24_000, 44_100, 48_000] {
+            let track = unpaced_track();
+            let tone: Vec<i16> = (0..rate * 7 / 100)
+                .map(|index| {
+                    let time = f64::from(index) / f64::from(rate);
+                    (10_000.0 * (std::f64::consts::TAU * 1_000.0 * time).sin()) as i16
+                })
+                .collect();
+            let mut frame = vec![0; FRAME_SAMPLES_20MS];
+            let mut played = Vec::new();
+
+            for (index, samples) in tone.chunks(rate as usize / 100).enumerate() {
+                track
+                    .write_pcm(PcmFrame::mono(samples.to_vec(), rate))
+                    .await
+                    .expect("write_pcm");
+                // The first write starts the pacer, and its first tick comes at
+                // once. Each later tick comes after two 10 ms writes.
+                if index % 2 == 0 {
+                    track.inner.take_pcm(&mut frame);
+                    played.extend_from_slice(&frame);
+                }
+            }
+
+            assert!(
+                played[FRAME_SAMPLES_20MS..]
+                    .chunks(48)
+                    .all(|window| peak(window) > 5_000),
+                "the audio has a gap at {rate} Hz"
+            );
+            track.stop();
+        }
     }
 
     #[tokio::test]
