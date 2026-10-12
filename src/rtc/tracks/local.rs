@@ -2561,8 +2561,8 @@ mod tests {
                     .write_pcm(PcmFrame::mono(samples.to_vec(), rate))
                     .await
                     .expect("write_pcm");
-                // The first write starts the pacer, and its first tick comes at
-                // once. Each later tick comes after two 10 ms writes.
+                // The test acts as the pacer: the first tick comes at once after
+                // the first write, and each later tick after two 10 ms writes.
                 if index % 2 == 0 {
                     track.inner.take_pcm(&mut frame);
                     played.extend_from_slice(&frame);
