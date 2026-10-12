@@ -122,12 +122,14 @@ its audio for the next write. A track at 48 kHz holds no audio.
 ### Pacing control for PCM tracks
 
 `LocalAudioTrackConfig::pace` (default `true`) starts pacing at the first
-`write_pcm`, as before. With `with_pace(false)`, `write_pcm` only queues until
-`LocalAudioTrack::start_pacing`; `pause_pacing` stops pacing and keeps the
-queue. A `pause_pacing` before the first `write_pcm` stays in force until
-`start_pacing`. `Call::publish_audio` holds the queue of a new publication
-until the SFU publisher first connects, so the audio written before the
-connect is not lost.
+`write_pcm` after a negotiated PeerConnection can send the track. Until then,
+the queue keeps the written audio. Before, the pacer sent that audio to a track
+with no sender, and the audio was lost. With `with_pace(false)`, `write_pcm`
+only queues until `LocalAudioTrack::start_pacing`; `pause_pacing` stops pacing
+and keeps the queue. A `pause_pacing` before the first `write_pcm` stays in
+force until `start_pacing`. `Call::publish_audio` holds the queue of a new
+publication until the SFU publisher first connects, so the audio written
+before the publish or the connect is not lost.
 Pacing does not pause on a later disconnect: audio written during an outage is
 lost, and a reconnect adds no delay.
 
