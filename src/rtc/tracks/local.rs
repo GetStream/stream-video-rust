@@ -460,6 +460,8 @@ impl AudioInner {
     /// While a write holds the resampler, the pacer does not wait and takes no
     /// such audio.
     fn take_pcm(&self, frame: &mut [i16]) {
+        // A write that sets the flag after this point counts for the next tick.
+        let written = self.pcm_written.swap(false, Ordering::SeqCst);
         let mut buf = self.pcm.lock().unwrap_or_else(|e| e.into_inner());
         if buf.len() < frame.len() {
             drop(buf);
@@ -470,7 +472,7 @@ impl AudioInner {
             };
             buf = self.pcm.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(mut resampler) = resampler
-                && !self.pcm_written.load(Ordering::SeqCst)
+                && !written
                 && buf.len() < frame.len()
             {
                 match resampler.flush() {
@@ -488,7 +490,6 @@ impl AudioInner {
                 }
             }
         }
-        self.pcm_written.store(false, Ordering::SeqCst);
         for slot in frame.iter_mut() {
             *slot = buf.pop_front().unwrap_or(0);
         }
