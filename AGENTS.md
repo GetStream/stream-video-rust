@@ -16,6 +16,8 @@ UI are out of scope unless the task explicitly expands the project.
 - Never inspect, modify, or commit `.env`, credentials, generated secrets, or
   logs containing tokens. `.env.example` is the public configuration reference.
 
+- Use /tdd skill when introducing new features or fixes to the codebase.
+
 ## Rust and async expectations
 
 - Ensure [rust-skills](https://github.com/leonardomso/rust-skills) is available
