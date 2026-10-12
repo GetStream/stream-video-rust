@@ -1901,19 +1901,20 @@ fn encode_layer_packets(
         None => true,
     };
     if needs_new {
-        let prior_vp9_packetizer = guard.as_ref().and_then(|state| match &state.codec {
-            VideoCodecState::Vp9Svc { packetizer, .. } => Some(packetizer.clone()),
-            VideoCodecState::Vpx { .. } => None,
+        // The picture IDs continue on the same SSRC (RFC 7741, RFC 9628).
+        let prior_packetizer = guard.as_ref().map(|state| match &state.codec {
+            VideoCodecState::Vp9Svc { packetizer, .. }
+            | VideoCodecState::Vpx { packetizer, .. } => packetizer.clone(),
         });
         let codec = match (codec_id, svc_mode) {
             (VpxCodec::Vp9, Some(mode)) => VideoCodecState::Vp9Svc {
                 encoder: VpxSvcEncoder::new(width, height, bitrate_kbps, mode)?,
-                packetizer: prior_vp9_packetizer
+                packetizer: prior_packetizer
                     .unwrap_or_else(|| VpxRtpPacketizer::new(VpxCodec::Vp9)),
             },
             (codec, None) => VideoCodecState::Vpx {
                 encoder: VpxEncoder::new(codec, width, height, bitrate_kbps)?,
-                packetizer: VpxRtpPacketizer::new(codec),
+                packetizer: prior_packetizer.unwrap_or_else(|| VpxRtpPacketizer::new(codec)),
             },
             (VpxCodec::Vp8, Some(_)) => {
                 return Err(RtcError::Media(
@@ -3685,6 +3686,31 @@ mod tests {
             0,
             "reconfigured key picture must carry a new scalability structure"
         );
+    }
+
+    #[test]
+    fn a_single_layer_track_keeps_its_picture_ids_across_a_size_change() {
+        let picture_id = |payload: &[u8], offset: usize| {
+            (u16::from(payload[offset] & 0x7F) << 8) | u16::from(payload[offset + 1])
+        };
+        // The 15-bit picture ID is in bytes 2-3 of the VP8 descriptor and in
+        // bytes 1-2 of the VP9 descriptor.
+        for (track, offset) in [
+            (LocalVideoTrack::vp8().expect("VP8"), 2),
+            (LocalVideoTrack::vp9().expect("VP9"), 1),
+        ] {
+            let small = vec![128; 320 * 240 * 3 / 2];
+            let large = vec![128; 640 * 480 * 3 / 2];
+            let first = encode_i420_layers(&track.inner, &small, 320, 240, 100, 9_000)
+                .expect("first frame");
+            // A new size sets up the encoder again.
+            let second = encode_i420_layers(&track.inner, &large, 640, 480, 100, 9_000)
+                .expect("frame at the new size");
+
+            let first_id = picture_id(&first[0].1[0].payload, offset);
+            let second_id = picture_id(&second[0].1[0].payload, offset);
+            assert_eq!(second_id, (first_id + 1) & 0x7FFF, "offset {offset}");
+        }
     }
 
     #[test]
