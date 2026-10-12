@@ -1034,7 +1034,10 @@ impl Call {
     /// other track types. Before an `update_subscriptions` call, the current
     /// config is
     /// [`SubscriptionConfig::audio_all`](crate::rtc::SubscriptionConfig::audio_all),
-    /// so `true` subscribes to audio and video, and `false` to audio only.
+    /// so `true` subscribes to audio and video, and `false` to audio only. This
+    /// also removes a target list that
+    /// [`update_subscription_targets`](Self::update_subscription_targets) set,
+    /// so the call subscribes by the config again.
     pub async fn set_incoming_video_enabled(&self, enabled: bool) -> crate::rtc::RtcResult<()> {
         self.rtc.set_incoming_video_enabled(enabled).await
     }

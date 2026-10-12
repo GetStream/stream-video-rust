@@ -406,7 +406,9 @@ impl RtcCall {
     /// [`SubscriptionConfig`] and keeps the other track types. Before an
     /// `update_subscriptions` call, the current config is
     /// [`SubscriptionConfig::audio_all`], so `true` subscribes to audio and
-    /// video, and `false` to audio only.
+    /// video, and `false` to audio only. This also removes a target list that
+    /// [`update_subscription_targets`](Self::update_subscription_targets) set,
+    /// so the call subscribes by the config again.
     pub async fn set_incoming_video_enabled(&self, enabled: bool) -> Result<()> {
         self.core.set_incoming_video_enabled(enabled).await
     }
