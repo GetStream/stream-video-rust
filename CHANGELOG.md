@@ -136,7 +136,8 @@ and publish option takes over the sender that the stop kept, as JS
 media of the new track. Before, a second video publish failed with
 "participant not found". A simulcast track (`vp8_simulcast`) cannot replace or
 be replaced: `publish` returns `RtcError::SimulcastReplace`. Turn such a track
-off and on with `mute_track` and `unmute_track`.
+off and on with `mute_track` and `unmute_track`. If a replace fails, the next
+publish can use the sender again.
 
 ### A dropped remote track comes back after a republish
 
