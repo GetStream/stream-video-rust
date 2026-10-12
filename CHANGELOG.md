@@ -137,7 +137,9 @@ lost, and a reconnect adds no delay.
 After `stop_publish`, a new audio, video, or screen-share track of the same kind
 and publish option takes over the sender that the stop kept, as JS
 `replaceTrack` does. Remote participants keep their remote track and get the
-media of the new track. Before, a second video publish failed with
+media of the new track. The new track continues the RTP sequence numbers and
+timestamps of the stopped track, also when one of the two tracks forwards RTP
+with `write_rtp`. Before, a second video publish failed with
 "participant not found". A simulcast track (`vp8_simulcast`) cannot replace or
 be replaced, and a track cannot replace a track with different layers (for
 example `vp9_svc` and `vp9`): `publish` returns `RtcError::SimulcastReplace`.
