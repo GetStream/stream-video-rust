@@ -10,7 +10,8 @@
 //!   emits silence on starve (stream-py `AudioStreamTrack` pacing). After a
 //!   tick without a write, it takes the audio that the resampler still holds
 //!   before the silence. Pacing
-//!   starts at the first write, or at [`LocalAudioTrack::start_pacing`] when
+//!   starts at the first write after a negotiated PeerConnection can send the
+//!   track, or at [`LocalAudioTrack::start_pacing`] when
 //!   [`LocalAudioTrackConfig::pace`] is off. A published track holds its queue
 //!   until the SFU publisher first connects and does not pause on a later
 //!   disconnect, so audio written during an outage is lost instead of delayed.
@@ -429,7 +430,9 @@ pub struct LocalAudioTrackConfig {
     /// write above it drops the oldest queued samples. The minimum is one 20 ms
     /// frame.
     pub pcm_queue_capacity: Duration,
-    /// Start pacing at the first [`LocalAudioTrack::write_pcm`]. A
+    /// Start pacing at the first [`LocalAudioTrack::write_pcm`] after a
+    /// negotiated PeerConnection can send the track. Before that, the queue
+    /// keeps the written audio. A
     /// [`LocalAudioTrack::pause_pacing`] before that write stays in force. When
     /// `false`, `write_pcm` only queues until [`LocalAudioTrack::start_pacing`].
     pub pace: bool,
@@ -568,8 +571,9 @@ impl LocalAudioTrack {
     /// The first frame sets the sample rate of the track, and later frames must
     /// keep it. The channels of a frame are averaged to mono, and the mono
     /// audio is resampled to 48 kHz and buffered up to
-    /// [`LocalAudioTrackConfig::pcm_queue_capacity`]. The first write starts
-    /// pacing when [`LocalAudioTrackConfig::pace`] is set (the default) and no
+    /// [`LocalAudioTrackConfig::pcm_queue_capacity`]. The first write after a
+    /// negotiated PeerConnection can send the track starts pacing when
+    /// [`LocalAudioTrackConfig::pace`] is set (the default) and no
     /// [`pause_pacing`](Self::pause_pacing) came before it; otherwise
     /// [`start_pacing`](Self::start_pacing) does. While pacing runs, a
     /// background task emits one Opus packet every 20 ms, writing silence when
@@ -623,8 +627,9 @@ impl LocalAudioTrack {
         .await
         .map_err(|error| RtcError::Media(format!("pcm resample worker failed: {error}")))??;
         // The write does not set `pacing_enabled`, so a `pause_pacing` stays
-        // in force.
-        if self.inner.pace {
+        // in force. Audio paced into a track with no sending binding is lost,
+        // so the queue waits for a sender.
+        if self.inner.pace && !self.inner.core.track.all_binding_paused().await {
             self.ensure_pacer();
         }
         queued
@@ -729,8 +734,9 @@ impl LocalAudioTrack {
 
     /// Start taking queued PCM: one 20 ms frame every 20 ms, or silence when
     /// the queue is empty. With [`LocalAudioTrackConfig::pace`] set (the
-    /// default), the first [`write_pcm`](Self::write_pcm) starts pacing without
-    /// this call, unless [`pause_pacing`](Self::pause_pacing) came before it.
+    /// default), the first [`write_pcm`](Self::write_pcm) after a negotiated
+    /// PeerConnection can send the track starts pacing without this call,
+    /// unless [`pause_pacing`](Self::pause_pacing) came before it.
     ///
     /// [`Call::publish_audio`](crate::Call::publish_audio) holds the queue
     /// until the SFU publisher first connects, then starts pacing; pacing
@@ -800,9 +806,10 @@ impl LocalAudioTrack {
     /// SFU; you only need it to send the same audio to a second peer, such as an
     /// AI provider's Realtime endpoint. Every write path (`write_pcm` and
     /// friends) feeds all bound senders. With [`LocalAudioTrackConfig::pace`]
-    /// set, audio written before this PeerConnection connects is lost; turn it
-    /// off and call [`start_pacing`](Self::start_pacing) at the connect to keep
-    /// that audio.
+    /// set, pacing starts at the first write after this PeerConnection
+    /// negotiates the track, so audio written before the connect can be lost;
+    /// turn it off and call [`start_pacing`](Self::start_pacing) at the
+    /// connect to keep that audio.
     pub fn webrtc_track(&self) -> Arc<TrackLocalStaticRTP> {
         self.inner.core.track.clone()
     }
@@ -2852,6 +2859,12 @@ mod tests {
             LocalAudioTrackConfig::default().with_pcm_queue_capacity(Duration::from_millis(100)),
         )
         .expect("opus track");
+        let sender = peer::new_peer_connection(&[]).await.expect("sender");
+        sender
+            .add_track(track.webrtc_track())
+            .await
+            .expect("add track");
+        let (receiver, _remote_rx) = peer::connect_audio_receiver(&sender).await;
         track.pause_pacing();
         track
             .write_pcm(PcmFrame::mono(vec![7; 4_800], OPUS_SAMPLE_RATE))
@@ -2875,6 +2888,8 @@ mod tests {
             })
         ));
         track.stop();
+        let _ = sender.close().await;
+        let _ = receiver.close().await;
     }
 
     #[tokio::test]
