@@ -2202,8 +2202,8 @@ impl LocalTrack {
         }
     }
 
-    /// Continue the RTP timeline of the audio track `previous`, whose sender
-    /// this audio track takes over.
+    /// Continue the RTP timeline of `previous`, whose sender this track takes
+    /// over. Does nothing for tracks of different kinds.
     pub(crate) fn continue_rtp_from(&self, previous: &LocalTrack) {
         match (self, previous) {
             (
