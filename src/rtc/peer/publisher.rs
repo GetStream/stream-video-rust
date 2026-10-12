@@ -370,8 +370,10 @@ mod tests {
     use crate::rtc::peer;
     use crate::rtc::proto::event::VideoLayerSetting;
     use crate::rtc::proto::models::{Codec, VideoDimension};
-    use crate::rtc::tracks::{LocalAudioTrack, LocalVideoTrack};
+    use crate::rtc::tracks::{LocalAudioTrack, LocalVideoTrack, RtpPacket};
+    use bytes::Bytes;
     use std::time::{Duration, Instant};
+    use webrtc::rtp::header::Header;
     use webrtc::rtp_transceiver::rtp_codec::RTPCodecType;
 
     #[tokio::test]
@@ -435,6 +437,171 @@ mod tests {
         }
         let _ = publisher.close().await;
         let _ = receiver.close().await;
+    }
+
+    #[tokio::test]
+    async fn a_forwarding_track_continues_the_rtp_timeline_of_a_retired_pcm_track() {
+        let takeover = take_over_audio_sender(AudioWriter::Pcm, AudioWriter::Rtp).await;
+
+        // One 20 ms frame, then the time from the stop to the replace.
+        takeover.assert_continues_after(960);
+    }
+
+    #[tokio::test]
+    async fn a_forwarding_track_continues_the_rtp_timeline_of_a_retired_forwarding_track() {
+        let takeover = take_over_audio_sender(AudioWriter::Rtp, AudioWriter::Rtp).await;
+
+        // The time from the stop to the replace.
+        takeover.assert_continues_after(0);
+    }
+
+    #[tokio::test]
+    async fn a_pcm_track_continues_the_rtp_timeline_of_a_retired_forwarding_track() {
+        let takeover = take_over_audio_sender(AudioWriter::Rtp, AudioWriter::Pcm).await;
+
+        // The time from the stop to the replace.
+        takeover.assert_continues_after(0);
+    }
+
+    /// How a test track writes its audio.
+    #[derive(Clone, Copy)]
+    enum AudioWriter {
+        /// The pacer of `write_pcm`.
+        Pcm,
+        /// `write_rtp` of a source that has its own RTP timeline.
+        Rtp,
+    }
+
+    impl AudioWriter {
+        /// Write one 20 ms frame every 20 ms until `track` stops. A source
+        /// starts at the RTP timestamp `source_timestamp`.
+        async fn start(self, track: &LocalAudioTrack, source_timestamp: u32) {
+            match self {
+                AudioWriter::Pcm => track.start_pacing().await,
+                AudioWriter::Rtp => {
+                    let track = track.clone();
+                    let mut packet = RtpPacket {
+                        header: Header {
+                            version: 2,
+                            payload_type: 111,
+                            timestamp: source_timestamp,
+                            ..Default::default()
+                        },
+                        payload: Bytes::from_static(&[0xf8, 0xff, 0xfe]),
+                    };
+                    tokio::spawn(async move {
+                        while track.write_rtp(packet.clone()).await.is_ok() {
+                            packet.header.sequence_number =
+                                packet.header.sequence_number.wrapping_add(1);
+                            packet.header.timestamp = packet.header.timestamp.wrapping_add(960);
+                            tokio::time::sleep(Duration::from_millis(20)).await;
+                        }
+                    });
+                }
+            }
+        }
+    }
+
+    /// The last packet of a stopped audio track and the first packet of the
+    /// track that takes over its sender.
+    struct AudioTakeover {
+        last: RtpPacket,
+        next: RtpPacket,
+        /// The minimum time from the stop to the replace.
+        waited: Duration,
+        /// The maximum time from the stop to the replace.
+        replaced: Duration,
+    }
+
+    impl AudioTakeover {
+        /// Assert that `next` follows `last`, and that its timestamp advanced
+        /// by `frame` samples plus the time from the stop to the replace.
+        fn assert_continues_after(&self, frame: u32) {
+            assert_eq!(
+                self.next.header.sequence_number,
+                self.last.header.sequence_number.wrapping_add(1)
+            );
+            let expected = |gap: Duration| frame + (gap.as_secs_f64() * 48_000.0) as u32;
+            let advanced = self
+                .next
+                .header
+                .timestamp
+                .wrapping_sub(self.last.header.timestamp);
+            assert!(
+                (expected(self.waited)..=expected(self.replaced)).contains(&advanced),
+                "the timestamp advanced {advanced} samples over a stop of {:?} to {:?}",
+                self.waited,
+                self.replaced
+            );
+        }
+    }
+
+    /// Stop an audio track that `first` writes, put a track that `second`
+    /// writes on its sender, and read the packets around the replace.
+    async fn take_over_audio_sender(first: AudioWriter, second: AudioWriter) -> AudioTakeover {
+        let opus = [PublishOption {
+            track_type: TrackType::Audio as i32,
+            codec: Some(Codec {
+                name: "opus".to_owned(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }];
+        let first_track = LocalAudioTrack::opus().expect("first track");
+        let retired = LocalTrack::Audio(first_track.clone());
+        let publisher = peer::new_peer_connection(&[]).await.expect("publisher");
+        let rtcp_tasks = add_transceiver_for_track(&publisher, &retired, &opus)
+            .await
+            .expect("first transceiver");
+        let (receiver, mut remote_rx) = peer::connect_audio_receiver(&publisher).await;
+        first.start(&first_track, 0).await;
+        let remote = tokio::time::timeout(Duration::from_secs(5), remote_rx.recv())
+            .await
+            .expect("remote track")
+            .expect("remote track channel");
+        let (mut last, _) = remote.read_rtp().await.expect("first packet");
+        let before_stop = Instant::now();
+        retired.stop();
+        let stopped = Instant::now();
+        while let Ok(Ok((packet, _))) =
+            tokio::time::timeout(Duration::from_millis(200), remote.read_rtp()).await
+        {
+            last = packet;
+        }
+        let waited = stopped.elapsed();
+
+        let second_track = LocalAudioTrack::opus().expect("second track");
+        let track = LocalTrack::Audio(second_track.clone());
+        let reader = replace_retired_track(&publisher, &retired, &track, &opus)
+            .await
+            .expect("replace the retired track")
+            .expect("the retired sender");
+        let replaced = before_stop.elapsed();
+        // A source timeline that is far from the timeline of the first track.
+        second
+            .start(
+                &second_track,
+                last.header.timestamp.wrapping_add(u32::MAX / 2),
+            )
+            .await;
+        let (next, _) = tokio::time::timeout(Duration::from_secs(5), remote.read_rtp())
+            .await
+            .expect("the receiver takes the packets of the second track")
+            .expect("second track packet");
+
+        track.stop();
+        reader.abort();
+        for task in rtcp_tasks {
+            task.abort();
+        }
+        let _ = publisher.close().await;
+        let _ = receiver.close().await;
+        AudioTakeover {
+            last,
+            next,
+            waited,
+            replaced,
+        }
     }
 
     #[tokio::test]
@@ -514,6 +681,91 @@ mod tests {
                 .await
                 .is_err(),
             "the receiver keeps its remote track"
+        );
+        track.stop();
+        reader.abort();
+        for task in rtcp_tasks {
+            task.abort();
+        }
+        let _ = publisher.close().await;
+        let _ = receiver.close().await;
+    }
+
+    #[tokio::test]
+    async fn an_i420_track_continues_the_rtp_timeline_of_a_retired_forwarding_track() {
+        let vp9 = [video_option("VP9")];
+        let first = LocalVideoTrack::vp9().expect("first track");
+        let retired = LocalTrack::Video {
+            track: first.clone(),
+            track_type: TrackType::Video,
+        };
+        let publisher = peer::new_peer_connection(&[]).await.expect("publisher");
+        let rtcp_tasks = add_transceiver_for_track(&publisher, &retired, &vp9)
+            .await
+            .expect("first transceiver");
+        let (receiver, mut remote_rx) =
+            peer::connect_receiver(&publisher, RTPCodecType::Video).await;
+        let forwarding = first.clone();
+        tokio::spawn(async move {
+            let mut packet = RtpPacket {
+                header: Header {
+                    version: 2,
+                    marker: true,
+                    ..Default::default()
+                },
+                payload: Bytes::from_static(&[0x08, 0x00]),
+            };
+            while forwarding.write_rtp(packet.clone()).await.is_ok() {
+                packet.header.sequence_number = packet.header.sequence_number.wrapping_add(1);
+                packet.header.timestamp = packet.header.timestamp.wrapping_add(2_970);
+                tokio::time::sleep(Duration::from_millis(33)).await;
+            }
+        });
+        let remote = tokio::time::timeout(Duration::from_secs(5), remote_rx.recv())
+            .await
+            .expect("remote track")
+            .expect("remote track channel");
+        let (mut last, _) = remote.read_rtp().await.expect("first packet");
+        let before_stop = Instant::now();
+        retired.stop();
+        let stopped = Instant::now();
+        while let Ok(Ok((packet, _))) =
+            tokio::time::timeout(Duration::from_millis(200), remote.read_rtp()).await
+        {
+            last = packet;
+        }
+        let waited = stopped.elapsed();
+
+        let second = LocalVideoTrack::vp9().expect("second track");
+        let track = LocalTrack::Video {
+            track: second.clone(),
+            track_type: TrackType::Video,
+        };
+        let reader = replace_retired_track(&publisher, &retired, &track, &vp9)
+            .await
+            .expect("replace the retired track")
+            .expect("the retired sender");
+        let replaced = before_stop.elapsed();
+        let frame = vec![128_u8; 320 * 240 * 3 / 2];
+        second
+            .write_i420(&frame, 320, 240, Duration::from_millis(33))
+            .await
+            .expect("second track frame");
+        let (next, _) = tokio::time::timeout(Duration::from_secs(5), remote.read_rtp())
+            .await
+            .expect("the receiver takes the packets of the second track")
+            .expect("second track packet");
+
+        assert_eq!(
+            next.header.sequence_number,
+            last.header.sequence_number.wrapping_add(1)
+        );
+        // The time from the stop to the replace.
+        let expected = |gap: Duration| (gap.as_secs_f64() * 90_000.0) as u32;
+        let advanced = next.header.timestamp.wrapping_sub(last.header.timestamp);
+        assert!(
+            (expected(waited)..=expected(replaced)).contains(&advanced),
+            "the timestamp advanced {advanced} samples over a stop of {waited:?} to {replaced:?}"
         );
         track.stop();
         reader.abort();
