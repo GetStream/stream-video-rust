@@ -463,7 +463,7 @@ impl RtcCore {
             Err(e) => {
                 signal.trace("signal.close", json!(e.to_string()));
                 return Err(RtcError::WsConnection(
-                    super::super::error::WsConnectionError::transport(e.to_string()),
+                    crate::rtc::error::WsConnectionError::transport(e.to_string()),
                 ));
             }
         };
