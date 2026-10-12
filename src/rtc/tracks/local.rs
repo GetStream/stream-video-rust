@@ -33,7 +33,7 @@
 use std::collections::VecDeque;
 use std::num::NonZeroU8;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, AtomicU16, AtomicU32, Ordering};
-use std::sync::{Arc, Mutex as StdMutex, Weak};
+use std::sync::{Arc, Mutex as StdMutex, TryLockError, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
@@ -368,14 +368,21 @@ struct AudioInner {
 impl AudioInner {
     /// Fill `frame` from the queue and then with silence. A queue shorter than
     /// `frame` first gets the audio that the resampler still holds, so the end
-    /// of the written audio plays without a gap.
+    /// of the written audio plays without a gap. While a write holds the
+    /// resampler, the pacer does not wait and takes no such audio.
     fn take_pcm(&self, frame: &mut [i16]) {
         let mut buf = self.pcm.lock().unwrap_or_else(|e| e.into_inner());
         if buf.len() < frame.len() {
             drop(buf);
-            let mut resampler = self.resampler.lock().unwrap_or_else(|e| e.into_inner());
+            let resampler = match self.resampler.try_lock() {
+                Ok(resampler) => Some(resampler),
+                Err(TryLockError::Poisoned(e)) => Some(e.into_inner()),
+                Err(TryLockError::WouldBlock) => None,
+            };
             buf = self.pcm.lock().unwrap_or_else(|e| e.into_inner());
-            if buf.len() < frame.len() {
+            if let Some(mut resampler) = resampler
+                && buf.len() < frame.len()
+            {
                 match resampler.flush() {
                     Ok(mut tail) => {
                         // The silence after the tail would delay the next write.
@@ -591,15 +598,19 @@ impl LocalAudioTrack {
         } else {
             frame
         };
-        let queued = {
-            let mut r = self
+        // The sinc filter is slow on a long frame, so it runs on a blocking thread.
+        let track = self.clone();
+        let queued = tokio::task::spawn_blocking(move || -> Result<Result<()>> {
+            let mut r = track
                 .inner
                 .resampler
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
             let resampled = r.push(&frame)?.samples;
-            self.queue_pcm(resampled)
-        };
+            Ok(track.queue_pcm(resampled))
+        })
+        .await
+        .map_err(|error| RtcError::Media(format!("pcm resample worker failed: {error}")))??;
         // Only a pacer that never started starts here, so a `pause_pacing`
         // stays in force.
         if self.inner.pace && !self.inner.pacer_started.load(Ordering::SeqCst) {
@@ -2429,6 +2440,50 @@ mod tests {
 
         assert_eq!(peak(&frame), 0, "audio from before the flush played");
         track.stop();
+    }
+
+    #[tokio::test]
+    async fn other_tasks_run_while_write_pcm_resamples() {
+        let track = unpaced_track();
+        // The test runtime has one thread, so this task runs only when the
+        // write gives the thread back.
+        let other = tokio::spawn(async {});
+
+        track
+            .write_pcm(PcmFrame::mono(vec![1_000; 24_000], 24_000))
+            .await
+            .expect("write_pcm");
+
+        assert!(
+            other.is_finished(),
+            "the resample kept the runtime thread from other tasks"
+        );
+        track.stop();
+    }
+
+    #[test]
+    fn the_pacer_takes_a_frame_while_a_write_resamples() {
+        let track = unpaced_track();
+        let writing = track
+            .inner
+            .resampler
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let (taken_tx, taken_rx) = std::sync::mpsc::channel();
+        let inner = track.inner.clone();
+        std::thread::spawn(move || {
+            let mut frame = vec![1; FRAME_SAMPLES_20MS];
+            inner.take_pcm(&mut frame);
+            let _ = taken_tx.send(frame);
+        });
+
+        let taken = taken_rx.recv_timeout(Duration::from_secs(5));
+        drop(writing);
+
+        assert_eq!(
+            taken.expect("the pacer waited for the write"),
+            vec![0; FRAME_SAMPLES_20MS]
+        );
     }
 
     #[test]
