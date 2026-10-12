@@ -2582,10 +2582,17 @@ mod tests {
         track.write_pcm(loud_end_16k()).await.expect("write_pcm");
 
         track.flush();
-        let mut frame = vec![0; FRAME_SAMPLES_20MS];
-        track.inner.take_pcm(&mut frame);
+        // The first tick after a write never takes the resampler audio.
+        let mut first = vec![0; FRAME_SAMPLES_20MS];
+        let mut second = vec![0; FRAME_SAMPLES_20MS];
+        track.inner.take_pcm(&mut first);
+        track.inner.take_pcm(&mut second);
 
-        assert_eq!(peak(&frame), 0, "audio from before the flush played");
+        assert_eq!(
+            peak(&first).max(peak(&second)),
+            0,
+            "audio from before the flush played"
+        );
         track.stop();
     }
 
