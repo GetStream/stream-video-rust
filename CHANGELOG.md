@@ -112,11 +112,12 @@ longer downmixes to mono.
 
 `StreamResampler` holds the newest 128 input frames in its filter: 8 ms at
 16 kHz, 5.3 ms at 24 kHz. `StreamResampler::flush` returns them. When the queue
-of a `LocalAudioTrack` holds less than one 20 ms frame, the pacer first adds
-that audio, so the end of the written audio plays without the next write. A
-track at 48 kHz holds no audio. Each time the queue runs short in the middle of
-the audio, the filter starts again: the gap is at least 11 ms at 16 kHz and
-23 ms at 8 kHz.
+of a `LocalAudioTrack` holds less than one 20 ms frame and no `write_pcm` came
+since the last pacer tick, the pacer first adds that audio, so the end of the
+written audio plays without the next write. If the queue runs short at the
+tick just after the last write, the end plays one tick later. While the writes
+continue, the pacer fills a short queue with silence only, and the filter keeps
+its audio for the next write. A track at 48 kHz holds no audio.
 
 ### Pacing control for PCM tracks
 
