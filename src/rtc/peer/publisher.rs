@@ -371,7 +371,7 @@ mod tests {
     use crate::rtc::proto::event::VideoLayerSetting;
     use crate::rtc::proto::models::{Codec, VideoDimension};
     use crate::rtc::tracks::{LocalAudioTrack, LocalVideoTrack};
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
     use webrtc::rtp_transceiver::rtp_codec::RTPCodecType;
 
     #[tokio::test]
@@ -397,12 +397,15 @@ mod tests {
             .expect("remote track")
             .expect("remote track channel");
         let (mut last, _) = remote.read_rtp().await.expect("first packet");
+        let before_stop = Instant::now();
         retired.stop();
+        let stopped = Instant::now();
         while let Ok(Ok((packet, _))) =
             tokio::time::timeout(Duration::from_millis(200), remote.read_rtp()).await
         {
             last = packet;
         }
+        let waited = stopped.elapsed();
 
         let second = LocalAudioTrack::opus().expect("second track");
         let track = LocalTrack::Audio(second.clone());
@@ -410,6 +413,7 @@ mod tests {
             .await
             .expect("replace the retired track")
             .expect("the retired sender");
+        let replaced = before_stop.elapsed();
         second.start_pacing().await;
         let (next, _) = remote.read_rtp().await.expect("second packet");
 
@@ -417,9 +421,12 @@ mod tests {
             next.header.sequence_number,
             last.header.sequence_number.wrapping_add(1)
         );
-        assert_eq!(
-            next.header.timestamp,
-            last.header.timestamp.wrapping_add(960)
+        // One 20 ms frame, then the time from the stop to the replace.
+        let expected = |gap: Duration| 960 + (gap.as_secs_f64() * 48_000.0) as u32;
+        let advanced = next.header.timestamp.wrapping_sub(last.header.timestamp);
+        assert!(
+            (expected(waited)..=expected(replaced)).contains(&advanced),
+            "the timestamp advanced {advanced} samples over a stop of {waited:?} to {replaced:?}"
         );
         track.stop();
         reader.abort();
@@ -460,7 +467,9 @@ mod tests {
                 .await
                 .expect("frame");
         }
+        let before_stop = Instant::now();
         retired.stop();
+        let stopped = Instant::now();
         let mut last = None;
         while let Ok(Ok((packet, _))) =
             tokio::time::timeout(Duration::from_millis(200), remote.read_rtp()).await
@@ -468,6 +477,7 @@ mod tests {
             last = Some(packet);
         }
         let last = last.expect("packets of the first track");
+        let waited = stopped.elapsed();
 
         let second = LocalVideoTrack::vp9().expect("second track");
         let track = LocalTrack::Video {
@@ -478,6 +488,7 @@ mod tests {
             .await
             .expect("replace the retired track")
             .expect("the retired sender");
+        let replaced = before_stop.elapsed();
         second
             .write_i420(&frame, 320, 240, frame_time)
             .await
@@ -491,9 +502,12 @@ mod tests {
             next.header.sequence_number,
             last.header.sequence_number.wrapping_add(1)
         );
-        assert_eq!(
-            next.header.timestamp,
-            last.header.timestamp.wrapping_add(2_970)
+        // One 33 ms frame, then the time from the stop to the replace.
+        let expected = |gap: Duration| 2_970 + (gap.as_secs_f64() * 90_000.0) as u32;
+        let advanced = next.header.timestamp.wrapping_sub(last.header.timestamp);
+        assert!(
+            (expected(waited)..=expected(replaced)).contains(&advanced),
+            "the timestamp advanced {advanced} samples over a stop of {waited:?} to {replaced:?}"
         );
         assert!(
             tokio::time::timeout(Duration::from_millis(200), remote_rx.recv())
