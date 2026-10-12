@@ -212,8 +212,11 @@ on `Call` (`get_call_participant_session_metrics`,
   decoded `PcmFrame` holds only its own samples.
 - A muted audio track no longer encodes its PCM.
 - While a track is muted, its RTP clock keeps running, for audio and video. The
-  first packet after an unmute shows the length of the mute (RFC 3550). Before,
-  the timestamps continued from the last packet before the mute.
+  clock of a PCM track also runs while `pause_pacing` or the hold of a new
+  publication stops the pacer. A new track on the sender of a stopped track
+  adds the time since the stop to the timestamps of the stopped track. The
+  first packet after the gap shows the length of the gap (RFC 3550). Before,
+  the timestamps continued from the last packet before the gap.
 - `RemoteTrack::next_video_frame` decodes the VP9 SVC that browsers send in
   flexible mode. Before, it gave the first frames and then no more frames: the
   depacketizer kept the reference indices of earlier packets and rejected each
