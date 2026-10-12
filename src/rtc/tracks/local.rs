@@ -40,7 +40,7 @@ use std::collections::VecDeque;
 use std::num::NonZeroU8;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock, TryLockError, Weak};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use tokio::sync::{Notify, Semaphore};
@@ -177,7 +177,7 @@ impl TrackCore {
             clock_rate,
             mime_type,
             rtp: StdMutex::new(RtpTimeline {
-                seq: seed_u16(),
+                seq: random_u32() as u16,
                 timestamp: None,
                 forward_offset: None,
             }),
@@ -395,7 +395,7 @@ impl RtpTimeline {
 
     /// Return the timestamp of a frame of `samples`, and move past it.
     fn advance(&mut self, samples: u32) -> u32 {
-        let timestamp = self.timestamp.unwrap_or_else(|| u32::from(seed_u16()));
+        let timestamp = self.timestamp.unwrap_or_else(random_u32);
         self.timestamp = Some(timestamp.wrapping_add(samples));
         timestamp
     }
@@ -413,14 +413,11 @@ impl RtpTimeline {
     }
 }
 
-/// A low-entropy 16-bit seed from the wall clock (no `rand` dependency), used to
-/// randomize the first RTP sequence numbers and timestamps so they do not always
-/// start at 0.
-fn seed_u16() -> u16 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.subsec_nanos() as u16)
-        .unwrap_or(0)
+/// A random value from the operating system. The first RTP sequence number and
+/// the first RTP timestamp of a track come from it (RFC 3550 §5.1).
+fn random_u32() -> u32 {
+    // The low 32 bits of a version 4 UUID have no version or variant bits.
+    uuid::Uuid::new_v4().as_u128() as u32
 }
 
 // Audio
@@ -3101,6 +3098,46 @@ mod tests {
         );
         let _ = sender.close().await;
         let _ = receiver.close().await;
+    }
+
+    /// The first RTP timestamp of a new track is random over 32 bits. The
+    /// probability that all three first timestamps are below 65536 is 2^-48.
+    #[tokio::test]
+    async fn new_tracks_start_their_rtp_timestamps_at_random_points() {
+        let silence = [0xf8u8, 0xff, 0xfe];
+        let mut first_timestamps = Vec::new();
+
+        for _ in 0..3 {
+            let track = LocalAudioTrack::opus().expect("opus track");
+            let sender = peer::new_peer_connection(&[]).await.expect("sender");
+            sender
+                .add_track(track.webrtc_track())
+                .await
+                .expect("add track");
+            let (receiver, mut remote_rx) = peer::connect_audio_receiver(&sender).await;
+            track
+                .write_sample(&silence, Duration::from_millis(20))
+                .await
+                .expect("write");
+            let remote = tokio::time::timeout(Duration::from_secs(5), remote_rx.recv())
+                .await
+                .expect("remote track")
+                .expect("remote track channel");
+            let (first, _) = tokio::time::timeout(Duration::from_secs(5), remote.read_rtp())
+                .await
+                .expect("first packet")
+                .expect("first packet");
+            first_timestamps.push(first.header.timestamp);
+            let _ = sender.close().await;
+            let _ = receiver.close().await;
+        }
+
+        assert!(
+            first_timestamps
+                .iter()
+                .any(|&timestamp| timestamp > u32::from(u16::MAX)),
+            "first timestamps: {first_timestamps:?}"
+        );
     }
 
     #[tokio::test]
