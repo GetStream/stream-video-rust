@@ -142,7 +142,7 @@ pub enum RtcError {
          track is simulcast or the tracks have different layers; use mute_track and \
          unmute_track"
     )]
-    SimulcastReplace {
+    LayeredReplace {
         /// Publication kind requested by the caller.
         track_type: models::TrackType,
     },

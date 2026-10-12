@@ -381,7 +381,7 @@ impl RtcCall {
     /// Stop publishing a local media track. A new track of the same kind that
     /// is published later takes over its sender, except for a simulcast track
     /// or a track with different layers than the stopped track
-    /// ([`RtcError::SimulcastReplace`]); use [`mute_track`](Self::mute_track)
+    /// ([`RtcError::LayeredReplace`]); use [`mute_track`](Self::mute_track)
     /// for that.
     pub async fn stop_publish(&self, track: LocalTrack) -> Result<()> {
         self.core.stop_publish(track).await

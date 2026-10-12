@@ -1192,7 +1192,7 @@ async fn a_stopped_simulcast_publication_is_not_replaced() {
         assert!(
             matches!(
                 result,
-                Err(RtcError::SimulcastReplace {
+                Err(RtcError::LayeredReplace {
                     track_type: TrackType::ScreenShare
                 })
             ),
@@ -1323,7 +1323,7 @@ async fn a_stopped_publication_is_not_replaced_by_a_track_with_other_layers() {
     assert!(
         matches!(
             result,
-            Err(RtcError::SimulcastReplace {
+            Err(RtcError::LayeredReplace {
                 track_type: TrackType::Video
             })
         ),

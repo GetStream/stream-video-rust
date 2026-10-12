@@ -249,7 +249,7 @@ pub(crate) async fn replace_retired_track(
         }
         let option = publish_option(track, publish_options)?;
         if track.configure_for_publish(option)? != retired.planned_layers_for_publish(option)? {
-            return Err(RtcError::SimulcastReplace {
+            return Err(RtcError::LayeredReplace {
                 track_type: track.track_type(),
             });
         }
