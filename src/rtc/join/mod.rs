@@ -528,6 +528,7 @@ pub struct RtcCore {
     /// Fired for each inbound [`RemoteTrack`] the subscriber PC delivers.
     on_track_cb: StdMutex<Option<OnTrackCallback>>,
     /// The active subscription policy (applied once `subs_active` is set).
+    /// Audio only until `update_subscriptions` replaces it.
     sub_config: StdMutex<SubscriptionConfig>,
     /// Set once the caller opts into subscriptions via `update_subscriptions`.
     subs_active: AtomicBool,
@@ -602,7 +603,7 @@ impl RtcCore {
             join_data: StdMutex::new(JoinCallData::new("")),
             unified_session_id: StdMutex::new(String::new()),
             on_track_cb: StdMutex::new(None),
-            sub_config: StdMutex::new(SubscriptionConfig::default()),
+            sub_config: StdMutex::new(SubscriptionConfig::audio_all()),
             subs_active: AtomicBool::new(false),
             manual_unsub: StdMutex::new(HashSet::new()),
             delivered_tracks: StdMutex::new(HashMap::new()),

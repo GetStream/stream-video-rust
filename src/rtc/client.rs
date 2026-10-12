@@ -403,9 +403,10 @@ impl RtcCall {
     /// Enable or disable incoming video from every remote participant.
     ///
     /// This adds or removes `TrackType::Video` in every rule of the current
-    /// [`SubscriptionConfig`] and keeps the other track types. The default
-    /// config has no track types, so before an `update_subscriptions` call,
-    /// `true` subscribes to video only.
+    /// [`SubscriptionConfig`] and keeps the other track types. Before an
+    /// `update_subscriptions` call, the current config is
+    /// [`SubscriptionConfig::audio_all`], so `true` subscribes to audio and
+    /// video, and `false` to audio only.
     pub async fn set_incoming_video_enabled(&self, enabled: bool) -> Result<()> {
         self.core.set_incoming_video_enabled(enabled).await
     }

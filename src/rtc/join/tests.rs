@@ -2169,6 +2169,27 @@ async fn turning_incoming_video_off_and_on_keeps_the_video_dimension() {
     );
 }
 
+#[tokio::test]
+async fn incoming_video_before_a_subscription_update_keeps_remote_audio() {
+    let core = test_core();
+    let rules = || {
+        core.sub_config
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    };
+
+    core.set_incoming_video_enabled(true)
+        .await
+        .expect("video on");
+    assert_eq!(rules(), SubscriptionConfig::audio_video());
+
+    core.set_incoming_video_enabled(false)
+        .await
+        .expect("video off");
+    assert_eq!(rules(), SubscriptionConfig::audio_all());
+}
+
 #[test]
 fn a_join_response_keeps_the_order_of_known_participants() {
     let core = test_core();
