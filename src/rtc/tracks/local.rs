@@ -34,7 +34,9 @@
 
 use std::collections::VecDeque;
 use std::num::NonZeroU8;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, AtomicU16, AtomicU32, Ordering};
+use std::sync::atomic::{
+    AtomicBool, AtomicI32, AtomicU8, AtomicU16, AtomicU32, AtomicU64, Ordering,
+};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock, TryLockError, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -354,9 +356,12 @@ struct AudioInner {
     /// Resampled 48 kHz mono PCM awaiting the 20 ms pacer.
     pcm: StdMutex<VecDeque<i16>>,
     pcm_capacity_samples: usize,
-    /// Locked before `pcm`. A writer keeps it until its audio is queued, so a
-    /// flush cannot fall between the resample and the queue.
+    /// Locked before `pcm`. A writer keeps it until its audio is queued.
+    /// `flush` does not wait for it.
     resampler: StdMutex<StreamResampler>,
+    /// Counts `flush` calls. Changed and compared under the `pcm` lock. A
+    /// write queues no audio when a flush came after the write started.
+    flushes: AtomicU64,
     /// Set by `write_pcm` and cleared at each pacer tick. A resampler flush
     /// makes the next write start with silence.
     pcm_written: AtomicBool,
@@ -557,6 +562,7 @@ impl LocalAudioTrack {
                 pcm: StdMutex::new(VecDeque::new()),
                 pcm_capacity_samples,
                 resampler: StdMutex::new(StreamResampler::new(OPUS_SAMPLE_RATE, 1)),
+                flushes: AtomicU64::new(0),
                 pcm_written: AtomicBool::new(false),
                 encoder: StdMutex::new(encoder),
                 pacer: StdMutex::new(None),
@@ -601,6 +607,7 @@ impl LocalAudioTrack {
                 "write to a stopped track".to_owned(),
             ));
         }
+        let flushes = self.inner.flushes.load(Ordering::SeqCst);
         self.inner.pcm_pacing.store(true, Ordering::SeqCst);
         let frame = if frame.channels > 1 {
             let channels = usize::from(frame.channels);
@@ -626,7 +633,12 @@ impl LocalAudioTrack {
                 .unwrap_or_else(|e| e.into_inner());
             let resampled = r.push(&frame)?.samples;
             track.inner.pcm_written.store(true, Ordering::SeqCst);
-            Ok(track.queue_pcm(resampled))
+            let queued = track.queue_pcm(resampled, flushes);
+            // After a flush, the filter must not keep the audio of this write.
+            if track.inner.flushes.load(Ordering::SeqCst) != flushes {
+                r.flush()?;
+            }
+            Ok(queued)
         })
         .await
         .map_err(|error| RtcError::Media(format!("pcm resample worker failed: {error}")))??;
@@ -640,9 +652,13 @@ impl LocalAudioTrack {
     }
 
     /// Append 48 kHz mono samples to the pacer queue, dropping the oldest
-    /// audio above the capacity. Callers hold the `resampler` lock.
-    fn queue_pcm(&self, samples: Vec<i16>) -> Result<()> {
+    /// audio above the capacity. Queues nothing when a flush came after
+    /// `flushes` was read. Callers hold the `resampler` lock.
+    fn queue_pcm(&self, samples: Vec<i16>, flushes: u64) -> Result<()> {
         let mut buf = self.inner.pcm.lock().unwrap_or_else(|e| e.into_inner());
+        if self.inner.flushes.load(Ordering::SeqCst) != flushes {
+            return Ok(());
+        }
         let dropped = push_bounded_pcm(&mut buf, samples, self.inner.pcm_capacity_samples);
         if dropped == 0 {
             return Ok(());
@@ -722,18 +738,23 @@ impl LocalAudioTrack {
     }
 
     /// Drop any buffered-but-unsent PCM (barge-in), including the audio that
-    /// the resampler still holds. Does not stop the track.
+    /// the resampler still holds and the audio of a
+    /// [`write_pcm`](Self::write_pcm) that started before this call. Does not
+    /// wait for a write in progress. Does not stop the track.
     pub fn flush(&self) {
-        let mut r = self
-            .inner
-            .resampler
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut buf = self.inner.pcm.lock().unwrap_or_else(|e| e.into_inner());
+        self.inner.flushes.fetch_add(1, Ordering::SeqCst);
+        buf.clear();
+        drop(buf);
+        // A write that holds the resampler resets it itself.
+        let mut r = match self.inner.resampler.try_lock() {
+            Ok(r) => r,
+            Err(TryLockError::Poisoned(e)) => e.into_inner(),
+            Err(TryLockError::WouldBlock) => return,
+        };
         if let Err(e) = r.flush() {
             tracing::debug!(error = %e, "stream.rtc.audio.flush_failed");
         }
-        let mut buf = self.inner.pcm.lock().unwrap_or_else(|e| e.into_inner());
-        buf.clear();
     }
 
     /// Start taking queued PCM: one 20 ms frame every 20 ms, or silence when
@@ -2271,6 +2292,8 @@ impl LocalTrack {
 
 #[cfg(test)]
 mod tests {
+    use futures_util::FutureExt;
+
     use super::*;
     use crate::rtc::peer;
     use crate::rtc::proto::models::{Codec, VideoDimension};
@@ -2568,6 +2591,58 @@ mod tests {
             taken.expect("the pacer waited for the write"),
             vec![0; FRAME_SAMPLES_20MS]
         );
+    }
+
+    #[test]
+    fn flush_returns_while_a_write_resamples() {
+        let track = unpaced_track();
+        let writing = track
+            .inner
+            .resampler
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let (flushed_tx, flushed_rx) = std::sync::mpsc::channel();
+        let flushing = track.clone();
+        std::thread::spawn(move || {
+            flushing.flush();
+            let _ = flushed_tx.send(());
+        });
+
+        let flushed = flushed_rx.recv_timeout(Duration::from_secs(5));
+        drop(writing);
+
+        flushed.expect("the flush waited for the write");
+    }
+
+    #[test]
+    fn flush_drops_a_write_that_waits_for_a_blocking_thread() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .max_blocking_threads(1)
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let track = unpaced_track();
+            let (release, released) = std::sync::mpsc::channel::<()>();
+            // Takes the only blocking thread, so the write cannot resample yet.
+            let _busy = tokio::task::spawn_blocking(move || released.recv());
+            let mut write = std::pin::pin!(track.write_pcm(loud_end_16k()));
+            assert!(write.as_mut().now_or_never().is_none());
+
+            track.flush();
+            drop(release);
+            write.await.expect("write_pcm");
+            let mut first = vec![0; FRAME_SAMPLES_20MS];
+            let mut second = vec![0; FRAME_SAMPLES_20MS];
+            track.inner.take_pcm(&mut first);
+            track.inner.take_pcm(&mut second);
+
+            assert_eq!(
+                peak(&first).max(peak(&second)),
+                0,
+                "audio from before the flush played"
+            );
+            track.stop();
+        });
     }
 
     #[test]
