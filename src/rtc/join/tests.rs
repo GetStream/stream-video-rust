@@ -2,6 +2,7 @@
 
 use super::*;
 use crate::client::ClientConfig;
+use crate::rtc::stats::tests::run_then_delete;
 use crate::rtc::{
     ClientPublishOptions, LocalAudioTrack, LocalVideoTrack, PcmFrame, PreferredVideoCodec,
 };
@@ -3072,29 +3073,31 @@ async fn live_twirp_ice_trickle_framing_accepted() {
     .await
     .expect("get_or_create failed");
 
-    call.join(JoinCallData::create(&user))
-        .await
-        .expect("join failed");
-    let probe = call.rtc_core().twirp_probe().await;
-    let _ = call.leave().await;
-    let _ = call
-        .delete(crate::models::DeleteCallRequest { hard: Some(true) })
-        .await;
+    run_then_delete(call.clone(), Duration::from_secs(60), async move {
+        call.join(JoinCallData::create(&user))
+            .await
+            .expect("join failed");
+        let probe = call.rtc_core().twirp_probe().await;
+        let _ = call.leave().await;
 
-    match probe {
-        // 200 + empty error, or an application-level Signal error: either way
-        // the SFU parsed our protobuf body and accepted the auth header.
-        Ok(()) => {}
-        Err(RtcError::Signal { code, message, .. }) => {
-            eprintln!("twirp framing accepted; SFU app-level response code={code} msg={message:?}");
+        match probe {
+            // 200 + empty error, or an application-level Signal error: either way
+            // the SFU parsed our protobuf body and accepted the auth header.
+            Ok(()) => {}
+            Err(RtcError::Signal { code, message, .. }) => {
+                eprintln!(
+                    "twirp framing accepted; SFU app-level response code={code} msg={message:?}"
+                );
+            }
+            Err(RtcError::Twirp(e)) => {
+                panic!("SFU rejected Twirp framing (body format or auth header): {e:?}")
+            }
+            Err(RtcError::Transport(e)) => panic!("twirp transport error: {e}"),
+            Err(RtcError::Decode(e)) => panic!("twirp response not protobuf-decodable: {e}"),
+            Err(other) => panic!("unexpected twirp probe error: {other}"),
         }
-        Err(RtcError::Twirp(e)) => {
-            panic!("SFU rejected Twirp framing (body format or auth header): {e:?}")
-        }
-        Err(RtcError::Transport(e)) => panic!("twirp transport error: {e}"),
-        Err(RtcError::Decode(e)) => panic!("twirp response not protobuf-decodable: {e}"),
-        Err(other) => panic!("unexpected twirp probe error: {other}"),
-    }
+    })
+    .await;
 }
 
 #[tokio::test]
@@ -3179,7 +3182,7 @@ async fn live_forced_reconnect(
         .expect("get_or_create");
 
     let call = stream.video().call("default", &call_id);
-    let outcome = tokio::time::timeout(Duration::from_secs(120), async {
+    let outcome = run_then_delete(admin, Duration::from_secs(120), async move {
         call.join(JoinCallData::new(&user)).await.expect("join");
         let audio = LocalAudioTrack::opus().expect("opus track");
         call.publish_audio(audio.clone()).await.expect("publish");
@@ -3257,16 +3260,12 @@ async fn live_forced_reconnect(
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .clone();
-        (attempts, core.state())
+        let final_state = core.state();
+        let _ = call.leave().await;
+        (attempts, final_state)
     })
     .await;
 
-    let _ = call.leave().await;
-    let _ = admin
-        .delete(crate::models::DeleteCallRequest { hard: Some(true) })
-        .await;
-
-    let outcome = outcome.expect("forced reconnect timed out (120s guard)");
     eprintln!(
         "FORCED RECONNECT {strategy:?} fault={fault:?}: attempts={:?} final_state={:?}",
         outcome.0, outcome.1

@@ -17,8 +17,8 @@ use std::future::Future;
 use std::time::Duration;
 
 use getstream::models::{
-    CallRequest, CustomData, DeleteCallRequest, GetOrCreateCallRequest,
-    QueryCallParticipantSessionsRequest, QueryCallSessionParticipantStatsRequest, UserRequest,
+    CallRequest, CustomData, GetOrCreateCallRequest, QueryCallParticipantSessionsRequest,
+    QueryCallSessionParticipantStatsRequest, UserRequest,
 };
 use getstream::rtc::JoinCallData;
 
@@ -79,101 +79,102 @@ async fn session_scoped_participant_stats_echo_call_identity() {
     .await
     .expect("get_or_create failed");
 
-    let outcome: Result<(), String> = async {
-        call.join(JoinCallData::new(&user_id))
-            .await
-            .map_err(|error| format!("join failed: {error}"))?;
+    common::run_then_delete(call.clone(), Duration::from_secs(120), async move {
+        let outcome: Result<(), String> = async {
+            call.join(JoinCallData::new(&user_id))
+                .await
+                .map_err(|error| format!("join failed: {error}"))?;
 
-        // `session_id()` is this participant's SFU session; the stats endpoints
-        // are keyed by the coordinator's call session, which is a different id.
-        let user_session_id = call
-            .session_id()
-            .await
-            .ok_or_else(|| "joined call did not expose an SFU session id".to_owned())?;
-        let session_id = call
-            .get(Default::default())
-            .await
-            .map_err(|error| format!("get failed: {error}"))?
-            .call
-            .session
-            .map(|session| session.id)
-            .ok_or_else(|| "joined call did not expose a call session".to_owned())?;
+            // `session_id()` is this participant's SFU session; the stats endpoints
+            // are keyed by the coordinator's call session, which is a different id.
+            let user_session_id = call
+                .session_id()
+                .await
+                .ok_or_else(|| "joined call did not expose an SFU session id".to_owned())?;
+            let session_id = call
+                .get(Default::default())
+                .await
+                .map_err(|error| format!("get failed: {error}"))?
+                .call
+                .session
+                .map(|session| session.id)
+                .ok_or_else(|| "joined call did not expose a call session".to_owned())?;
 
-        call.leave()
-            .await
-            .map_err(|error| format!("leave failed: {error}"))?;
-        call.end()
-            .await
-            .map_err(|error| format!("end failed: {error}"))?;
+            call.leave()
+                .await
+                .map_err(|error| format!("leave failed: {error}"))?;
+            call.end()
+                .await
+                .map_err(|error| format!("end failed: {error}"))?;
 
-        // Independent reads of the same ended session: no need to serialise
-        // their retry windows.
-        let (stats, sessions) = tokio::try_join!(
-            await_stats("query_call_session_participant_stats", || {
-                call.query_call_session_participant_stats(
-                    &session_id,
-                    QueryCallSessionParticipantStatsRequest {
-                        // Populated so the query encoding is validated against
-                        // the server, not just against its own unit test.
-                        limit: Some(5),
-                        filter_conditions: participant_filter(&user_id),
-                        ..Default::default()
-                    },
-                )
-            }),
-            await_stats("query_call_participant_sessions", || {
-                call.query_call_participant_sessions(
-                    &session_id,
-                    QueryCallParticipantSessionsRequest::default(),
-                )
-            }),
-        )?;
-        assert_eq!(stats.call_id, call_id, "participant stats call_id mismatch");
-        assert_eq!(
-            stats.call_type, "default",
-            "participant stats type mismatch"
-        );
-        assert_eq!(
-            stats.call_session_id, session_id,
-            "participant stats session mismatch"
-        );
+            // Independent reads of the same ended session: no need to serialise
+            // their retry windows.
+            let (stats, sessions) = tokio::try_join!(
+                await_stats("query_call_session_participant_stats", || {
+                    call.query_call_session_participant_stats(
+                        &session_id,
+                        QueryCallSessionParticipantStatsRequest {
+                            // Populated so the query encoding is validated against
+                            // the server, not just against its own unit test.
+                            limit: Some(5),
+                            filter_conditions: participant_filter(&user_id),
+                            ..Default::default()
+                        },
+                    )
+                }),
+                await_stats("query_call_participant_sessions", || {
+                    call.query_call_participant_sessions(
+                        &session_id,
+                        QueryCallParticipantSessionsRequest::default(),
+                    )
+                }),
+            )?;
+            assert_eq!(stats.call_id, call_id, "participant stats call_id mismatch");
+            assert_eq!(
+                stats.call_type, "default",
+                "participant stats type mismatch"
+            );
+            assert_eq!(
+                stats.call_session_id, session_id,
+                "participant stats session mismatch"
+            );
 
-        assert_eq!(
-            sessions.call_id, call_id,
-            "participant sessions call_id mismatch"
-        );
-        assert_eq!(
-            sessions.call_type, "default",
-            "participant sessions type mismatch"
-        );
-        assert_eq!(
-            sessions.call_session_id, session_id,
-            "participant sessions session mismatch"
-        );
+            assert_eq!(
+                sessions.call_id, call_id,
+                "participant sessions call_id mismatch"
+            );
+            assert_eq!(
+                sessions.call_type, "default",
+                "participant sessions type mismatch"
+            );
+            assert_eq!(
+                sessions.call_session_id, session_id,
+                "participant sessions session mismatch"
+            );
 
-        // The join above is the only participant session, and it must be
-        // reported under the SFU session id -- guarding the two ids from being
-        // conflated again.
-        let reported: Vec<&str> = sessions
-            .participants_sessions
-            .iter()
-            .filter_map(|entry| entry.get("user_session_id")?.as_str())
-            .collect();
-        assert!(
-            reported.contains(&user_session_id.as_str()),
-            "participant sessions {reported:?} missing this join's SFU session {user_session_id}"
-        );
+            // The join above is the only participant session, and it must be
+            // reported under the SFU session id -- guarding the two ids from being
+            // conflated again.
+            let reported: Vec<&str> = sessions
+                .participants_sessions
+                .iter()
+                .filter_map(|entry| entry.get("user_session_id")?.as_str())
+                .collect();
+            assert!(
+                reported.contains(&user_session_id.as_str()),
+                "participant sessions {reported:?} missing this join's SFU session {user_session_id}"
+            );
 
-        Ok(())
-    }
+            Ok(())
+        }
+        .await;
+
+        let leave_cleanup = call.leave().await;
+        if let Err(error) = outcome {
+            panic!("{error}; leave cleanup: {leave_cleanup:?}");
+        }
+    })
     .await;
-
-    let leave_cleanup = call.leave().await;
-    let delete_cleanup = call.delete(DeleteCallRequest { hard: Some(true) }).await;
-    if let Err(error) = outcome {
-        panic!("{error}; leave cleanup: {leave_cleanup:?}; delete cleanup: {delete_cleanup:?}");
-    }
-    delete_cleanup.expect("delete cleanup failed");
 }
 
 /// Restrict a participant-stats query to one user, exercising the

@@ -3,9 +3,7 @@ mod common;
 use std::process::Command;
 use std::time::Duration;
 
-use getstream::models::{
-    CallRequest, DeleteCallRequest, GetOrCreateCallRequest, MemberRequest, UserRequest,
-};
+use getstream::models::{CallRequest, GetOrCreateCallRequest, MemberRequest, UserRequest};
 use getstream::rtc::JoinCallData;
 
 const DEFAULT_ITERATIONS: usize = 10;
@@ -54,37 +52,42 @@ async fn repeated_join_leave_has_bounded_rss_growth() {
     .await
     .expect("create soak call");
 
-    let outcome = tokio::time::timeout(Duration::from_secs(30), async {
-        call.join(JoinCallData::new(&user_id)).await?;
-        call.leave().await
-    })
-    .await
-    .expect("warm-up join/leave timed out");
-    outcome.expect("warm-up join/leave failed");
-    tokio::time::sleep(Duration::from_millis(250)).await;
-    let start_rss = process_rss_bytes();
-
-    for iteration in 1..=iterations {
+    // The warm-up and each iteration have a 30 s timeout.
+    let limit = Duration::from_secs(30 * (iterations as u64 + 2));
+    common::run_then_delete(call.clone(), limit, async move {
         let outcome = tokio::time::timeout(Duration::from_secs(30), async {
             call.join(JoinCallData::new(&user_id)).await?;
             call.leave().await
         })
         .await
-        .unwrap_or_else(|_| panic!("join/leave iteration {iteration} timed out"));
-        outcome.unwrap_or_else(|error| panic!("join/leave iteration {iteration} failed: {error}"));
-    }
+        .expect("warm-up join/leave timed out");
+        outcome.expect("warm-up join/leave failed");
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        let start_rss = process_rss_bytes();
 
-    tokio::time::sleep(Duration::from_millis(500)).await;
-    let end_rss = process_rss_bytes();
-    let growth = end_rss.saturating_sub(start_rss);
-    let _ = call.delete(DeleteCallRequest { hard: Some(true) }).await;
+        for iteration in 1..=iterations {
+            let outcome = tokio::time::timeout(Duration::from_secs(30), async {
+                call.join(JoinCallData::new(&user_id)).await?;
+                call.leave().await
+            })
+            .await
+            .unwrap_or_else(|_| panic!("join/leave iteration {iteration} timed out"));
+            outcome
+                .unwrap_or_else(|error| panic!("join/leave iteration {iteration} failed: {error}"));
+        }
 
-    eprintln!(
-        "SOAK_RESULT iterations={iterations} start_rss_bytes={start_rss} \
-         end_rss_bytes={end_rss} growth_bytes={growth}"
-    );
-    assert!(
-        growth <= MAX_RSS_GROWTH_BYTES,
-        "RSS grew by {growth} bytes across {iterations} join/leave cycles"
-    );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let end_rss = process_rss_bytes();
+        let growth = end_rss.saturating_sub(start_rss);
+
+        eprintln!(
+            "SOAK_RESULT iterations={iterations} start_rss_bytes={start_rss} \
+             end_rss_bytes={end_rss} growth_bytes={growth}"
+        );
+        assert!(
+            growth <= MAX_RSS_GROWTH_BYTES,
+            "RSS grew by {growth} bytes across {iterations} join/leave cycles"
+        );
+    })
+    .await;
 }
