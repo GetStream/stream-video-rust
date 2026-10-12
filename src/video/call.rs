@@ -1008,8 +1008,10 @@ impl Call {
     }
 
     /// Set the subscription policy and (re)send `UpdateSubscriptions`. The SFU
-    /// forwards no media until this is called; `SubscriptionConfig::default()`
-    /// subscribes to nothing.
+    /// forwards no media until this call,
+    /// [`update_subscription_targets`](Self::update_subscription_targets), or
+    /// [`set_incoming_video_enabled`](Self::set_incoming_video_enabled);
+    /// `SubscriptionConfig::default()` subscribes to nothing.
     pub async fn update_subscriptions(
         &self,
         config: crate::rtc::SubscriptionConfig,
