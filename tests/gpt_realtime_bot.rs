@@ -16,9 +16,7 @@ use std::f64::consts::PI;
 use std::time::Duration;
 
 use anyhow::{Context, Result, ensure};
-use getstream::models::{
-    CallRequest, DeleteCallRequest, GetOrCreateCallRequest, MemberRequest, UserRequest,
-};
+use getstream::models::{CallRequest, GetOrCreateCallRequest, MemberRequest, UserRequest};
 use getstream::rtc::proto::models::TrackType;
 use getstream::rtc::{JoinCallData, LocalAudioTrack, PcmFrame, RemoteTrack, SubscriptionConfig};
 use getstream::video::Call;
@@ -198,77 +196,73 @@ async fn gpt_bot_hears_audio_and_replies() {
         .await
         .expect("get_or_create");
 
-    let call_s = client.video().call("default", &call_id);
-    let mut bot_handle = None;
-    let mut tone = None;
-    let outcome: Result<()> = tokio::time::timeout(Duration::from_secs(180), async {
-        bot_handle = Some(
-            bot::start_bot(&client, &cfg, &bot_user, "default", &call_id)
+    common::run_then_delete(admin, Duration::from_secs(180), async move {
+        let call_s = client.video().call("default", &call_id);
+        let mut bot_handle = None;
+        let mut tone = None;
+        let outcome: Result<()> = async {
+            bot_handle = Some(
+                bot::start_bot(&client, &cfg, &bot_user, "default", &call_id)
+                    .await
+                    .context("start bot")?,
+            );
+            let bot = bot_handle.as_ref().expect("bot was just stored");
+            let mut rx_s = track_sink(&call_s);
+            call_s
+                .join(JoinCallData::new(&speaker))
                 .await
-                .context("start bot")?,
-        );
-        let bot = bot_handle.as_ref().expect("bot was just stored");
-        let mut rx_s = track_sink(&call_s);
-        call_s
-            .join(JoinCallData::new(&speaker))
+                .context("speaker join")?;
+
+            let audio = LocalAudioTrack::opus().context("speaker Opus track")?;
+            call_s
+                .publish_audio(audio.clone())
+                .await
+                .context("speaker publish audio")?;
+            tone = Some(spawn_speech_tone(audio));
+
+            call_s
+                .update_subscriptions(SubscriptionConfig::audio_all())
+                .await
+                .context("speaker subscriptions")?;
+
+            ensure!(
+                wait_until(Duration::from_secs(60), || bot.audio_seen()).await,
+                "bot on_track never fired for AUDIO (subscription/ICE/RTP stage)"
+            );
+
+            let bot_audio = recv_track(
+                &mut rx_s,
+                &bot_user,
+                TrackType::Audio,
+                Duration::from_secs(45),
+            )
             .await
-            .context("speaker join")?;
+            .context("second session never received the bot's audio track")?;
+            let rms = max_block_rms(&bot_audio, Duration::from_secs(35)).await;
+            ensure!(
+                rms > NON_SILENT_RMS,
+                "bot produced only silence (max block rms={rms:.4})"
+            );
+            ensure!(
+                bot.openai_connection_state() == RTCPeerConnectionState::Connected,
+                "the OpenAI PeerConnection is not connected: {:?}",
+                bot.openai_connection_state()
+            );
+            Ok(())
+        }
+        .await;
 
-        let audio = LocalAudioTrack::opus().context("speaker Opus track")?;
-        call_s
-            .publish_audio(audio.clone())
-            .await
-            .context("speaker publish audio")?;
-        tone = Some(spawn_speech_tone(audio));
-
-        call_s
-            .update_subscriptions(SubscriptionConfig::audio_all())
-            .await
-            .context("speaker subscriptions")?;
-
-        ensure!(
-            wait_until(Duration::from_secs(60), || bot.audio_seen()).await,
-            "bot on_track never fired for AUDIO (subscription/ICE/RTP stage)"
-        );
-
-        let bot_audio = recv_track(
-            &mut rx_s,
-            &bot_user,
-            TrackType::Audio,
-            Duration::from_secs(45),
-        )
-        .await
-        .context("second session never received the bot's audio track")?;
-        let rms = max_block_rms(&bot_audio, Duration::from_secs(35)).await;
-        ensure!(
-            rms > NON_SILENT_RMS,
-            "bot produced only silence (max block rms={rms:.4})"
-        );
-        ensure!(
-            bot.openai_connection_state() == RTCPeerConnectionState::Connected,
-            "the OpenAI PeerConnection is not connected: {:?}",
-            bot.openai_connection_state()
-        );
-        Ok(())
+        stop_task(tone).await;
+        let speaker_cleanup = call_s.leave().await;
+        let bot_cleanup = match bot_handle {
+            Some(bot) => bot.shutdown().await,
+            None => Ok(()),
+        };
+        if let Err(error) = outcome {
+            panic!("{error:#}; speaker cleanup: {speaker_cleanup:?}; bot cleanup: {bot_cleanup:?}");
+        }
+        speaker_cleanup.expect("speaker cleanup");
+        bot_cleanup.expect("bot cleanup");
     })
-    .await
-    .context("GPT bot test timed out")
-    .and_then(|result| result);
-
-    stop_task(tone).await;
-    let speaker_cleanup = call_s.leave().await;
-    let bot_cleanup = match bot_handle {
-        Some(bot) => bot.shutdown().await,
-        None => Ok(()),
-    };
-    let call_cleanup = admin.delete(DeleteCallRequest { hard: Some(true) }).await;
-    if let Err(error) = outcome {
-        panic!(
-            "{error:#}; speaker cleanup: {speaker_cleanup:?}; bot cleanup: {bot_cleanup:?}; \
-             call cleanup: {call_cleanup:?}"
-        );
-    }
-    speaker_cleanup.expect("speaker cleanup");
-    bot_cleanup.expect("bot cleanup");
-    call_cleanup.expect("call cleanup");
+    .await;
 }

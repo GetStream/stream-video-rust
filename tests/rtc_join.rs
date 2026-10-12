@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use getstream::TokenOptions;
 use getstream::models::UserRequest;
-use getstream::models::{CallRequest, DeleteCallRequest, GetOrCreateCallRequest, MemberRequest};
+use getstream::models::{CallRequest, GetOrCreateCallRequest, MemberRequest};
 use getstream::rtc::{CallingState, ClientCallEvent, JoinCallData, RtcClient, SfuCallEvent};
 use tokio::sync::broadcast::Receiver;
 
@@ -94,7 +94,7 @@ async fn two_sessions_join_and_observe_each_other() {
         .expect("get_or_create failed");
 
     // The whole join/observe/leave dance must finish well within a minute.
-    let outcome = tokio::time::timeout(Duration::from_secs(90), async {
+    common::run_then_delete(call_admin, Duration::from_secs(90), async move {
         let call_a = client.video().call("default", &call_id);
         // Session B joins through the `RtcCall` view of a server-client call.
         let call_b = client.video().call("default", &call_id).rtc();
@@ -133,13 +133,6 @@ async fn two_sessions_join_and_observe_each_other() {
         call_b.leave().await.expect("session B leave failed");
     })
     .await;
-
-    // Best-effort cleanup regardless of outcome.
-    let _ = call_admin
-        .delete(DeleteCallRequest { hard: Some(true) })
-        .await;
-
-    outcome.expect("two-session join test timed out (possible hang)");
 }
 
 #[tokio::test]
@@ -153,18 +146,6 @@ async fn provider_backed_client_loads_token_and_joins() {
         .upsert_users([UserRequest::new(&user_id)])
         .await
         .expect("upsert provider user");
-    let admin = client.video().call("default", &call_id);
-    admin
-        .get_or_create(GetOrCreateCallRequest {
-            data: Some(CallRequest {
-                created_by_id: Some(user_id.clone()),
-                members: Some(vec![MemberRequest::new(&user_id)]),
-                ..Default::default()
-            }),
-            ..Default::default()
-        })
-        .await
-        .expect("create provider call");
 
     let loads = Arc::new(AtomicUsize::new(0));
     let provider_loads = loads.clone();
@@ -178,7 +159,20 @@ async fn provider_backed_client_loads_token_and_joins() {
     })
     .expect("provider-backed RTC client");
 
-    let outcome = tokio::time::timeout(Duration::from_secs(90), async {
+    let admin = client.video().call("default", &call_id);
+    admin
+        .get_or_create(GetOrCreateCallRequest {
+            data: Some(CallRequest {
+                created_by_id: Some(user_id.clone()),
+                members: Some(vec![MemberRequest::new(&user_id)]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        })
+        .await
+        .expect("create provider call");
+
+    common::run_then_delete(admin, Duration::from_secs(90), async move {
         let call = rtc
             .join("default", &call_id, JoinCallData::new(&user_id))
             .await
@@ -186,8 +180,6 @@ async fn provider_backed_client_loads_token_and_joins() {
         call.leave().await.expect("provider-backed leave");
     })
     .await;
-    let _ = admin.delete(DeleteCallRequest { hard: Some(true) }).await;
-    outcome.expect("provider-backed join timed out");
     assert_eq!(loads.load(Ordering::SeqCst), 1);
 }
 
@@ -207,6 +199,18 @@ async fn preminted_token_client_gets_join_events_and_signature_is_enforced() {
         .await
         .expect("upsert token authorization user");
 
+    let token = client
+        .create_token_with(
+            &user_id,
+            TokenOptions {
+                expiration: Some(Duration::from_secs(600)),
+                call_cids: Some(vec![format!("default:{call_id}")]),
+                ..Default::default()
+            },
+        )
+        .expect("mint participant token");
+    let tampered = tamper_signature(&token).expect("tamper JWT signature");
+
     let admin = client.video().call("default", &call_id);
     admin
         .get_or_create(GetOrCreateCallRequest {
@@ -220,64 +224,50 @@ async fn preminted_token_client_gets_join_events_and_signature_is_enforced() {
         .await
         .expect("create token signature call");
 
-    let token = client
-        .create_token_with(
-            &user_id,
-            TokenOptions {
-                expiration: Some(Duration::from_secs(600)),
-                call_cids: Some(vec![format!("default:{call_id}")]),
-                ..Default::default()
-            },
-        )
-        .expect("mint participant token");
-    let tampered = tamper_signature(&token).expect("tamper JWT signature");
-
-    let outcome: Result<(), String> = tokio::time::timeout(Duration::from_secs(120), async {
-        let allowed = RtcClient::new(client.api_key(), token)
-            .map_err(|error| format!("build RTC client: {error}"))?
-            .call("default", &call_id);
-        let mut events = allowed.client_events();
-        allowed
-            .join(JoinCallData::new(&user_id))
-            .await
-            .map_err(|error| format!("valid token failed to join: {error}"))?;
-        let mut states = Vec::new();
-        while let Ok(event) = events.try_recv() {
-            if let ClientCallEvent::CallingStateChanged(state) = event {
-                states.push(state);
+    common::run_then_delete(admin, Duration::from_secs(120), async move {
+        let outcome: Result<(), String> = async {
+            let allowed = RtcClient::new(client.api_key(), token)
+                .map_err(|error| format!("build RTC client: {error}"))?
+                .call("default", &call_id);
+            let mut events = allowed.client_events();
+            allowed
+                .join(JoinCallData::new(&user_id))
+                .await
+                .map_err(|error| format!("valid token failed to join: {error}"))?;
+            let mut states = Vec::new();
+            while let Ok(event) = events.try_recv() {
+                if let ClientCallEvent::CallingStateChanged(state) = event {
+                    states.push(state);
+                }
             }
-        }
-        if states != [CallingState::Joining, CallingState::Joined] {
-            let _ = allowed.leave().await;
-            return Err(format!("join states seen before the join: {states:?}"));
-        }
-        allowed
-            .leave()
-            .await
-            .map_err(|error| format!("leave valid-token call: {error}"))?;
+            if states != [CallingState::Joining, CallingState::Joined] {
+                let _ = allowed.leave().await;
+                return Err(format!("join states seen before the join: {states:?}"));
+            }
+            allowed
+                .leave()
+                .await
+                .map_err(|error| format!("leave valid-token call: {error}"))?;
 
-        if let Ok(unexpected) = RtcClient::new(client.api_key(), tampered)
-            .map_err(|error| format!("build tampered-token RTC client: {error}"))?
-            .join("default", &call_id, JoinCallData::new(&user_id))
-            .await
-        {
-            let leave = unexpected.leave().await;
-            return Err(format!(
-                "Stream accepted a participant token with a tampered signature; \
-                 leave result: {leave:?}"
-            ));
+            if let Ok(unexpected) = RtcClient::new(client.api_key(), tampered)
+                .map_err(|error| format!("build tampered-token RTC client: {error}"))?
+                .join("default", &call_id, JoinCallData::new(&user_id))
+                .await
+            {
+                let leave = unexpected.leave().await;
+                return Err(format!(
+                    "Stream accepted a participant token with a tampered signature; \
+                     leave result: {leave:?}"
+                ));
+            }
+            Ok(())
         }
-        Ok(())
+        .await;
+        if let Err(error) = outcome {
+            panic!("{error}");
+        }
     })
-    .await
-    .map_err(|_| "participant token signature test timed out".to_owned())
-    .and_then(|result| result);
-
-    let cleanup = admin.delete(DeleteCallRequest { hard: Some(true) }).await;
-    if let Err(error) = outcome {
-        panic!("{error}; cleanup: {cleanup:?}");
-    }
-    cleanup.expect("delete token signature test call");
+    .await;
 }
 
 /// A completed leave starts a new lifecycle generation, so the same call handle
@@ -305,7 +295,7 @@ async fn join_leave_join_same_handle() {
     .await
     .expect("create call");
 
-    let outcome = tokio::time::timeout(Duration::from_secs(90), async {
+    common::run_then_delete(call.clone(), Duration::from_secs(90), async move {
         call.join(JoinCallData::new(&user_id))
             .await
             .expect("first join");
@@ -316,7 +306,4 @@ async fn join_leave_join_same_handle() {
         call.leave().await.expect("second leave");
     })
     .await;
-
-    let _ = call.delete(DeleteCallRequest { hard: Some(true) }).await;
-    outcome.expect("join/leave/join test timed out");
 }

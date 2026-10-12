@@ -35,68 +35,71 @@ async fn call_crud_lifecycle() {
 
     let call = client.video().call("default", &call_id);
 
-    // create (get_or_create)
-    let created = call
-        .get_or_create(GetOrCreateCallRequest {
-            data: Some(CallRequest {
-                created_by_id: Some(owner_id.clone()),
+    common::run_then_delete(call.clone(), Duration::from_secs(60), async move {
+        // create (get_or_create)
+        let created = call
+            .get_or_create(GetOrCreateCallRequest {
+                data: Some(CallRequest {
+                    created_by_id: Some(owner_id.clone()),
+                    ..Default::default()
+                }),
                 ..Default::default()
-            }),
-            ..Default::default()
-        })
-        .await
-        .expect("get_or_create failed");
-    assert!(created.created, "expected a freshly created call");
-    assert_eq!(created.call.id, call_id);
-    assert_eq!(created.call.cid, format!("default:{call_id}"));
+            })
+            .await
+            .expect("get_or_create failed");
+        assert!(created.created, "expected a freshly created call");
+        assert_eq!(created.call.id, call_id);
+        assert_eq!(created.call.cid, format!("default:{call_id}"));
 
-    // get
-    let got = call
-        .get(GetCallRequest::default())
-        .await
-        .expect("get failed");
-    assert_eq!(got.call.cid, format!("default:{call_id}"));
+        // get
+        let got = call
+            .get(GetCallRequest::default())
+            .await
+            .expect("get failed");
+        assert_eq!(got.call.cid, format!("default:{call_id}"));
 
-    // update members
-    let updated = call
-        .update_call_members(UpdateCallMembersRequest {
-            update_members: vec![MemberRequest::new(&member_id)],
-            remove_members: vec![],
-        })
-        .await
-        .expect("update_call_members failed");
-    assert!(
-        updated.members.iter().any(|m| m.user_id == member_id),
-        "expected member {member_id} in members list"
-    );
+        // update members
+        let updated = call
+            .update_call_members(UpdateCallMembersRequest {
+                update_members: vec![MemberRequest::new(&member_id)],
+                remove_members: vec![],
+            })
+            .await
+            .expect("update_call_members failed");
+        assert!(
+            updated.members.iter().any(|m| m.user_id == member_id),
+            "expected member {member_id} in members list"
+        );
 
-    // query_calls: our call should be findable by CID filter
-    let queried = client
-        .video()
-        .query_calls(QueryCallsRequest {
-            filter_conditions: serde_json::json!({ "cid": format!("default:{call_id}") })
-                .as_object()
-                .cloned()
-                .unwrap()
-                .into_iter()
-                .collect(),
-            limit: Some(1),
-            ..Default::default()
-        })
-        .await
-        .expect("query_calls failed");
-    assert!(
-        queried.calls.iter().any(|c| c.call.id == call_id),
-        "expected queried calls to include {call_id}"
-    );
+        // query_calls: our call should be findable by CID filter
+        let queried = client
+            .video()
+            .query_calls(QueryCallsRequest {
+                filter_conditions: serde_json::json!({ "cid": format!("default:{call_id}") })
+                    .as_object()
+                    .cloned()
+                    .unwrap()
+                    .into_iter()
+                    .collect(),
+                limit: Some(1),
+                ..Default::default()
+            })
+            .await
+            .expect("query_calls failed");
+        assert!(
+            queried.calls.iter().any(|c| c.call.id == call_id),
+            "expected queried calls to include {call_id}"
+        );
 
-    // end
-    call.end().await.expect("end failed");
+        // end
+        call.end().await.expect("end failed");
 
-    // delete (hard) — also our cleanup so reruns stay idempotent
-    call.delete(DeleteCallRequest { hard: Some(true) })
-        .await
-        .expect("delete failed");
+        // delete (hard) — also our cleanup so reruns stay idempotent
+        call.delete(DeleteCallRequest { hard: Some(true) })
+            .await
+            .expect("delete failed");
+    })
+    .await;
 }
 
 #[tokio::test]
@@ -125,39 +128,39 @@ async fn scoped_call_endpoints_lifecycle() {
     .await
     .expect("get_or_create failed");
 
-    let outcome: Result<(), String> = async {
-        let mut filter_conditions = getstream::models::CustomData::new();
-        filter_conditions.insert("user_id".to_owned(), serde_json::json!(member_id.clone()));
-        call.query_participants(QueryCallParticipantsRequest {
-            limit: Some(10),
-            filter_conditions,
-        })
-        .await
-        .map_err(|error| format!("query_participants failed: {error}"))?;
-
-        call.ring(RingCallRequest {
-            video: Some(false),
-            members_ids: vec![member_id.clone()],
-        })
-        .await
-        .map_err(|error| format!("ring failed: {error}"))?;
-
-        call.list_recordings()
+    common::run_then_delete(call.clone(), Duration::from_secs(60), async move {
+        let outcome: Result<(), String> = async {
+            let mut filter_conditions = getstream::models::CustomData::new();
+            filter_conditions.insert("user_id".to_owned(), serde_json::json!(member_id.clone()));
+            call.query_participants(QueryCallParticipantsRequest {
+                limit: Some(10),
+                filter_conditions,
+            })
             .await
-            .map_err(|error| format!("list_recordings failed: {error}"))?;
-        call.list_transcriptions()
-            .await
-            .map_err(|error| format!("list_transcriptions failed: {error}"))?;
+            .map_err(|error| format!("query_participants failed: {error}"))?;
 
-        Ok(())
-    }
+            call.ring(RingCallRequest {
+                video: Some(false),
+                members_ids: vec![member_id.clone()],
+            })
+            .await
+            .map_err(|error| format!("ring failed: {error}"))?;
+
+            call.list_recordings()
+                .await
+                .map_err(|error| format!("list_recordings failed: {error}"))?;
+            call.list_transcriptions()
+                .await
+                .map_err(|error| format!("list_transcriptions failed: {error}"))?;
+
+            Ok(())
+        }
+        .await;
+        if let Err(error) = outcome {
+            panic!("{error}");
+        }
+    })
     .await;
-
-    let cleanup = call.delete(DeleteCallRequest { hard: Some(true) }).await;
-    if let Err(error) = outcome {
-        panic!("{error}; cleanup result: {cleanup:?}");
-    }
-    cleanup.expect("delete cleanup failed");
 }
 
 #[tokio::test]
@@ -186,64 +189,65 @@ async fn audio_room_send_audio_permission_controls_publishing() {
         })
         .await
         .expect("create permission test call");
-    admin
-        .go_live(GoLiveRequest::default())
-        .await
-        .expect("take permission test audio room live");
-    let participant = client.video().call("audio_room", &call_id);
-    let outcome: Result<(), String> = tokio::time::timeout(Duration::from_secs(120), async {
-        let mut events = participant.coordinator_events();
-        participant
-            .join(JoinCallData::new(&publisher_id))
-            .await
-            .map_err(|error| format!("join permission test participant: {error}"))?;
-        let denied_track = LocalAudioTrack::opus()
-            .map_err(|error| format!("create denied audio track: {error}"))?;
-        match participant.publish_audio(denied_track).await {
-            Err(RtcError::PermissionDenied {
-                capability: "send-audio",
-            }) => {}
-            Err(error) => {
-                return Err(format!(
-                    "publish with send-audio revoked returned the wrong error: {error}"
-                ));
-            }
-            Ok(()) => {
-                return Err("participant published audio while send-audio was revoked".to_owned());
-            }
-        }
+    common::run_then_delete(admin.clone(), Duration::from_secs(120), async move {
         admin
-            .grant_permissions(&publisher_id, vec!["send-audio".to_owned()])
+            .go_live(GoLiveRequest::default())
             .await
-            .map_err(|error| format!("grant send-audio: {error}"))?;
-        wait_for_audio_permission(&mut events, true).await?;
-        let allowed_track = LocalAudioTrack::opus()
-            .map_err(|error| format!("create allowed audio track: {error}"))?;
-        participant
-            .publish_audio(allowed_track.clone())
-            .await
-            .map_err(|error| format!("publish after send-audio grant: {error}"))?;
-        participant
-            .stop_publish(LocalTrack::Audio(allowed_track))
-            .await
-            .map_err(|error| format!("stop granted audio publication: {error}"))?;
-        participant
-            .leave()
-            .await
-            .map_err(|error| format!("leave after allowed publish: {error}"))?;
-        Ok(())
-    })
-    .await
-    .map_err(|_| "permission behavior test timed out".to_owned())
-    .and_then(|result| result);
+            .expect("take permission test audio room live");
+        let participant = client.video().call("audio_room", &call_id);
+        let outcome: Result<(), String> = async {
+            let mut events = participant.coordinator_events();
+            participant
+                .join(JoinCallData::new(&publisher_id))
+                .await
+                .map_err(|error| format!("join permission test participant: {error}"))?;
+            let denied_track = LocalAudioTrack::opus()
+                .map_err(|error| format!("create denied audio track: {error}"))?;
+            match participant.publish_audio(denied_track).await {
+                Err(RtcError::PermissionDenied {
+                    capability: "send-audio",
+                }) => {}
+                Err(error) => {
+                    return Err(format!(
+                        "publish with send-audio revoked returned the wrong error: {error}"
+                    ));
+                }
+                Ok(()) => {
+                    return Err(
+                        "participant published audio while send-audio was revoked".to_owned()
+                    );
+                }
+            }
+            admin
+                .grant_permissions(&publisher_id, vec!["send-audio".to_owned()])
+                .await
+                .map_err(|error| format!("grant send-audio: {error}"))?;
+            wait_for_audio_permission(&mut events, true).await?;
+            let allowed_track = LocalAudioTrack::opus()
+                .map_err(|error| format!("create allowed audio track: {error}"))?;
+            participant
+                .publish_audio(allowed_track.clone())
+                .await
+                .map_err(|error| format!("publish after send-audio grant: {error}"))?;
+            participant
+                .stop_publish(LocalTrack::Audio(allowed_track))
+                .await
+                .map_err(|error| format!("stop granted audio publication: {error}"))?;
+            participant
+                .leave()
+                .await
+                .map_err(|error| format!("leave after allowed publish: {error}"))?;
+            Ok(())
+        }
+        .await;
 
-    let leave_cleanup = participant.leave().await;
-    let delete_cleanup = admin.delete(DeleteCallRequest { hard: Some(true) }).await;
-    if let Err(error) = outcome {
-        panic!("{error}; leave cleanup: {leave_cleanup:?}; delete cleanup: {delete_cleanup:?}");
-    }
-    leave_cleanup.expect("permission test leave cleanup");
-    delete_cleanup.expect("permission test delete cleanup");
+        let leave_cleanup = participant.leave().await;
+        if let Err(error) = outcome {
+            panic!("{error}; leave cleanup: {leave_cleanup:?}");
+        }
+        leave_cleanup.expect("permission test leave cleanup");
+    })
+    .await;
 }
 
 async fn wait_for_audio_permission(
@@ -308,188 +312,190 @@ async fn scoped_participant_service_lifecycle() {
     })
     .await
     .expect("get_or_create failed");
-    assert!(
-        server_call.session_id().await.is_none(),
-        "server REST handle unexpectedly has participant state"
-    );
 
-    let outcome: Result<(), String> = async {
-        call.join(getstream::rtc::JoinCallData::new(&user_id))
-            .await
-            .map_err(|error| format!("join failed: {error}"))?;
-        let session_id = call
-            .session_id()
-            .await
-            .ok_or_else(|| "joined call did not expose a session id".to_owned())?;
+    common::run_then_delete(call.clone(), Duration::from_secs(120), async move {
+        assert!(
+            server_call.session_id().await.is_none(),
+            "server REST handle unexpectedly has participant state"
+        );
 
-        call.set_incoming_video_enabled(false)
-            .await
-            .map_err(|error| format!("disable incoming video failed: {error}"))?;
-        call.set_incoming_video_enabled(true)
-            .await
-            .map_err(|error| format!("enable incoming video failed: {error}"))?;
+        let outcome: Result<(), String> = async {
+            call.join(getstream::rtc::JoinCallData::new(&user_id))
+                .await
+                .map_err(|error| format!("join failed: {error}"))?;
+            let session_id = call
+                .session_id()
+                .await
+                .ok_or_else(|| "joined call did not expose a session id".to_owned())?;
 
-        let mut events = call.coordinator_events();
-        let mut custom = getstream::models::CustomData::new();
-        custom.insert("source".to_owned(), serde_json::json!("rust-live-test"));
-        server_call
-            .send_custom_event(SendCallEventRequest {
-                user_id: Some(user_id.clone()),
-                custom,
-                user: None,
-            })
-            .await
-            .map_err(|error| format!("send_custom_event failed: {error}"))?;
-        let custom_event = tokio::time::timeout(Duration::from_secs(10), async {
-            while let Ok(event) = events.recv().await {
-                if event.event_type == "custom"
-                    && event
-                        .raw
-                        .pointer("/custom/source")
-                        .and_then(serde_json::Value::as_str)
-                        == Some("rust-live-test")
-                {
-                    return Ok(());
-                }
-            }
-            Err("coordinator event stream ended before the custom event".to_owned())
-        })
-        .await
-        .map_err(|_| "timed out waiting for custom coordinator event".to_owned())
-        .and_then(|result| result);
-        custom_event?;
+            call.set_incoming_video_enabled(false)
+                .await
+                .map_err(|error| format!("disable incoming video failed: {error}"))?;
+            call.set_incoming_video_enabled(true)
+                .await
+                .map_err(|error| format!("enable incoming video failed: {error}"))?;
 
-        let caption_result: Result<(), String> = async {
-            let caption_text = format!("rust caption {session_id}");
+            let mut events = call.coordinator_events();
+            let mut custom = getstream::models::CustomData::new();
+            custom.insert("source".to_owned(), serde_json::json!("rust-live-test"));
             server_call
-                .send_closed_caption(SendClosedCaptionRequest {
-                    speaker_id: user_id.clone(),
-                    text: caption_text.clone(),
-                    start_time: Some(serde_json::json!("2026-08-17T18:00:00Z")),
-                    end_time: Some(serde_json::json!("2026-08-17T18:00:01Z")),
-                    language: Some("en".to_owned()),
-                    service: Some("manual".to_owned()),
+                .send_custom_event(SendCallEventRequest {
                     user_id: Some(user_id.clone()),
-                    ..Default::default()
+                    custom,
+                    user: None,
                 })
                 .await
-                .map_err(|error| format!("send_closed_caption failed: {error}"))?;
-            tokio::time::timeout(Duration::from_secs(10), async {
+                .map_err(|error| format!("send_custom_event failed: {error}"))?;
+            let custom_event = tokio::time::timeout(Duration::from_secs(10), async {
                 while let Ok(event) = events.recv().await {
-                    if event.event_type == "call.closed_caption"
+                    if event.event_type == "custom"
                         && event
                             .raw
-                            .pointer("/closed_caption/text")
+                            .pointer("/custom/source")
                             .and_then(serde_json::Value::as_str)
-                            == Some(caption_text.as_str())
+                            == Some("rust-live-test")
                     {
                         return Ok(());
                     }
                 }
-                Err("coordinator event stream ended before the closed caption".to_owned())
+                Err("coordinator event stream ended before the custom event".to_owned())
             })
             .await
-            .map_err(|_| "timed out waiting for closed caption event".to_owned())
-            .and_then(|result| result)
-        }
-        .await;
-        caption_result?;
+            .map_err(|_| "timed out waiting for custom coordinator event".to_owned())
+            .and_then(|result| result);
+            custom_event?;
 
-        call.send_reaction(SendVideoReactionRequest {
-            reaction_type: "raise-hand".to_owned(),
-            emoji_code: Some("✋".to_owned()),
-            custom: None,
-        })
-        .await
-        .map_err(|error| format!("send_reaction failed: {error}"))?;
+            let caption_result: Result<(), String> = async {
+                let caption_text = format!("rust caption {session_id}");
+                server_call
+                    .send_closed_caption(SendClosedCaptionRequest {
+                        speaker_id: user_id.clone(),
+                        text: caption_text.clone(),
+                        start_time: Some(serde_json::json!("2026-08-17T18:00:00Z")),
+                        end_time: Some(serde_json::json!("2026-08-17T18:00:01Z")),
+                        language: Some("en".to_owned()),
+                        service: Some("manual".to_owned()),
+                        user_id: Some(user_id.clone()),
+                        ..Default::default()
+                    })
+                    .await
+                    .map_err(|error| format!("send_closed_caption failed: {error}"))?;
+                tokio::time::timeout(Duration::from_secs(10), async {
+                    while let Ok(event) = events.recv().await {
+                        if event.event_type == "call.closed_caption"
+                            && event
+                                .raw
+                                .pointer("/closed_caption/text")
+                                .and_then(serde_json::Value::as_str)
+                                == Some(caption_text.as_str())
+                        {
+                            return Ok(());
+                        }
+                    }
+                    Err("coordinator event stream ended before the closed caption".to_owned())
+                })
+                .await
+                .map_err(|_| "timed out waiting for closed caption event".to_owned())
+                .and_then(|result| result)
+            }
+            .await;
+            caption_result?;
 
-        allow_entitlement_skip(
-            "request_permissions",
-            call.request_permissions(RequestPermissionRequest {
-                permissions: vec!["send-video".to_owned()],
+            call.send_reaction(SendVideoReactionRequest {
+                reaction_type: "raise-hand".to_owned(),
+                emoji_code: Some("✋".to_owned()),
+                custom: None,
             })
-            .await,
-        )?;
+            .await
+            .map_err(|error| format!("send_reaction failed: {error}"))?;
 
-        let captions_started = allow_entitlement_skip(
-            "start_closed_captions",
-            call.start_closed_captions(StartClosedCaptionsRequest {
-                language: Some("en".to_owned()),
+            allow_entitlement_skip(
+                "request_permissions",
+                call.request_permissions(RequestPermissionRequest {
+                    permissions: vec!["send-video".to_owned()],
+                })
+                .await,
+            )?;
+
+            let captions_started = allow_entitlement_skip(
+                "start_closed_captions",
+                call.start_closed_captions(StartClosedCaptionsRequest {
+                    language: Some("en".to_owned()),
+                    ..Default::default()
+                })
+                .await,
+            )?
+            .is_some();
+            if captions_started {
+                call.stop_closed_captions(StopClosedCaptionsRequest::default())
+                    .await
+                    .map_err(|error| format!("stop_closed_captions failed: {error}"))?;
+            }
+            let transcriptions = call
+                .list_transcriptions()
+                .await
+                .map_err(|error| format!("list_transcriptions failed: {error}"))?;
+            if let Some(transcription) = transcriptions.transcriptions.first() {
+                call.delete_transcription(&transcription.session_id, &transcription.filename)
+                    .await
+                    .map_err(|error| format!("delete_transcription failed: {error}"))?;
+            } else {
+                eprintln!("SKIP artifact cleanup: delete_transcription had no generated artifact");
+            }
+
+            let frame_recording_started = allow_entitlement_skip(
+                "start_frame_recording",
+                call.start_frame_recording(StartFrameRecordingRequest::default())
+                    .await,
+            )?
+            .is_some();
+            if frame_recording_started {
+                call.stop_frame_recording()
+                    .await
+                    .map_err(|error| format!("stop_frame_recording failed: {error}"))?;
+            }
+
+            call.submit_feedback(CollectUserFeedbackRequest {
+                rating: 5,
+                sdk: "stream-rust".to_owned(),
+                sdk_version: env!("CARGO_PKG_VERSION").to_owned(),
+                user_session_id: Some(session_id.clone()),
                 ..Default::default()
             })
-            .await,
-        )?
-        .is_some();
-        if captions_started {
-            call.stop_closed_captions(StopClosedCaptionsRequest::default())
-                .await
-                .map_err(|error| format!("stop_closed_captions failed: {error}"))?;
-        }
-        let transcriptions = call
-            .list_transcriptions()
             .await
-            .map_err(|error| format!("list_transcriptions failed: {error}"))?;
-        if let Some(transcription) = transcriptions.transcriptions.first() {
-            call.delete_transcription(&transcription.session_id, &transcription.filename)
-                .await
-                .map_err(|error| format!("delete_transcription failed: {error}"))?;
-        } else {
-            eprintln!("SKIP artifact cleanup: delete_transcription had no generated artifact");
-        }
+            .map_err(|error| format!("submit_feedback failed: {error}"))?;
 
-        let frame_recording_started = allow_entitlement_skip(
-            "start_frame_recording",
-            call.start_frame_recording(StartFrameRecordingRequest::default())
+            call.end()
+                .await
+                .map_err(|error| format!("end failed: {error}"))?;
+            call.leave()
+                .await
+                .map_err(|error| format!("leave failed: {error}"))?;
+
+            allow_stats_pending_skip("get_call_stats", call.get_call_stats(&session_id).await)?;
+            allow_stats_pending_skip(
+                "get_call_report",
+                call.get_call_report(GetCallReportRequest {
+                    session_id: Some(session_id.clone()),
+                })
                 .await,
-        )?
-        .is_some();
-        if frame_recording_started {
-            call.stop_frame_recording()
-                .await
-                .map_err(|error| format!("stop_frame_recording failed: {error}"))?;
+            )?;
+            allow_stats_pending_skip(
+                "get_call_stats_map",
+                call.get_call_stats_map(&session_id, GetCallStatsMapRequest::default())
+                    .await,
+            )?;
+            Ok(())
         }
+        .await;
 
-        call.submit_feedback(CollectUserFeedbackRequest {
-            rating: 5,
-            sdk: "stream-rust".to_owned(),
-            sdk_version: env!("CARGO_PKG_VERSION").to_owned(),
-            user_session_id: Some(session_id.clone()),
-            ..Default::default()
-        })
-        .await
-        .map_err(|error| format!("submit_feedback failed: {error}"))?;
-
-        call.end()
-            .await
-            .map_err(|error| format!("end failed: {error}"))?;
-        call.leave()
-            .await
-            .map_err(|error| format!("leave failed: {error}"))?;
-
-        allow_stats_pending_skip("get_call_stats", call.get_call_stats(&session_id).await)?;
-        allow_stats_pending_skip(
-            "get_call_report",
-            call.get_call_report(GetCallReportRequest {
-                session_id: Some(session_id.clone()),
-            })
-            .await,
-        )?;
-        allow_stats_pending_skip(
-            "get_call_stats_map",
-            call.get_call_stats_map(&session_id, GetCallStatsMapRequest::default())
-                .await,
-        )?;
-        Ok(())
-    }
+        let leave_cleanup = call.leave().await;
+        if let Err(error) = outcome {
+            panic!("{error}; leave cleanup: {leave_cleanup:?}");
+        }
+        leave_cleanup.expect("leave cleanup failed");
+    })
     .await;
-
-    let leave_cleanup = call.leave().await;
-    let delete_cleanup = call.delete(DeleteCallRequest { hard: Some(true) }).await;
-    if let Err(error) = outcome {
-        panic!("{error}; leave cleanup: {leave_cleanup:?}; delete cleanup: {delete_cleanup:?}");
-    }
-    leave_cleanup.expect("leave cleanup failed");
-    delete_cleanup.expect("delete cleanup failed");
 }
 
 fn allow_entitlement_skip<T>(

@@ -284,9 +284,36 @@ async fn collect_stats(pc: &Arc<RTCPeerConnection>) -> (String, Value) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use serde_json::json;
+
+    /// Runs `body` as a task for a maximum of `limit`, then hard-deletes the call of
+    /// `admin`. If `body` panics or times out, the test fails after the delete.
+    pub(crate) async fn run_then_delete<F, T>(
+        admin: crate::video::Call,
+        limit: Duration,
+        body: F,
+    ) -> T
+    where
+        F: Future<Output = T> + Send + 'static,
+        T: Send + 'static,
+    {
+        let mut task = tokio::spawn(body);
+        let outcome = tokio::time::timeout(limit, &mut task).await;
+        if outcome.is_err() {
+            task.abort();
+        }
+        let _ = admin
+            .delete(crate::models::DeleteCallRequest { hard: Some(true) })
+            .await;
+        match outcome {
+            Ok(Ok(value)) => value,
+            Ok(Err(error)) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
+            Ok(Err(error)) => panic!("test task was cancelled: {error}"),
+            Err(_) => panic!("test timed out"),
+        }
+    }
 
     #[test]
     fn cadence_uses_coordinator_interval_when_positive() {
@@ -400,7 +427,7 @@ mod tests {
         let call_a = stream.video().call("default", &call_id);
         let call_b = stream.video().call("default", &call_id);
 
-        let outcome = tokio::time::timeout(Duration::from_secs(120), async {
+        let outcome = run_then_delete(admin, Duration::from_secs(120), async move {
             // A publishes a continuous 440 Hz tone.
             call_a
                 .join(JoinCallData::new(&user_a))
@@ -507,18 +534,13 @@ mod tests {
 
             feeder.abort();
             drop(held);
+            let _ = call_a.leave().await;
+            let _ = call_b.leave().await;
             (cid, a_session, b_session, a_report, b_report, a_obs, b_obs)
         })
         .await;
 
-        let _ = call_a.leave().await;
-        let _ = call_b.leave().await;
-        let _ = admin
-            .delete(crate::models::DeleteCallRequest { hard: Some(true) })
-            .await;
-
-        let (cid, a_session, b_session, a_report, b_report, a_obs, b_obs) =
-            outcome.expect("telemetry test timed out (120s guard)");
+        let (cid, a_session, b_session, a_report, b_report, a_obs, b_obs) = outcome;
 
         eprintln!(
             "DASHBOARD CHECK: cid={cid} publisher_session={a_session} subscriber_session={b_session}"
@@ -604,7 +626,7 @@ mod tests {
             .expect("get_or_create");
 
         let call_a = stream.video().call("default", &call_id);
-        let outcome = tokio::time::timeout(Duration::from_secs(90), async {
+        let outcome = run_then_delete(admin, Duration::from_secs(90), async move {
             call_a
                 .join(JoinCallData::new(&user_a))
                 .await
@@ -669,17 +691,12 @@ mod tests {
             }
 
             feeder.abort();
+            let _ = call_a.leave().await;
             (options.reporting_interval_ms, effective, success)
         })
         .await;
 
-        let _ = call_a.leave().await;
-        let _ = admin
-            .delete(crate::models::DeleteCallRequest { hard: Some(true) })
-            .await;
-
-        let (coordinator_interval_ms, effective, success) =
-            outcome.expect("default-cadence stats test timed out (90s guard)");
+        let (coordinator_interval_ms, effective, success) = outcome;
         eprintln!(
             "STATS DEFAULT: coordinator reporting_interval_ms={coordinator_interval_ms} \
              effective_ms={} periodic_success={success}",
