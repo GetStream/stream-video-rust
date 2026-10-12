@@ -443,7 +443,8 @@ struct AudioInner {
     encoder: StdMutex<opus::Encoder>,
     pacer: StdMutex<Option<JoinHandle<()>>>,
     pacer_started: AtomicBool,
-    /// Starts as `pace`. Set by `start_pacing`, cleared by `pause_pacing`.
+    /// Cleared by `pause_pacing`, set by `start_pacing`. Starts set: with
+    /// `pace` off, no pacer runs before `start_pacing` or the hold end.
     pacing_enabled: AtomicBool,
     pcm_pacing: AtomicBool,
     /// [`LocalAudioTrackConfig::pace`].
@@ -520,7 +521,9 @@ pub struct LocalAudioTrackConfig {
     /// negotiated PeerConnection can send the track. Before that, the queue
     /// keeps the written audio. A
     /// [`LocalAudioTrack::pause_pacing`] before that write stays in force. When
-    /// `false`, `write_pcm` only queues until [`LocalAudioTrack::start_pacing`].
+    /// `false`, `write_pcm` only queues until [`LocalAudioTrack::start_pacing`]
+    /// or the first SFU publisher connect of
+    /// [`Call::publish_audio`](crate::Call::publish_audio).
     pub pace: bool,
 }
 
@@ -644,7 +647,7 @@ impl LocalAudioTrack {
                 encoder: StdMutex::new(encoder),
                 pacer: StdMutex::new(None),
                 pacer_started: AtomicBool::new(false),
-                pacing_enabled: AtomicBool::new(config.pace),
+                pacing_enabled: AtomicBool::new(true),
                 pcm_pacing: AtomicBool::new(true),
                 pace: config.pace,
                 held: AtomicBool::new(false),
@@ -662,7 +665,9 @@ impl LocalAudioTrack {
     /// negotiated PeerConnection can send the track starts pacing when
     /// [`LocalAudioTrackConfig::pace`] is set (the default) and no
     /// [`pause_pacing`](Self::pause_pacing) came before it; otherwise
-    /// [`start_pacing`](Self::start_pacing) does. While pacing runs, a
+    /// [`start_pacing`](Self::start_pacing) does, or the first SFU publisher
+    /// connect after [`Call::publish_audio`](crate::Call::publish_audio) when no
+    /// `pause_pacing` came before it. While pacing runs, a
     /// background task emits one Opus packet every 20 ms, writing silence when
     /// the buffer runs dry. After a tick without a write, it takes the audio
     /// that the resampler still holds (8 ms at 16 kHz) before the silence, so
@@ -836,8 +841,9 @@ impl LocalAudioTrack {
     /// unless [`pause_pacing`](Self::pause_pacing) came before it.
     ///
     /// [`Call::publish_audio`](crate::Call::publish_audio) holds the queue
-    /// until the SFU publisher first connects, then starts pacing; pacing
-    /// continues through later disconnects. With `pace` off, call this for a
+    /// until the SFU publisher first connects, then starts pacing unless
+    /// `pause_pacing` came before; pacing continues through later
+    /// disconnects. With `pace` off, call this for a
     /// track on your own PeerConnection (see [`webrtc_track`](Self::webrtc_track))
     /// after that PeerConnection connects.
     pub async fn start_pacing(&self) {
@@ -847,7 +853,8 @@ impl LocalAudioTrack {
 
     /// Stop taking queued PCM. The queue keeps its audio, so audio written
     /// while paused is sent late after the next
-    /// [`start_pacing`](Self::start_pacing).
+    /// [`start_pacing`](Self::start_pacing). Only `start_pacing` ends the
+    /// pause: a later `write_pcm` or SFU publisher connect does not.
     pub fn pause_pacing(&self) {
         self.inner.pacing_enabled.store(false, Ordering::SeqCst);
     }
@@ -2210,13 +2217,12 @@ impl LocalTrack {
     }
 
     /// End the publication hold at the first SFU publisher connect and start
-    /// pacing. A track that is not held keeps its pacing state, so a
-    /// `pause_pacing` stays in force.
+    /// the pacer. A `pause_pacing` stays in force until `start_pacing`.
     pub(crate) async fn start_audio_pacing(&self) {
         match self {
             LocalTrack::Audio(track) | LocalTrack::ScreenShareAudio(track) => {
                 if track.release_pacing() {
-                    track.start_pacing().await;
+                    track.ensure_pacer();
                 }
             }
             LocalTrack::Video { .. } => {}
@@ -3166,6 +3172,77 @@ mod tests {
         track.stop();
         let _ = sender.close().await;
         let _ = receiver.close().await;
+    }
+
+    #[tokio::test]
+    async fn a_pause_during_the_publication_hold_stays_in_force_after_it() {
+        for pace in [false, true] {
+            let track = LocalAudioTrack::opus_with_config(
+                LocalAudioTrackConfig::default()
+                    .with_pace(pace)
+                    .with_pcm_queue_capacity(Duration::from_millis(100)),
+            )
+            .expect("opus track");
+            let published = LocalTrack::Audio(track.clone());
+            published.hold_audio_pacing();
+            track.pause_pacing();
+            track
+                .write_pcm(PcmFrame::mono(vec![7; 4_800], OPUS_SAMPLE_RATE))
+                .await
+                .expect("100 ms fits the queue");
+
+            published.start_audio_pacing().await;
+            // A running pacer takes 960 samples every 20 ms.
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let result = track
+                .write_pcm(PcmFrame::mono(
+                    vec![7; FRAME_SAMPLES_20MS],
+                    OPUS_SAMPLE_RATE,
+                ))
+                .await;
+
+            assert!(
+                matches!(
+                    result,
+                    Err(RtcError::PcmQueueOverflow {
+                        dropped_samples: FRAME_SAMPLES_20MS,
+                        ..
+                    })
+                ),
+                "pace {pace}: the pacer took the PCM of a paused track"
+            );
+            track.stop();
+        }
+    }
+
+    #[tokio::test]
+    async fn the_end_of_the_publication_hold_starts_pacing_with_pace_off() {
+        let track =
+            LocalAudioTrack::opus_with_config(LocalAudioTrackConfig::default().with_pace(false))
+                .expect("opus track");
+        let published = LocalTrack::Audio(track.clone());
+        published.hold_audio_pacing();
+        track
+            .write_pcm(PcmFrame::mono(vec![7; 4_800], OPUS_SAMPLE_RATE))
+            .await
+            .expect("100 ms fits the queue");
+
+        published.start_audio_pacing().await;
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !track
+                .inner
+                .pcm
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .is_empty()
+            {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the pacer takes the queued PCM");
+        track.stop();
     }
 
     #[tokio::test]
