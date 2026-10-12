@@ -35,8 +35,8 @@
 use std::collections::VecDeque;
 use std::num::NonZeroU8;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, AtomicU16, AtomicU32, Ordering};
-use std::sync::{Arc, Mutex as StdMutex, TryLockError, Weak};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, Mutex as StdMutex, OnceLock, TryLockError, Weak};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 use tokio::sync::{Notify, Semaphore};
@@ -120,6 +120,8 @@ struct TrackCore {
     fwd_seq: AtomicU16,
     fwd_init: AtomicBool,
     stopped: AtomicBool,
+    /// The time of the first [`Self::stop`].
+    stopped_at: OnceLock<Instant>,
     stop_notify: Notify,
     muted: AtomicBool,
     quality_paused: AtomicBool,
@@ -174,6 +176,7 @@ impl TrackCore {
             fwd_seq: AtomicU16::new(0),
             fwd_init: AtomicBool::new(false),
             stopped: AtomicBool::new(false),
+            stopped_at: OnceLock::new(),
             stop_notify: Notify::new(),
             muted: AtomicBool::new(false),
             quality_paused: AtomicBool::new(false),
@@ -302,6 +305,7 @@ impl TrackCore {
     }
 
     fn stop(&self) {
+        self.stopped_at.get_or_init(Instant::now);
         self.stopped.store(true, Ordering::SeqCst);
         self.stop_notify.notify_waiters();
     }
@@ -768,15 +772,24 @@ impl LocalAudioTrack {
 
     /// Continue the RTP sequence numbers and timestamps of `previous`, whose
     /// sender this track takes over. The SFU drops a stream whose timestamps
-    /// go back.
+    /// go back. The timestamps also count the time since `previous` stopped.
     fn continue_rtp_from(&self, previous: &LocalAudioTrack) {
-        let packetizer = previous
+        let mut packetizer = previous
             .inner
             .core
             .packetizer
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone();
+        let stopped_for = previous
+            .inner
+            .core
+            .stopped_at
+            .get()
+            .map_or(Duration::ZERO, Instant::elapsed);
+        packetizer.skip_samples(
+            (stopped_for.as_secs_f64() * f64::from(self.inner.core.clock_rate)) as u32,
+        );
         *self
             .inner
             .core
@@ -854,21 +867,23 @@ async fn pace_audio(track: Weak<AudioInner>) {
         if inner.core.stopped.load(Ordering::SeqCst) {
             return;
         }
-        if !inner.pcm_pacing.load(Ordering::SeqCst)
-            || !inner.pacing_enabled.load(Ordering::SeqCst)
-            || inner.held.load(Ordering::SeqCst)
-        {
+        if !inner.pcm_pacing.load(Ordering::SeqCst) {
             continue;
         }
         let _write = inner.write_guard.lock().await;
         if !inner.pcm_pacing.load(Ordering::SeqCst) {
             continue;
         }
-        inner.take_pcm(&mut scratch);
+        // A paused or held track takes no PCM.
+        let taking =
+            inner.pacing_enabled.load(Ordering::SeqCst) && !inner.held.load(Ordering::SeqCst);
+        if taking {
+            inner.take_pcm(&mut scratch);
+        }
         // A muted track sends nothing, so its audio is dropped without an encode.
-        // The RTP clock keeps time, so the first packet after the mute shows the
-        // gap (RFC 3550 §5.1).
-        if inner.core.is_output_paused() {
+        // The RTP clock keeps time, so the first packet after a mute, a pause, or
+        // a hold shows the gap (RFC 3550 §5.1).
+        if !taking || inner.core.is_output_paused() {
             inner
                 .core
                 .packetizer
@@ -1325,8 +1340,16 @@ impl LocalVideoTrack {
     /// Continue the RTP sequence numbers and timestamps of the single-encoding
     /// `previous`, whose sender this track takes over. The encoder state moves
     /// here, so the sequence numbers and the VP9 picture ids continue. The SFU
-    /// drops a stream whose timestamps go back.
+    /// drops a stream whose timestamps go back. The timestamps also count the
+    /// time since `previous` stopped.
     fn continue_rtp_from(&self, previous: &LocalVideoTrack) {
+        let stopped_for = previous.inner.encodings[0]
+            .core
+            .stopped_at
+            .get()
+            .map_or(Duration::ZERO, Instant::elapsed);
+        let samples =
+            (stopped_for.as_secs_f64() * f64::from(self.inner.encodings[0].core.clock_rate)) as u32;
         let (next_pts, rtp_ts) = {
             let clock = previous
                 .inner
@@ -1339,6 +1362,10 @@ impl LocalVideoTrack {
             let mut clock = self.inner.clock.lock().unwrap_or_else(|e| e.into_inner());
             clock.next_pts = next_pts;
             clock.rtp_ts = rtp_ts;
+            clock.advance(
+                i64::try_from(stopped_for.as_millis()).unwrap_or(i64::MAX),
+                samples,
+            );
         }
         let (current, previous) = (&self.inner.encodings[0], &previous.inner.encodings[0]);
         let state = previous
@@ -1347,12 +1374,13 @@ impl LocalVideoTrack {
             .unwrap_or_else(|e| e.into_inner())
             .take();
         *current.encoder.lock().unwrap_or_else(|e| e.into_inner()) = state;
-        let packetizer = previous
+        let mut packetizer = previous
             .core
             .packetizer
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone();
+        packetizer.skip_samples(samples);
         *current
             .core
             .packetizer
@@ -2710,6 +2738,87 @@ mod tests {
         assert!(
             skipped >= 10 * FRAME_SAMPLES_20MS as u32,
             "the timestamp advanced {skipped} samples over the mute"
+        );
+        track.stop();
+        let _ = sender.close().await;
+        let _ = receiver.close().await;
+    }
+
+    #[tokio::test]
+    async fn the_rtp_clock_runs_while_pacing_is_paused() {
+        let track = LocalAudioTrack::opus().expect("opus track");
+        let sender = peer::new_peer_connection(&[]).await.expect("sender");
+        sender
+            .add_track(track.webrtc_track())
+            .await
+            .expect("add track");
+        let (receiver, mut remote_rx) = peer::connect_audio_receiver(&sender).await;
+        track.start_pacing().await;
+        let remote = tokio::time::timeout(Duration::from_secs(5), remote_rx.recv())
+            .await
+            .expect("remote track")
+            .expect("remote track channel");
+
+        track.pause_pacing();
+        let (mut before, _) = remote.read_rtp().await.expect("packet before the pause");
+        while let Ok(Ok((packet, _))) =
+            tokio::time::timeout(Duration::from_millis(100), remote.read_rtp()).await
+        {
+            before = packet;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        track.start_pacing().await;
+        let (after, _) = tokio::time::timeout(Duration::from_secs(5), remote.read_rtp())
+            .await
+            .expect("packet after the pause")
+            .expect("packet after the pause");
+
+        // The pause lasts at least 600 ms; a slow runtime can skip some ticks.
+        let skipped = after.header.timestamp.wrapping_sub(before.header.timestamp);
+        assert!(
+            skipped >= 10 * FRAME_SAMPLES_20MS as u32,
+            "the timestamp advanced {skipped} samples over the pause"
+        );
+        track.stop();
+        let _ = sender.close().await;
+        let _ = receiver.close().await;
+    }
+
+    #[tokio::test]
+    async fn the_rtp_clock_runs_while_a_sending_track_is_held() {
+        let track = LocalAudioTrack::opus().expect("opus track");
+        let sender = peer::new_peer_connection(&[]).await.expect("sender");
+        sender
+            .add_track(track.webrtc_track())
+            .await
+            .expect("add track");
+        let (receiver, mut remote_rx) = peer::connect_audio_receiver(&sender).await;
+        track.start_pacing().await;
+        let remote = tokio::time::timeout(Duration::from_secs(5), remote_rx.recv())
+            .await
+            .expect("remote track")
+            .expect("remote track channel");
+        let published = LocalTrack::Audio(track.clone());
+
+        published.hold_audio_pacing();
+        let (mut before, _) = remote.read_rtp().await.expect("packet before the hold");
+        while let Ok(Ok((packet, _))) =
+            tokio::time::timeout(Duration::from_millis(100), remote.read_rtp()).await
+        {
+            before = packet;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        published.release_audio_pacing();
+        let (after, _) = tokio::time::timeout(Duration::from_secs(5), remote.read_rtp())
+            .await
+            .expect("packet after the hold")
+            .expect("packet after the hold");
+
+        // The hold lasts at least 600 ms; a slow runtime can skip some ticks.
+        let skipped = after.header.timestamp.wrapping_sub(before.header.timestamp);
+        assert!(
+            skipped >= 10 * FRAME_SAMPLES_20MS as u32,
+            "the timestamp advanced {skipped} samples over the hold"
         );
         track.stop();
         let _ = sender.close().await;
