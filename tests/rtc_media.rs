@@ -1351,6 +1351,11 @@ async fn sole_audio_can_be_stopped_and_published_again() {
             "SFU never reported A's audio TrackUnpublished after stop_publish \
              (mute state not propagated to peers)"
         );
+        // The queued audio of the stopped track, and the silence that the SFU
+        // sends after the stop.
+        while let Ok(Some(_)) =
+            tokio::time::timeout(Duration::from_secs(2), remote_a.next_pcm()).await
+        {}
 
         // Publish a new audio track on the same session, as after an unmute.
         let audio_again = LocalAudioTrack::opus().expect("opus track");
@@ -1782,6 +1787,11 @@ async fn a_kept_track_resumes_after_unmute_without_a_second_track() {
             .await,
             "B never received A's audio TrackUnpublished after the mute"
         );
+        // The queued audio from before the mute, and the silence that the SFU
+        // sends after the mute.
+        while let Ok(Some(_)) =
+            tokio::time::timeout(Duration::from_secs(2), remote_a.next_pcm()).await
+        {}
         call_a
             .unmute_track(TrackType::Audio)
             .await
