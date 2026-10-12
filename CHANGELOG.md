@@ -142,7 +142,7 @@ timestamps of the stopped track, also when one of the two tracks forwards RTP
 with `write_rtp`. Before, a second video publish failed with
 "participant not found". A simulcast track (`vp8_simulcast`) cannot replace or
 be replaced, and a track cannot replace a track with different layers (for
-example `vp9_svc` and `vp9`): `publish` returns `RtcError::SimulcastReplace`.
+example `vp9_svc` and `vp9`): `publish` returns `RtcError::LayeredReplace`.
 Turn such a track off and on with `mute_track` and `unmute_track`. If a
 replace fails, the next publish can use the sender again.
 
