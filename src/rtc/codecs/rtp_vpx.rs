@@ -10,8 +10,6 @@
 //!
 //! References: RFC 7741 (VP8) and RFC 9628 (VP9).
 
-use std::time::{SystemTime, UNIX_EPOCH};
-
 use super::vpx::{EncodedFrame, Vp9SvcMode, VpxCodec};
 
 /// One RTP-ready payload (a VPx descriptor followed by a bitstream fragment)
@@ -339,14 +337,11 @@ fn write_gof_entry(data: &mut Vec<u8>, temporal_id: u8, up_switch: bool, referen
     data.extend_from_slice(references);
 }
 
-/// A low-entropy 16-bit seed from the wall clock (no `rand` dependency), used to
-/// randomize the initial picture id / tl0 index so a fresh track does not always
-/// start at zero.
+/// A random value from the operating system. The first picture ID and the
+/// first TL0PICIDX of a packetizer come from it (RFC 9628 §4.2).
 fn seed_u16() -> u16 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.subsec_nanos() as u16)
-        .unwrap_or(1)
+    // The low 16 bits of a version 4 UUID have no version or variant bits.
+    uuid::Uuid::new_v4().as_u128() as u16
 }
 
 #[cfg(test)]
@@ -421,6 +416,30 @@ mod tests {
         p.picture_id = 0x7FFF;
         let _ = p.packetize(&[1], true, 16, 16, 1200);
         assert_eq!(p.picture_id, 0);
+    }
+
+    /// RFC 9628 says the VP9 PID and TL0PICIDX should start at a random value.
+    /// With 64 new packetizers, one of the 23 bits stays constant with a
+    /// probability below 2^-58.
+    #[test]
+    fn new_vp9_packetizers_start_picture_id_and_tl0_pic_idx_at_random_values() {
+        let mut seen_set = 0u32;
+        let mut seen_clear = 0u32;
+        for _ in 0..64 {
+            let mut p = VpxRtpPacketizer::new(VpxCodec::Vp9);
+            let out = p.packetize(&[1], true, 16, 16, 1200);
+            let d = &out[0].data;
+            let bits = (u32::from(d[1] & 0x7F) << 16) | (u32::from(d[2]) << 8) | u32::from(d[4]);
+            seen_set |= bits;
+            seen_clear |= !bits;
+        }
+        let all_bits = 0x7F_FFFF;
+        assert_eq!(
+            seen_set & seen_clear & all_bits,
+            all_bits,
+            "PID and TL0PICIDX bits that never change: {:023b}",
+            !(seen_set & seen_clear) & all_bits
+        );
     }
 
     #[test]
