@@ -70,7 +70,7 @@ impl RtcCore {
                 .retired(track.track_type(), publish_option_id)
                 .is_some_and(|retired| retired.is_simulcast() || track.is_simulcast())
             {
-                return Err(RtcError::SimulcastReplace {
+                return Err(RtcError::LayeredReplace {
                     track_type: track.track_type(),
                 });
             }
