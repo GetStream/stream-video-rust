@@ -229,7 +229,8 @@ pub(crate) async fn add_transceiver_for_track(
 
 /// Put `track` on the sender that still carries the stopped track `retired`,
 /// as JS `replaceTrack` does. Returns the RTCP reader of `track`, or `None` if
-/// `publisher` has no such sender.
+/// `publisher` has no such sender. The replace sends no `SetPublisher`, so
+/// `track` must announce the same layers as `retired`.
 pub(crate) async fn replace_retired_track(
     publisher: &Arc<RTCPeerConnection>,
     retired: &LocalTrack,
@@ -247,7 +248,11 @@ pub(crate) async fn replace_retired_track(
             continue;
         }
         let option = publish_option(track, publish_options)?;
-        track.configure_for_publish(option)?;
+        if track.configure_for_publish(option)? != retired.planned_layers_for_publish(option)? {
+            return Err(RtcError::SimulcastReplace {
+                track_type: track.track_type(),
+            });
+        }
         track.continue_rtp_from(retired);
         let physical = track.webrtc_tracks().into_iter().next().ok_or_else(|| {
             RtcError::Media("local publication has no physical encodings".to_owned())

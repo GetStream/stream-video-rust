@@ -74,10 +74,17 @@ impl RtcCore {
                     track_type: track.track_type(),
                 });
             }
-            let reader = match media.take_retired(track.track_type(), publish_option_id) {
+            let reader = match media.retired(track.track_type(), publish_option_id) {
                 Some(retired) => {
-                    publisher::replace_retired_track(&publisher, &retired, &track, &publish_options)
-                        .await?
+                    let reader = publisher::replace_retired_track(
+                        &publisher,
+                        retired,
+                        &track,
+                        &publish_options,
+                    )
+                    .await?;
+                    media.take_retired(track.track_type(), publish_option_id);
+                    reader
                 }
                 None => None,
             };

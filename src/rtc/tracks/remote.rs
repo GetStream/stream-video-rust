@@ -486,7 +486,8 @@ impl RemoteTrack {
             let (samples, stalled) = {
                 let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
                 let samples = s.push_packet(packet);
-                (samples, s.stall_timed_out(Instant::now()))
+                let stalled = samples.is_empty() && s.stall_timed_out(Instant::now());
+                (samples, stalled)
             };
             if samples.is_empty() {
                 if stalled {
@@ -510,7 +511,7 @@ impl RemoteTrack {
                 worker_state
                     .lock()
                     .unwrap_or_else(|error| error.into_inner())
-                    .decode_samples(samples)
+                    .decode_samples(samples, Instant::now())
             })
             .await
             {
@@ -731,8 +732,9 @@ impl VideoDecode {
     }
 
     /// Decode completed samples into `ready` on a blocking worker. Returns
-    /// whether the publisher should be asked for a fresh keyframe.
-    fn decode_samples(&mut self, samples: Vec<webrtc::media::Sample>) -> bool {
+    /// whether the publisher should be asked for a fresh keyframe: after a lost
+    /// packet, a decode error, or a stall that ends at `now`.
+    fn decode_samples(&mut self, samples: Vec<webrtc::media::Sample>, now: Instant) -> bool {
         let mut needs_keyframe = false;
         for sample in samples {
             if sample.prev_dropped_packets > 0 {
@@ -771,7 +773,7 @@ impl VideoDecode {
                 }
             }
         }
-        needs_keyframe
+        needs_keyframe || self.stall_timed_out(now)
     }
 
     /// Whether a [`VIDEO_STALL_TIMEOUT`] without a decoded frame ended at `now`.
@@ -936,7 +938,7 @@ mod tests {
                 sequence_number = sequence_number.wrapping_add(packets.len() as u16);
                 for packet in packets {
                     let samples = state.push_packet(packet);
-                    state.decode_samples(samples);
+                    state.decode_samples(samples, Instant::now());
                 }
             }
         }
@@ -1011,12 +1013,45 @@ mod tests {
             sequence_number = sequence_number.wrapping_add(packets.len() as u16);
             for packet in packets {
                 let samples = state.push_packet(packet);
-                state.decode_samples(samples);
+                state.decode_samples(samples, Instant::now());
             }
         }
 
         assert_eq!(state.ready.len(), 1);
         assert!(!state.stall_timed_out(before_decode + VIDEO_STALL_TIMEOUT));
+    }
+
+    #[test]
+    fn a_completed_sample_that_shows_no_frame_after_the_timeout_requests_a_keyframe() {
+        let (width, height) = (160, 120);
+        let mut encoder = VpxEncoder::new(VpxCodec::Vp9, width, height, 400).expect("vp9 encoder");
+        let image = vec![128u8; (width * height * 3 / 2) as usize];
+        let state = vp9_decode();
+        let mut state = state.lock().expect("video decode state");
+
+        // A keyframe without the show_frame bit decodes without error and shows
+        // no picture.
+        let mut hidden = encoder.encode(&image, 0, 33, true).expect("encode");
+        hidden[0].data[0] &= !0x02;
+        let packets = vp9_flexible_mode_packets(&hidden[0], 0, 0);
+        let next_sequence_number = packets.len() as u16;
+        let mut samples = Vec::new();
+        for packet in packets {
+            samples.extend(state.push_packet(packet));
+        }
+        // The first packet of the next frame completes the hidden frame.
+        let next = encoder.encode(&image, 33, 33, false).expect("encode");
+        let first_of_next = vp9_flexible_mode_packets(&next[0], 1, next_sequence_number).remove(0);
+        samples.extend(state.push_packet(first_of_next));
+        assert_eq!(samples.len(), 1);
+
+        let requested = state.decode_samples(samples, Instant::now() + VIDEO_STALL_TIMEOUT);
+
+        assert!(
+            state.ready.is_empty(),
+            "the hidden frame must show no picture"
+        );
+        assert!(requested);
     }
 
     #[tokio::test]
