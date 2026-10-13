@@ -12,7 +12,46 @@ for a staging or local environment must set both fields. Code that builds
 `..ClientConfig::default()`. `DEFAULT_COORDINATOR_WS_URL` moved from
 `rtc::coordinator::ws` to the crate root.
 
+### Call events come in one stream for each source
+
+`Call`, `RtcCall` and `RtcCore` replace `subscribe()`, `on()`, `off()` and the
+`CallEvent` enum with three streams:
+
+- `sfu_events()` gives `SfuCallEvent`: the events from the SFU, including
+  `CallEnded { reason }` for the SFU `call_ended`.
+- `coordinator_events()` gives `CoordinatorEvent`: the call-scoped coordinator
+  events, including `call.ended`.
+- `client_events()` gives `ClientCallEvent`: `CallingStateChanged`.
+
+The SDK leaves the call on the SFU `call_ended` or the coordinator
+`call.ended`; the other one may then not arrive. `CallingStateChanged(Left)` is
+the reliable end of the call. Each stream has its own buffer, so a lagging
+receiver loses events only from its own stream.
+
+### Track events carry the SFU data
+
+`SfuCallEvent::TrackPublished` and `SfuCallEvent::TrackUnpublished` give
+`track_type` as a `TrackType`, not an `i32`, and add `participant`.
+`TrackUnpublished` also adds `cause`. Patterns that match these variants must
+use the new fields or `..`.
+
 ## New Features
+
+### A token-only client can prepare a call before the join
+
+`RtcClient::call` returns an `RtcCall` that is not joined yet, and
+`RtcCall::join` joins it. Register `on_track` and subscribe before the join to
+get the join events and tracks. `Call::rtc` gives the same `RtcCall` type for a
+client with an API secret; both handles share one session. `RtcCall` also adds
+`update_publish_options` and `set_disconnection_timeout`.
+
+### Stable call event names
+
+`SfuCallEvent::name` gives the stable `SfuEvent` field name of the source event
+(for example `participant_joined` or `call_ended`), and
+`participant_count_changed`. `ClientCallEvent::name` gives
+`calling_state_changed`. A `CoordinatorEvent` has its coordinator `event_type`
+(for example `call.created`).
 
 ### Video REST: advanced call statistics and reporting
 

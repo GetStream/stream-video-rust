@@ -397,7 +397,7 @@ async fn leave_tears_down_the_stored_connection() {
 }
 
 #[tokio::test]
-async fn call_ended_from_the_coordinator_is_reported_once_and_leaves_the_call() {
+async fn call_ended_from_the_coordinator_is_forwarded_and_leaves_the_call() {
     let (coordinator_ws_url, _coordinator) = fake_coordinator_sending(vec![
         json!({ "type": "call.ended", "call_cid": "default:test-call" }),
     ])
@@ -408,9 +408,8 @@ async fn call_ended_from_the_coordinator_is_reported_once_and_leaves_the_call() 
     });
     let generation = prepare_joined_core(&core, "alice");
     let (connection, sfu) = establish_fake(&core, generation).await;
-    let context = event_context(&core, &connection);
     *core.connection.lock().await = Some(connection);
-    let mut events = core.subscribe();
+    let mut events = core.coordinator_events();
     let token = core.current_user_token().expect("user token");
 
     core.connect_coordinator_events(generation, &token, "alice")
@@ -418,19 +417,15 @@ async fn call_ended_from_the_coordinator_is_reported_once_and_leaves_the_call() 
         .expect("coordinator events");
     tokio::time::timeout(Duration::from_secs(2), async {
         loop {
-            if let Ok(CallEvent::CallEnded) = events.recv().await {
+            if let Ok(event) = events.recv().await
+                && event.event_type == "call.ended"
+            {
                 return;
             }
         }
     })
     .await
-    .expect("call ended event");
-    connection::handle_event(
-        &context,
-        sfu_event::EventPayload::CallEnded(event::CallEnded::default()),
-    )
-    .await
-    .expect("handle SFU call ended");
+    .expect("call.ended event");
 
     wait_for(
         Duration::from_secs(2),
@@ -438,13 +433,6 @@ async fn call_ended_from_the_coordinator_is_reported_once_and_leaves_the_call() 
         "the ended call is left",
     )
     .await;
-    let mut repeated = 0;
-    while let Ok(event) = events.try_recv() {
-        if matches!(event, CallEvent::CallEnded) {
-            repeated += 1;
-        }
-    }
-    assert_eq!(repeated, 0, "call ended is reported once");
     let requests = requests_until_close(sfu).await;
     assert!(requests.iter().any(|request| matches!(
         request.request_payload,
@@ -453,19 +441,21 @@ async fn call_ended_from_the_coordinator_is_reported_once_and_leaves_the_call() 
 }
 
 #[tokio::test]
-async fn call_ended_twice_before_the_leave_is_reported_once() {
+async fn sfu_call_ended_is_forwarded_with_its_reason_and_leaves_once() {
     let core = test_core();
     let generation = prepare_joined_core(&core, "alice");
-    let (connection, _sfu) = establish_fake(&core, generation).await;
+    let (connection, sfu) = establish_fake(&core, generation).await;
     let context = event_context(&core, &connection);
     *core.connection.lock().await = Some(connection);
-    let mut events = core.subscribe();
+    let mut events = core.sfu_events();
 
     // Neither call yields, so the spawned leave cannot run between them.
     for _ in 0..2 {
         connection::handle_event(
             &context,
-            sfu_event::EventPayload::CallEnded(event::CallEnded::default()),
+            sfu_event::EventPayload::CallEnded(event::CallEnded {
+                reason: models::CallEndedReason::Kicked as i32,
+            }),
         )
         .await
         .expect("handle SFU call ended");
@@ -477,13 +467,156 @@ async fn call_ended_twice_before_the_leave_is_reported_once() {
         "the ended call is left",
     )
     .await;
-    let mut reported = 0;
+    let mut forwarded = 0;
     while let Ok(event) = events.try_recv() {
-        if matches!(event, CallEvent::CallEnded) {
-            reported += 1;
+        if matches!(
+            event,
+            SfuCallEvent::CallEnded {
+                reason: models::CallEndedReason::Kicked
+            }
+        ) {
+            forwarded += 1;
         }
     }
-    assert_eq!(reported, 1);
+    assert_eq!(forwarded, 2, "each SFU call_ended is forwarded");
+    let leaves = requests_until_close(sfu)
+        .await
+        .into_iter()
+        .filter(|request| {
+            matches!(
+                request.request_payload,
+                Some(event::sfu_request::RequestPayload::LeaveCallRequest(_))
+            )
+        })
+        .count();
+    assert_eq!(leaves, 1, "the call is left once");
+}
+
+#[tokio::test]
+async fn each_event_goes_only_to_the_stream_of_its_source() {
+    let core = test_core();
+    let generation = prepare_joined_core(&core, "alice");
+    let (connection, _sfu) = establish_fake(&core, generation).await;
+    let context = event_context(&core, &connection);
+    *core.connection.lock().await = Some(connection);
+    let mut sfu = core.sfu_events();
+    let mut client = core.client_events();
+    let mut coordinator = core.coordinator_events();
+
+    connection::handle_event(
+        &context,
+        sfu_event::EventPayload::PinsUpdated(event::PinsChanged::default()),
+    )
+    .await
+    .expect("handle pins");
+    assert!(core.set_state_if_current(generation, CallingState::Reconnecting));
+
+    assert!(matches!(sfu.try_recv(), Ok(SfuCallEvent::PinsUpdated(_))));
+    assert!(sfu.try_recv().is_err());
+    assert!(matches!(
+        client.try_recv(),
+        Ok(ClientCallEvent::CallingStateChanged(
+            CallingState::Reconnecting
+        ))
+    ));
+    assert!(client.try_recv().is_err());
+    assert!(coordinator.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn track_events_report_the_track_type_cause_and_participant() {
+    let core = test_core();
+    let generation = prepare_joined_core(&core, "alice");
+    let (connection, _sfu) = establish_fake(&core, generation).await;
+    let context = event_context(&core, &connection);
+    *core.connection.lock().await = Some(connection);
+    let mut events = core.sfu_events();
+    let bob = models::Participant {
+        user_id: "bob".to_owned(),
+        session_id: "bob-session".to_owned(),
+        ..Default::default()
+    };
+
+    connection::handle_event(
+        &context,
+        sfu_event::EventPayload::TrackPublished(event::TrackPublished {
+            user_id: "bob".to_owned(),
+            session_id: "bob-session".to_owned(),
+            r#type: TrackType::Audio as i32,
+            participant: Some(bob.clone()),
+        }),
+    )
+    .await
+    .expect("handle track published");
+
+    let Ok(SfuCallEvent::TrackPublished {
+        track_type,
+        participant,
+        ..
+    }) = events.try_recv()
+    else {
+        panic!("expected a track published event");
+    };
+    assert_eq!(track_type, TrackType::Audio);
+    assert_eq!(participant.as_ref(), Some(&bob));
+
+    connection::handle_event(
+        &context,
+        sfu_event::EventPayload::TrackUnpublished(event::TrackUnpublished {
+            user_id: "bob".to_owned(),
+            session_id: "bob-session".to_owned(),
+            r#type: TrackType::Audio as i32,
+            cause: models::TrackUnpublishReason::Moderation as i32,
+            participant: Some(bob.clone()),
+        }),
+    )
+    .await
+    .expect("handle track unpublished");
+
+    let Ok(SfuCallEvent::TrackUnpublished {
+        track_type,
+        cause,
+        participant,
+        ..
+    }) = events.try_recv()
+    else {
+        panic!("expected a track unpublished event");
+    };
+    assert_eq!(track_type, TrackType::Audio);
+    assert_eq!(cause, models::TrackUnpublishReason::Moderation);
+    assert_eq!(participant, Some(bob));
+}
+
+#[tokio::test]
+async fn participant_count_event_is_sent_only_when_the_count_changes() {
+    let core = test_core();
+    let generation = prepare_joined_core(&core, "alice");
+    let (connection, _sfu) = establish_fake(&core, generation).await;
+    let context = event_context(&core, &connection);
+    *core.connection.lock().await = Some(connection);
+    let mut events = core.sfu_events();
+
+    for total in [2, 2, 3] {
+        connection::handle_event(
+            &context,
+            sfu_event::EventPayload::HealthCheckResponse(event::HealthCheckResponse {
+                participant_count: Some(models::ParticipantCount {
+                    total,
+                    anonymous: 0,
+                }),
+            }),
+        )
+        .await
+        .expect("handle health check response");
+    }
+
+    let mut totals = Vec::new();
+    while let Ok(event) = events.try_recv() {
+        if let SfuCallEvent::ParticipantCountChanged(count) = event {
+            totals.push(count.total);
+        }
+    }
+    assert_eq!(totals, vec![2, 3]);
 }
 
 #[tokio::test]
@@ -783,7 +916,7 @@ async fn published_audio_is_paced_only_while_the_publisher_is_connected() {
 }
 
 #[tokio::test]
-async fn remote_track_dropped_without_a_runtime_unsubscribes() {
+async fn only_the_latest_remote_track_unsubscribes_when_dropped_without_a_runtime() {
     let core = test_core();
     let generation = prepare_joined_core(&core, "alice");
     let (connection, _sfu) = establish_fake(&core, generation).await;
@@ -808,17 +941,39 @@ async fn remote_track_dropped_without_a_runtime_unsubscribes() {
         .await
         .expect("inbound track")
         .expect("inbound track channel");
-    core.clone()
-        .handle_incoming_track(
-            generation,
-            epoch,
-            reconnect_enabled,
-            inbound,
-            Arc::downgrade(&receiver),
-        )
-        .await;
-    let remote = remote_rx.recv().expect("remote track");
+    for _ in 0..2 {
+        core.clone()
+            .handle_incoming_track(
+                generation,
+                epoch,
+                reconnect_enabled.clone(),
+                inbound.clone(),
+                Arc::downgrade(&receiver),
+            )
+            .await;
+    }
+    let stale = remote_rx.recv().expect("stale remote track");
+    let remote = remote_rx.recv().expect("latest remote track");
     let key = TrackKey::new(remote.participant().session_id.clone(), remote.track_type());
+    let baseline = alive_tasks();
+
+    thread::spawn(move || drop(stale))
+        .join()
+        .expect("a drop without a runtime does not panic");
+    wait_for(
+        Duration::from_secs(2),
+        || alive_tasks() == baseline,
+        "the stale drop is handled",
+    )
+    .await;
+    assert!(
+        !core
+            .manual_unsub
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .contains(&key),
+        "a stale drop must not unsubscribe the latest track"
+    );
 
     thread::spawn(move || drop(remote))
         .join()
@@ -996,7 +1151,7 @@ async fn leave_cancels_reconnect_task_before_next_generation() {
 fn state_events_arrive_in_the_order_of_the_state_changes() {
     let core = test_core();
     let generation = core.begin_join().expect("join generation");
-    let mut events = core.subscribe();
+    let mut events = core.client_events();
     let rounds = 20_000;
     let barrier = Arc::new(std::sync::Barrier::new(3));
     let workers = [CallingState::Joined, CallingState::Reconnecting].map(|state| {
@@ -1015,10 +1170,8 @@ fn state_events_arrive_in_the_order_of_the_state_changes() {
         barrier.wait();
         barrier.wait();
         let mut last = None;
-        while let Ok(event) = events.try_recv() {
-            if let CallEvent::CallingStateChanged(state) = event {
-                last = Some(state);
-            }
+        while let Ok(ClientCallEvent::CallingStateChanged(state)) = events.try_recv() {
+            last = Some(state);
         }
         assert_eq!(last, Some(core.state()), "round {round}");
     }
@@ -1031,14 +1184,16 @@ fn state_events_arrive_in_the_order_of_the_state_changes() {
 fn setting_the_same_state_again_sends_no_event() {
     let core = test_core();
     let generation = core.begin_join().expect("join generation");
-    let mut events = core.subscribe();
+    let mut events = core.client_events();
 
     assert!(core.set_state_if_current(generation, CallingState::Reconnecting));
     assert!(core.set_state_if_current(generation, CallingState::Reconnecting));
 
     assert!(matches!(
         events.try_recv(),
-        Ok(CallEvent::CallingStateChanged(CallingState::Reconnecting))
+        Ok(ClientCallEvent::CallingStateChanged(
+            CallingState::Reconnecting
+        ))
     ));
     assert!(events.try_recv().is_err());
 }
@@ -1046,20 +1201,20 @@ fn setting_the_same_state_again_sends_no_event() {
 #[test]
 fn join_start_sends_joining() {
     let core = test_core();
-    let mut events = core.subscribe();
+    let mut events = core.client_events();
 
     core.begin_join().expect("join generation");
 
     assert!(matches!(
         events.try_recv(),
-        Ok(CallEvent::CallingStateChanged(CallingState::Joining))
+        Ok(ClientCallEvent::CallingStateChanged(CallingState::Joining))
     ));
 }
 
 #[tokio::test]
 async fn state_during_leave_matches_the_last_state_event() {
     let core = test_core();
-    let mut events = core.subscribe();
+    let mut events = core.client_events();
     core.begin_join().expect("join generation");
     let connection_slot = core.connection.lock().await;
     let generation = core.generation();
@@ -1073,10 +1228,8 @@ async fn state_during_leave_matches_the_last_state_event() {
     .await;
 
     let mut last = None;
-    while let Ok(event) = events.try_recv() {
-        if let CallEvent::CallingStateChanged(state) = event {
-            last = Some(state);
-        }
+    while let Ok(ClientCallEvent::CallingStateChanged(state)) = events.try_recv() {
+        last = Some(state);
     }
     assert_eq!(last, Some(core.state()));
     drop(connection_slot);
@@ -1464,6 +1617,7 @@ async fn stale_remote_track_drop_does_not_change_new_generation_subscriptions() 
             first,
             0,
             TrackKey::new("remote-session".to_owned(), TrackType::Audio),
+            0,
         )
         .await;
 
@@ -1553,6 +1707,168 @@ fn call_state_snapshot_combines_join_state_and_incremental_sfu_updates() {
     );
     assert_eq!(alice.paused_tracks, vec![TrackType::Video]);
     assert!(state.current_grants.expect("grants").can_publish_audio);
+}
+
+#[test]
+fn every_call_event_has_its_stable_name() {
+    let sfu = [
+        (
+            SfuCallEvent::ParticipantJoined(models::Participant::default()),
+            "participant_joined",
+        ),
+        (
+            SfuCallEvent::ParticipantLeft(models::Participant::default()),
+            "participant_left",
+        ),
+        (
+            SfuCallEvent::ParticipantUpdated(models::Participant::default()),
+            "participant_updated",
+        ),
+        (
+            SfuCallEvent::TrackPublished {
+                user_id: String::new(),
+                session_id: String::new(),
+                track_type: TrackType::Audio,
+                participant: None,
+            },
+            "track_published",
+        ),
+        (
+            SfuCallEvent::TrackUnpublished {
+                user_id: String::new(),
+                session_id: String::new(),
+                track_type: TrackType::Audio,
+                cause: models::TrackUnpublishReason::UserMuted,
+                participant: None,
+            },
+            "track_unpublished",
+        ),
+        (
+            SfuCallEvent::DominantSpeakerChanged {
+                user_id: String::new(),
+                session_id: String::new(),
+            },
+            "dominant_speaker_changed",
+        ),
+        (
+            SfuCallEvent::AudioLevelChanged(Vec::new()),
+            "audio_level_changed",
+        ),
+        (
+            SfuCallEvent::ConnectionQualityChanged(Vec::new()),
+            "connection_quality_changed",
+        ),
+        (
+            SfuCallEvent::ParticipantCountChanged(models::ParticipantCount::default()),
+            "participant_count_changed",
+        ),
+        (SfuCallEvent::PinsUpdated(Vec::new()), "pins_updated"),
+        (
+            SfuCallEvent::InboundStateChanged(Vec::new()),
+            "inbound_state_notification",
+        ),
+        (
+            SfuCallEvent::PublishOptionsChanged {
+                publish_options: Vec::new(),
+                reason: String::new(),
+            },
+            "change_publish_options",
+        ),
+        (
+            SfuCallEvent::PublishQualityChanged(event::ChangePublishQuality::default()),
+            "change_publish_quality",
+        ),
+        (
+            SfuCallEvent::CallGrantsUpdated(event::CallGrantsUpdated::default()),
+            "call_grants_updated",
+        ),
+        (
+            SfuCallEvent::IceRestarted(PeerType::Subscriber),
+            "ice_restart",
+        ),
+        (
+            SfuCallEvent::Error(SfuJoinError::from_event(None, 0)),
+            "error",
+        ),
+        (
+            SfuCallEvent::CallEnded {
+                reason: models::CallEndedReason::Ended,
+            },
+            "call_ended",
+        ),
+    ];
+
+    for (event, name) in sfu {
+        assert_eq!(event.name(), name, "{event:?}");
+    }
+    assert_eq!(
+        ClientCallEvent::CallingStateChanged(CallingState::Joined).name(),
+        "calling_state_changed"
+    );
+}
+
+#[test]
+fn join_state_reports_only_the_participant_changes_since_the_last_join() {
+    let core = test_core();
+    let generation = core.begin_join().expect("join generation");
+    let mut events = core.sfu_events();
+    let participant = |user_id: &str, session_id: &str| models::Participant {
+        user_id: user_id.to_owned(),
+        session_id: session_id.to_owned(),
+        ..Default::default()
+    };
+    let call_state = |participants| {
+        Some(models::CallState {
+            participants,
+            ..Default::default()
+        })
+    };
+    let bob = participant("bob", "session-b");
+
+    assert!(core.apply_join_call_state_if_current(
+        generation,
+        "local-1",
+        "agent",
+        call_state(vec![
+            participant("agent", "local-1"),
+            participant("alice", "session-a"),
+            bob.clone(),
+        ]),
+    ));
+    // A REJOIN: the local session changes, alice left, bob changed, carol joined.
+    assert!(core.apply_join_call_state_if_current(
+        generation,
+        "local-2",
+        "agent",
+        call_state(vec![
+            participant("agent", "local-2"),
+            models::Participant {
+                name: "Bob".to_owned(),
+                ..bob
+            },
+            participant("carol", "session-c"),
+        ]),
+    ));
+
+    let mut reported = Vec::new();
+    while let Ok(event) = events.try_recv() {
+        match event {
+            SfuCallEvent::ParticipantJoined(p) => reported.push(("joined", p.session_id)),
+            SfuCallEvent::ParticipantUpdated(p) => reported.push(("updated", p.session_id)),
+            SfuCallEvent::ParticipantLeft(p) => reported.push(("left", p.session_id)),
+            _ => {}
+        }
+    }
+    assert_eq!(
+        reported,
+        [
+            ("joined", "session-a".to_owned()),
+            ("joined", "session-b".to_owned()),
+            ("updated", "session-b".to_owned()),
+            ("joined", "session-c".to_owned()),
+            ("left", "session-a".to_owned()),
+        ]
+    );
 }
 
 #[test]

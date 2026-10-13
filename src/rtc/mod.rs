@@ -8,7 +8,8 @@
 //! The participant layer sits on top: the [`coordinator`] join REST, dual
 //! publisher/subscriber PeerConnections ([`peer`]), and the [`join`] state
 //! machine ([`join::RtcCore`]) with `max_join_retries`, Stream's reconnect
-//! strategies, and typed [`join::CallEvent`]s. [`crate::Call::join`] and
+//! strategies, and typed event streams by source ([`SfuCallEvent`],
+//! [`CoordinatorEvent`], [`ClientCallEvent`]). [`crate::Call::join`] and
 //! [`crate::Call::leave`] are the high-level entry points; [`RtcClient`] is the
 //! lower-level user-token client.
 //!
@@ -50,7 +51,9 @@ pub use error::{
     SfuTimeoutError, TwirpError, WsConnectionError, is_join_error_code,
 };
 pub use identity::{CLIENT_TYPE, SDK_TYPE, client_details, client_header};
-pub use join::{CallEvent, CallStateSnapshot, CallingState, JoinCallData, RtcCore};
+pub use join::{
+    CallStateSnapshot, CallingState, ClientCallEvent, JoinCallData, RtcCore, SfuCallEvent,
+};
 pub use pcm::chunk::Pad;
 pub use pcm::convert::G711_SAMPLE_RATE;
 pub use pcm::{

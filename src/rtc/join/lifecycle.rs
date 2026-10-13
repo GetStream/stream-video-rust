@@ -671,8 +671,8 @@ impl RtcCore {
         Ok(())
     }
 
-    /// The SFU or the coordinator reported the end of the call: send
-    /// [`CallEvent::CallEnded`] once and leave the call.
+    /// The SFU or the coordinator reported the end of the call: leave the call
+    /// once.
     pub(super) fn end_call(self: &Arc<Self>, generation: u64) {
         if !self.is_generation_current(generation) {
             return;
@@ -688,7 +688,6 @@ impl RtcCore {
         if already_ended {
             return;
         }
-        let _ = self.events_tx.send(CallEvent::CallEnded);
         let this = self.clone();
         // Not a generation task: `leave` ends the generation.
         std::mem::drop(self.spawn_runtime_task(async move {
@@ -713,6 +712,10 @@ impl RtcCore {
                     .lock()
                     .unwrap_or_else(|error| error.into_inner()) = CallStateCache::default();
                 self.active_subs
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clear();
+                self.delivered_tracks
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .clear();
@@ -750,7 +753,7 @@ impl Drop for JoinAttempt<'_> {
                 return;
             }
             lifecycle.generation = lifecycle.generation.wrapping_add(1);
-            lifecycle.set_state(CallingState::Idle, &self.core.events_tx);
+            lifecycle.set_state(CallingState::Idle, &self.core.client_events_tx);
         }
         self.core.lifecycle_changed.notify_waiters();
     }
@@ -804,7 +807,7 @@ impl RtcCore {
 
         let cid = self.cid();
         let local_user_id = user_id.to_owned();
-        let sender = self.events_tx.clone();
+        let sender = self.coordinator_events_tx.clone();
         let event_core = self.clone();
         let event_task = self.spawn_generation_task(generation, async move {
             loop {
@@ -817,7 +820,7 @@ impl RtcCore {
                             .apply_permissions_updated(&event, &local_user_id)
                             .await;
                         let ended = event.event_type == "call.ended";
-                        let _ = sender.send(CallEvent::Coordinator(event));
+                        let _ = sender.send(event);
                         if ended {
                             event_core.end_call(generation);
                         }
