@@ -64,9 +64,8 @@ dimension is now 1920×1080 (it was 1280×720), also for a `SubscriptionTarget`
 without a dimension. `Call::participants` gives the participants in the order
 the call learned about them. `set_incoming_video_enabled` keeps the configured
 video dimension and changes only the video track type of the current config.
-Before an `update_subscriptions` call, `set_incoming_video_enabled(true)` now
-subscribes to video only (it was audio and video), and `false` subscribes to
-nothing (it was audio).
+Before an `update_subscriptions` call, the current config is `audio_all`, as
+before.
 
 ### Leave stops the published tracks
 
@@ -173,9 +172,10 @@ client with an API secret; both handles share one session. `RtcCall` also adds
 
 `ClientConfig::call_event_capacity` sets how many events each call event
 stream keeps for a slow receiver. The default stays 256. A larger value makes a
-lag less likely, but each call allocates all slots of its three streams. Code
-that builds `ClientConfig` with a struct literal must set the new field or use
-`..ClientConfig::default()`.
+lag less likely, but each call allocates all slots of its three streams. The
+value must be between 1 and 65,536; `Client::new` returns `Error::Config` for a
+value out of this range. Code that builds `ClientConfig` with a struct literal
+must set the new field or use `..ClientConfig::default()`.
 
 ### Video REST: advanced call statistics and reporting
 
