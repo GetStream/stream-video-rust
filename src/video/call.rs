@@ -1000,7 +1000,7 @@ impl Call {
     /// `stream-video-js`. A new track of the same kind that is published later
     /// takes over that transceiver. A simulcast track, or a track with
     /// different layers than the stopped track, cannot do this
-    /// ([`RtcError::SimulcastReplace`](crate::rtc::RtcError::SimulcastReplace));
+    /// ([`RtcError::LayeredReplace`](crate::rtc::RtcError::LayeredReplace));
     /// turn it off and on with [`mute_track`](Self::mute_track) and
     /// [`unmute_track`](Self::unmute_track).
     pub async fn stop_publish(&self, track: crate::rtc::LocalTrack) -> crate::rtc::RtcResult<()> {

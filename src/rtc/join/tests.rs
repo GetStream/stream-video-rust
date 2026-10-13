@@ -1098,6 +1098,68 @@ async fn pcm_written_before_publish_plays_after_the_publisher_connects() {
 }
 
 #[tokio::test]
+async fn a_pause_before_publish_stays_in_force_after_the_publisher_connects() {
+    let core = test_core();
+    let generation = prepare_joined_core(&core, "alice");
+    let (connection, _sfu) = establish_fake(&core, generation).await;
+    let publisher = connection.publisher.clone();
+    *core.connection.lock().await = Some(connection);
+    let audio = LocalAudioTrack::opus().expect("opus track");
+    let tone_500ms = (0..24_000)
+        .map(|index| {
+            let time = f64::from(index) / 48_000.0;
+            (16_000.0 * (std::f64::consts::TAU * 440.0 * time).sin()) as i16
+        })
+        .collect();
+    audio.pause_pacing();
+    audio
+        .write_pcm(PcmFrame::mono(tone_500ms, 48_000))
+        .await
+        .expect("write before publish");
+
+    publisher
+        .add_track(audio.webrtc_track())
+        .await
+        .expect("add track");
+    core.media
+        .lock()
+        .await
+        .begin_publish(LocalTrack::Audio(audio.clone()), 0);
+    let (receiver, mut remote) = peer::connect_audio_receiver(&publisher).await;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), remote.recv())
+            .await
+            .is_err(),
+        "a paused track sends no audio after the publisher connects"
+    );
+    audio.start_pacing().await;
+    let remote = tokio::time::timeout(Duration::from_secs(5), remote.recv())
+        .await
+        .expect("start_pacing starts the paused track")
+        .expect("remote track");
+    let mut decoder = opus::Decoder::new(48_000, opus::Channels::Mono).expect("opus decoder");
+    let mut peak = 0;
+    for _ in 0..5 {
+        let (packet, _) = remote.read_rtp().await.expect("paced packet");
+        let mut decoded = vec![0; 5_760];
+        let length = decoder
+            .decode(&packet.payload, &mut decoded, false)
+            .expect("decode");
+        peak = decoded[..length]
+            .iter()
+            .fold(peak, |peak, sample| peak.max(sample.unsigned_abs()));
+    }
+
+    assert!(
+        peak > 5_000,
+        "the first packets carry silence (peak {peak}), not the PCM written while paused"
+    );
+    audio.stop();
+    let _ = receiver.close().await;
+    core.leave("test cleanup").await.expect("leave");
+}
+
+#[tokio::test]
 async fn a_failed_publish_does_not_hold_the_track() {
     let core = test_core();
     let generation = prepare_joined_core(&core, "alice");
@@ -1192,7 +1254,7 @@ async fn a_stopped_simulcast_publication_is_not_replaced() {
         assert!(
             matches!(
                 result,
-                Err(RtcError::SimulcastReplace {
+                Err(RtcError::LayeredReplace {
                     track_type: TrackType::ScreenShare
                 })
             ),
@@ -1323,7 +1385,7 @@ async fn a_stopped_publication_is_not_replaced_by_a_track_with_other_layers() {
     assert!(
         matches!(
             result,
-            Err(RtcError::SimulcastReplace {
+            Err(RtcError::LayeredReplace {
                 track_type: TrackType::Video
             })
         ),

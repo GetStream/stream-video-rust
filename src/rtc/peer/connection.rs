@@ -94,11 +94,11 @@ fn register_supported_codecs(media_engine: &mut MediaEngine) -> Result<()> {
 /// (NACK, RTCP reports, receiver-side TWCC).
 ///
 /// Known gap versus Pion/videosdk: webrtc-rs ships no publisher-side congestion
-/// controller (TWCC *sender* estimator / GCC) and no RTX/NACK retransmission
-/// sender. Opus audio is unaffected — low bitrate, loss-tolerant, single layer —
-/// but high-bitrate video publishing runs without bandwidth estimation or
-/// retransmission. The default interceptor set below is wired as-is rather than
-/// worked around.
+/// controller (TWCC *sender* estimator / GCC) and no RTX. The default NACK
+/// responder sends a lost packet again on the media SSRC. Opus audio is
+/// unaffected — low bitrate, loss-tolerant, single layer — but high-bitrate
+/// video publishing runs without bandwidth estimation. The default interceptor
+/// set below is wired as-is rather than worked around.
 fn build_api() -> Result<API> {
     let mut media_engine = MediaEngine::default();
     register_supported_codecs(&mut media_engine)?;

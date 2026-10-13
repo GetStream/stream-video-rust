@@ -40,7 +40,7 @@ use std::collections::VecDeque;
 use std::num::NonZeroU8;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock, TryLockError, Weak};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use tokio::sync::{Notify, Semaphore};
@@ -177,7 +177,7 @@ impl TrackCore {
             clock_rate,
             mime_type,
             rtp: StdMutex::new(RtpTimeline {
-                seq: seed_u16(),
+                seq: random_u32() as u16,
                 timestamp: None,
                 forward_offset: None,
             }),
@@ -395,7 +395,7 @@ impl RtpTimeline {
 
     /// Return the timestamp of a frame of `samples`, and move past it.
     fn advance(&mut self, samples: u32) -> u32 {
-        let timestamp = self.timestamp.unwrap_or_else(|| u32::from(seed_u16()));
+        let timestamp = self.timestamp.unwrap_or_else(random_u32);
         self.timestamp = Some(timestamp.wrapping_add(samples));
         timestamp
     }
@@ -413,14 +413,11 @@ impl RtpTimeline {
     }
 }
 
-/// A low-entropy 16-bit seed from the wall clock (no `rand` dependency), used to
-/// randomize the first RTP sequence numbers and timestamps so they do not always
-/// start at 0.
-fn seed_u16() -> u16 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.subsec_nanos() as u16)
-        .unwrap_or(0)
+/// A random value from the operating system. The first RTP sequence number and
+/// the first RTP timestamp of a track come from it (RFC 3550 §5.1).
+fn random_u32() -> u32 {
+    // The low 32 bits of a version 4 UUID have no version or variant bits.
+    uuid::Uuid::new_v4().as_u128() as u32
 }
 
 // Audio
@@ -431,8 +428,9 @@ struct AudioInner {
     pcm: StdMutex<VecDeque<i16>>,
     pcm_capacity_samples: usize,
     /// Locked before `pcm`. A writer keeps it until its audio is queued.
-    /// `flush` does not wait for it.
-    resampler: StdMutex<StreamResampler>,
+    /// `flush` does not lock it. The count is the `flushes` value of the audio
+    /// in the filter. Audio with an older count must not play.
+    resampler: StdMutex<(StreamResampler, u64)>,
     /// Counts `flush` calls. Changed and compared under the `pcm` lock. A
     /// write queues no audio when a flush came after the write started.
     flushes: AtomicU64,
@@ -442,7 +440,8 @@ struct AudioInner {
     encoder: StdMutex<opus::Encoder>,
     pacer: StdMutex<Option<JoinHandle<()>>>,
     pacer_started: AtomicBool,
-    /// Starts as `pace`. Set by `start_pacing`, cleared by `pause_pacing`.
+    /// Cleared by `pause_pacing`, set by `start_pacing`. Starts set: with
+    /// `pace` off, no pacer runs before `start_pacing` or the hold end.
     pacing_enabled: AtomicBool,
     pcm_pacing: AtomicBool,
     /// [`LocalAudioTrackConfig::pace`].
@@ -472,10 +471,11 @@ impl AudioInner {
             };
             buf = self.pcm.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(mut resampler) = resampler
+                && resampler.1 == self.flushes.load(Ordering::SeqCst)
                 && !written
                 && buf.len() < frame.len()
             {
-                match resampler.flush() {
+                match resampler.0.flush() {
                     Ok(mut tail) => {
                         // The silence after the tail would delay the next write.
                         let end = tail
@@ -518,7 +518,9 @@ pub struct LocalAudioTrackConfig {
     /// negotiated PeerConnection can send the track. Before that, the queue
     /// keeps the written audio. A
     /// [`LocalAudioTrack::pause_pacing`] before that write stays in force. When
-    /// `false`, `write_pcm` only queues until [`LocalAudioTrack::start_pacing`].
+    /// `false`, `write_pcm` only queues until [`LocalAudioTrack::start_pacing`]
+    /// or the first SFU publisher connect of
+    /// [`Call::publish_audio`](crate::Call::publish_audio).
     pub pace: bool,
 }
 
@@ -636,13 +638,13 @@ impl LocalAudioTrack {
                 core,
                 pcm: StdMutex::new(VecDeque::new()),
                 pcm_capacity_samples,
-                resampler: StdMutex::new(StreamResampler::new(OPUS_SAMPLE_RATE, 1)),
+                resampler: StdMutex::new((StreamResampler::new(OPUS_SAMPLE_RATE, 1), 0)),
                 flushes: AtomicU64::new(0),
                 pcm_written: AtomicBool::new(false),
                 encoder: StdMutex::new(encoder),
                 pacer: StdMutex::new(None),
                 pacer_started: AtomicBool::new(false),
-                pacing_enabled: AtomicBool::new(config.pace),
+                pacing_enabled: AtomicBool::new(true),
                 pcm_pacing: AtomicBool::new(true),
                 pace: config.pace,
                 held: AtomicBool::new(false),
@@ -660,7 +662,9 @@ impl LocalAudioTrack {
     /// negotiated PeerConnection can send the track starts pacing when
     /// [`LocalAudioTrackConfig::pace`] is set (the default) and no
     /// [`pause_pacing`](Self::pause_pacing) came before it; otherwise
-    /// [`start_pacing`](Self::start_pacing) does. While pacing runs, a
+    /// [`start_pacing`](Self::start_pacing) does, or the first SFU publisher
+    /// connect after [`Call::publish_audio`](crate::Call::publish_audio) when no
+    /// `pause_pacing` came before it. While pacing runs, a
     /// background task emits one Opus packet every 20 ms, writing silence when
     /// the buffer runs dry. After a tick without a write, it takes the audio
     /// that the resampler still holds (8 ms at 16 kHz) before the silence, so
@@ -701,18 +705,20 @@ impl LocalAudioTrack {
         // The sinc filter is slow on a long frame, so it runs on a blocking thread.
         let track = self.clone();
         let queued = tokio::task::spawn_blocking(move || -> Result<Result<()>> {
-            let mut r = track
+            let mut resampler = track
                 .inner
                 .resampler
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
+            let (r, filter_flushes) = &mut *resampler;
+            // The filter holds audio from before a flush.
+            if *filter_flushes != flushes {
+                r.flush()?;
+                *filter_flushes = flushes;
+            }
             let resampled = r.push(&frame)?.samples;
             track.inner.pcm_written.store(true, Ordering::SeqCst);
             let queued = track.queue_pcm(resampled, flushes);
-            // After a flush, the filter must not keep the audio of this write.
-            if track.inner.flushes.load(Ordering::SeqCst) != flushes {
-                r.flush()?;
-            }
             Ok(queued)
         })
         .await
@@ -823,16 +829,6 @@ impl LocalAudioTrack {
         let mut buf = self.inner.pcm.lock().unwrap_or_else(|e| e.into_inner());
         self.inner.flushes.fetch_add(1, Ordering::SeqCst);
         buf.clear();
-        drop(buf);
-        // A write that holds the resampler resets it itself.
-        let mut r = match self.inner.resampler.try_lock() {
-            Ok(r) => r,
-            Err(TryLockError::Poisoned(e)) => e.into_inner(),
-            Err(TryLockError::WouldBlock) => return,
-        };
-        if let Err(e) = r.flush() {
-            tracing::debug!(error = %e, "stream.rtc.audio.flush_failed");
-        }
     }
 
     /// Start taking queued PCM: one 20 ms frame every 20 ms, or silence when
@@ -842,8 +838,9 @@ impl LocalAudioTrack {
     /// unless [`pause_pacing`](Self::pause_pacing) came before it.
     ///
     /// [`Call::publish_audio`](crate::Call::publish_audio) holds the queue
-    /// until the SFU publisher first connects, then starts pacing; pacing
-    /// continues through later disconnects. With `pace` off, call this for a
+    /// until the SFU publisher first connects, then starts pacing unless
+    /// `pause_pacing` came before; pacing continues through later
+    /// disconnects. With `pace` off, call this for a
     /// track on your own PeerConnection (see [`webrtc_track`](Self::webrtc_track))
     /// after that PeerConnection connects.
     pub async fn start_pacing(&self) {
@@ -853,7 +850,8 @@ impl LocalAudioTrack {
 
     /// Stop taking queued PCM. The queue keeps its audio, so audio written
     /// while paused is sent late after the next
-    /// [`start_pacing`](Self::start_pacing).
+    /// [`start_pacing`](Self::start_pacing). Only `start_pacing` ends the
+    /// pause: a later `write_pcm` or SFU publisher connect does not.
     pub fn pause_pacing(&self) {
         self.inner.pacing_enabled.store(false, Ordering::SeqCst);
     }
@@ -2216,13 +2214,12 @@ impl LocalTrack {
     }
 
     /// End the publication hold at the first SFU publisher connect and start
-    /// pacing. A track that is not held keeps its pacing state, so a
-    /// `pause_pacing` stays in force.
+    /// the pacer. A `pause_pacing` stays in force until `start_pacing`.
     pub(crate) async fn start_audio_pacing(&self) {
         match self {
             LocalTrack::Audio(track) | LocalTrack::ScreenShareAudio(track) => {
                 if track.release_pacing() {
-                    track.start_pacing().await;
+                    track.ensure_pacer();
                 }
             }
             LocalTrack::Video { .. } => {}
@@ -2585,10 +2582,72 @@ mod tests {
         track.write_pcm(loud_end_16k()).await.expect("write_pcm");
 
         track.flush();
-        let mut frame = vec![0; FRAME_SAMPLES_20MS];
-        track.inner.take_pcm(&mut frame);
+        // The first tick after a write never takes the resampler audio.
+        let mut first = vec![0; FRAME_SAMPLES_20MS];
+        let mut second = vec![0; FRAME_SAMPLES_20MS];
+        track.inner.take_pcm(&mut first);
+        track.inner.take_pcm(&mut second);
 
-        assert_eq!(peak(&frame), 0, "audio from before the flush played");
+        assert_eq!(
+            peak(&first).max(peak(&second)),
+            0,
+            "audio from before the flush played"
+        );
+        track.stop();
+    }
+
+    #[tokio::test]
+    async fn flush_while_the_resampler_is_locked_drops_the_audio_it_holds() {
+        let track = unpaced_track();
+        track.write_pcm(loud_end_16k()).await.expect("write_pcm");
+        // The pacer or a write holds the resampler while the flush runs.
+        let locked = track
+            .inner
+            .resampler
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        track.flush();
+        drop(locked);
+        let mut first = vec![0; FRAME_SAMPLES_20MS];
+        let mut second = vec![0; FRAME_SAMPLES_20MS];
+        track.inner.take_pcm(&mut first);
+        track.inner.take_pcm(&mut second);
+
+        assert_eq!(
+            peak(&first).max(peak(&second)),
+            0,
+            "audio from before the flush played"
+        );
+        track.stop();
+    }
+
+    #[tokio::test]
+    async fn a_write_after_a_flush_while_the_resampler_is_locked_plays_no_old_audio() {
+        let track = unpaced_track();
+        track.write_pcm(loud_end_16k()).await.expect("write_pcm");
+        let locked = track
+            .inner
+            .resampler
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        track.flush();
+        drop(locked);
+
+        track
+            .write_pcm(PcmFrame::mono(vec![0; 320], 16_000))
+            .await
+            .expect("write_pcm");
+        let mut first = vec![0; FRAME_SAMPLES_20MS];
+        let mut second = vec![0; FRAME_SAMPLES_20MS];
+        track.inner.take_pcm(&mut first);
+        track.inner.take_pcm(&mut second);
+
+        assert_eq!(
+            peak(&first).max(peak(&second)),
+            0,
+            "audio from before the flush played"
+        );
         track.stop();
     }
 
@@ -3048,6 +3107,46 @@ mod tests {
         let _ = receiver.close().await;
     }
 
+    /// The first RTP timestamp of a new track is random over 32 bits. The
+    /// probability that all three first timestamps are below 65536 is 2^-48.
+    #[tokio::test]
+    async fn new_tracks_start_their_rtp_timestamps_at_random_points() {
+        let silence = [0xf8u8, 0xff, 0xfe];
+        let mut first_timestamps = Vec::new();
+
+        for _ in 0..3 {
+            let track = LocalAudioTrack::opus().expect("opus track");
+            let sender = peer::new_peer_connection(&[]).await.expect("sender");
+            sender
+                .add_track(track.webrtc_track())
+                .await
+                .expect("add track");
+            let (receiver, mut remote_rx) = peer::connect_audio_receiver(&sender).await;
+            track
+                .write_sample(&silence, Duration::from_millis(20))
+                .await
+                .expect("write");
+            let remote = tokio::time::timeout(Duration::from_secs(5), remote_rx.recv())
+                .await
+                .expect("remote track")
+                .expect("remote track channel");
+            let (first, _) = tokio::time::timeout(Duration::from_secs(5), remote.read_rtp())
+                .await
+                .expect("first packet")
+                .expect("first packet");
+            first_timestamps.push(first.header.timestamp);
+            let _ = sender.close().await;
+            let _ = receiver.close().await;
+        }
+
+        assert!(
+            first_timestamps
+                .iter()
+                .any(|&timestamp| timestamp > u32::from(u16::MAX)),
+            "first timestamps: {first_timestamps:?}"
+        );
+    }
+
     #[tokio::test]
     async fn pcm_written_before_pacing_starts_stays_queued() {
         let track = LocalAudioTrack::opus_with_config(
@@ -3117,6 +3216,77 @@ mod tests {
         track.stop();
         let _ = sender.close().await;
         let _ = receiver.close().await;
+    }
+
+    #[tokio::test]
+    async fn a_pause_during_the_publication_hold_stays_in_force_after_it() {
+        for pace in [false, true] {
+            let track = LocalAudioTrack::opus_with_config(
+                LocalAudioTrackConfig::default()
+                    .with_pace(pace)
+                    .with_pcm_queue_capacity(Duration::from_millis(100)),
+            )
+            .expect("opus track");
+            let published = LocalTrack::Audio(track.clone());
+            published.hold_audio_pacing();
+            track.pause_pacing();
+            track
+                .write_pcm(PcmFrame::mono(vec![7; 4_800], OPUS_SAMPLE_RATE))
+                .await
+                .expect("100 ms fits the queue");
+
+            published.start_audio_pacing().await;
+            // A running pacer takes 960 samples every 20 ms.
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let result = track
+                .write_pcm(PcmFrame::mono(
+                    vec![7; FRAME_SAMPLES_20MS],
+                    OPUS_SAMPLE_RATE,
+                ))
+                .await;
+
+            assert!(
+                matches!(
+                    result,
+                    Err(RtcError::PcmQueueOverflow {
+                        dropped_samples: FRAME_SAMPLES_20MS,
+                        ..
+                    })
+                ),
+                "pace {pace}: the pacer took the PCM of a paused track"
+            );
+            track.stop();
+        }
+    }
+
+    #[tokio::test]
+    async fn the_end_of_the_publication_hold_starts_pacing_with_pace_off() {
+        let track =
+            LocalAudioTrack::opus_with_config(LocalAudioTrackConfig::default().with_pace(false))
+                .expect("opus track");
+        let published = LocalTrack::Audio(track.clone());
+        published.hold_audio_pacing();
+        track
+            .write_pcm(PcmFrame::mono(vec![7; 4_800], OPUS_SAMPLE_RATE))
+            .await
+            .expect("100 ms fits the queue");
+
+        published.start_audio_pacing().await;
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !track
+                .inner
+                .pcm
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .is_empty()
+            {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the pacer takes the queued PCM");
+        track.stop();
     }
 
     #[tokio::test]
