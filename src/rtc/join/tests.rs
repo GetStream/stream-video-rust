@@ -1266,15 +1266,6 @@ async fn a_dropped_track_is_delivered_again_only_after_it_is_published_again() {
     );
     let remote = remote_rx.recv().await.expect("remote track");
     let session_id = remote.participant().session_id.clone();
-    // The SFU was asked to send the track.
-    *core
-        .active_subs
-        .lock()
-        .unwrap_or_else(|error| error.into_inner()) = vec![signal::TrackSubscriptionDetails {
-        session_id: session_id.clone(),
-        track_type: TrackType::Audio as i32,
-        ..Default::default()
-    }];
 
     // The publisher keeps sending after the drop.
     drop(remote);

@@ -318,9 +318,9 @@ impl RtcCore {
     }
 
     /// Read and drop the packets of a dropped track. When a packet arrives
-    /// after a republish subscribed the track again, deliver the track again
-    /// with that packet first: webrtc-rs fires `on_track` only once for each
-    /// receiver.
+    /// after a republish, deliver the track again with that packet first:
+    /// webrtc-rs fires `on_track` only once for each receiver. The SFU can
+    /// send the first packets before its answer to the new subscription.
     async fn deliver_again_when_published(
         self: Arc<Self>,
         generation: u64,
@@ -351,16 +351,7 @@ impl RtcCore {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .contains(&key);
-            let subscribed = !dropped
-                && self
-                    .active_subs
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .iter()
-                    .any(|details| {
-                        details.session_id == key.session_id && details.track_type == key.track_type
-                    });
-            if subscribed {
+            if !dropped {
                 self.handle_incoming_track(
                     generation,
                     connection_epoch,
