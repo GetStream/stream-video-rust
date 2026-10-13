@@ -93,7 +93,30 @@ Use `vp9` or `vp9_svc` for camera video and `vp8` or `vp8_simulcast` for screen
 share. The `gpt_realtime_bot` example is voice-only, because OpenAI Realtime
 accepts only H.264 video.
 
+### PCM has a fixed sample rate
+
+`write_pcm` takes the sample rate of the first frame. A later frame at another
+rate gets `RtcError::PcmRateMismatch { expected, actual }` and is not written.
+The track still averages the channels of a frame to mono.
+
+`StreamResampler::new(out_rate, channels)` replaces `new(out_rate)` and
+`to_opus_mono()`. The first `push` sets the input rate. A frame with another
+rate gets `RtcError::PcmRateMismatch`, and a frame with another channel count
+gets `RtcError::IllegalState`. `push` and `flush` return
+`RtcResult<PcmFrame>` with the same channels as the input. The resampler no
+longer downmixes to mono.
+
 ## New Features
+
+### The pacer plays the end of the PCM
+
+`StreamResampler` holds the newest 128 input frames in its filter: 8 ms at
+16 kHz, 5.3 ms at 24 kHz. `StreamResampler::flush` returns them. When the queue
+of a `LocalAudioTrack` holds less than one 20 ms frame, the pacer first adds
+that audio, so the end of the written audio plays without the next write. A
+track at 48 kHz holds no audio. Each time the queue runs short in the middle of
+the audio, the filter starts again: the gap is at least 11 ms at 16 kHz and
+23 ms at 8 kHz.
 
 ### Pacing control for PCM tracks
 
@@ -192,6 +215,11 @@ on `Call` (`get_call_participant_session_metrics`,
   packets arrive but no frame is decoded for 3 s, and again after each further
   3 s, as libwebrtc does. Before, a stream whose frames could not be assembled
   stayed frozen and sent no keyframe request.
+- `StreamResampler` uses a windowed-sinc filter (rubato) and removes the audio
+  above the lower Nyquist frequency. Before, it interpolated linearly: from
+  48 kHz to 16 kHz, a 12 kHz tone came out at 4 kHz at full level.
+- `LocalAudioTrack::flush` also drops the audio in the resampler. A flush during
+  a `write_pcm` can no longer put audio from before the flush in the queue.
 
 # v0.1.0-preview.2
 
