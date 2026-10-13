@@ -71,7 +71,7 @@ use super::subscriptions::{
     DEFAULT_VIDEO_DIMENSION, SubscriptionConfig, SubscriptionTarget, TrackKey,
 };
 use super::tracer::Tracer;
-use super::tracks::{LocalTrack, RemoteParticipant, RemoteTrack};
+use super::tracks::{LocalTrack, RemoteParticipant, RemoteTrack, RtpPacket};
 
 use serde_json::json;
 
