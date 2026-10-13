@@ -21,9 +21,9 @@ use getstream::models::UserRequest;
 use getstream::models::{CallRequest, DeleteCallRequest, GetOrCreateCallRequest, MemberRequest};
 use getstream::rtc::proto::models::TrackType;
 use getstream::rtc::{
-    CallingState, ClientCallEvent, ClientPublishOptions, JoinCallData, LocalAudioTrack, LocalTrack,
-    LocalVideoTrack, PcmFrame, PreferredVideoCodec, RemoteTrack, RtcError, SfuCallEvent,
-    SubscriptionConfig, SubscriptionTarget, TrackSubscriptionConfig, VideoFrame,
+    CallingState, ClientCallEvent, JoinCallData, LocalAudioTrack, LocalTrack, LocalVideoTrack,
+    PcmFrame, RemoteTrack, RtcError, SfuCallEvent, SubscriptionConfig, SubscriptionTarget,
+    TrackSubscriptionConfig, VideoFrame,
 };
 use getstream::video::Call;
 use tokio::sync::mpsc::{Receiver, channel};
@@ -1119,93 +1119,6 @@ async fn vp9_svc_preserves_one_ssrc_and_adapts_all_spatial_layers() {
         Ok(Err(error)) => panic!("{error}"),
         Err(_) => panic!("VP9 SVC live media test timed out"),
     }
-}
-
-#[tokio::test]
-async fn publish_h264_video_b_decodes_i420_frame() {
-    let Some(client) = common::client_or_skip() else {
-        return;
-    };
-    init_tracing();
-
-    let user_a = common::unique_id("h264-a");
-    let user_b = common::unique_id("h264-b");
-    let (admin, call_id) = setup_call(&client, &[&user_a, &user_b]).await;
-
-    let outcome = tokio::time::timeout(Duration::from_secs(160), async {
-        let call_a = client.video().call("default", &call_id);
-        let call_b = client.video().call("default", &call_id);
-
-        call_a.update_publish_options(ClientPublishOptions::new(PreferredVideoCodec::H264));
-        call_a
-            .join(JoinCallData::new(&user_a))
-            .await
-            .expect("H264 publisher join");
-        let video_a = LocalVideoTrack::h264().expect("H264 track");
-
-        // No public accessor exposes the join response's advertised
-        // publish_options, so attempting the publish is the structured skip
-        // signal the API gives us: `publish_video` validates the requested codec
-        // against the SFU's advertised options before any SetPublisher RPC, so a
-        // VP-only edge (all app edges are `-vp`) returns a narrow "did not
-        // advertise" media error. Skip cleanly only on that, surface anything
-        // else, and run the full publish -> subscribe -> decode assertion path
-        // on an H264-advertising edge.
-        match call_a.publish_video(video_a.clone()).await {
-            Ok(()) => {}
-            Err(RtcError::Media(message)) if message.contains("did not advertise") => {
-                eprintln!(
-                    "SKIP: publish_h264_video_b_decodes_i420_frame: SFU edge does not \
-                     advertise H264 ({message})"
-                );
-                call_a
-                    .leave()
-                    .await
-                    .expect("H264 publisher leave after skip");
-                return;
-            }
-            Err(error) => panic!("unexpected H264 publish_video failure: {error}"),
-        }
-        let feeder = spawn_blue_video(video_a);
-
-        let mut rx_b = track_sink(&call_b);
-        call_b
-            .join(JoinCallData::new(&user_b))
-            .await
-            .expect("H264 subscriber join");
-        call_b
-            .update_subscriptions(SubscriptionConfig::audio_video())
-            .await
-            .expect("subscribe to H264 video");
-
-        let remote = recv_track(
-            &mut rx_b,
-            &user_a,
-            TrackType::Video,
-            Duration::from_secs(60),
-        )
-        .await
-        .expect("subscriber did not receive the H264 track");
-        assert!(
-            remote.codec().mime_type.eq_ignore_ascii_case("video/h264"),
-            "expected H264, negotiated {}",
-            remote.codec().mime_type
-        );
-
-        let frame = tokio::time::timeout(Duration::from_secs(45), remote.next_video_frame())
-            .await
-            .expect("timed out reassembling and decoding H264")
-            .expect("H264 track ended before a frame decoded");
-        assert_packed_blue_frame(&frame);
-
-        feeder.abort();
-        call_a.leave().await.expect("H264 publisher leave");
-        call_b.leave().await.expect("H264 subscriber leave");
-    })
-    .await;
-
-    let _ = admin.delete(DeleteCallRequest { hard: Some(true) }).await;
-    outcome.expect("H264 live media test timed out");
 }
 
 // Test 8: the SFU reports A taking over as speaking / dominant

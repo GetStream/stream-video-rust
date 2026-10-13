@@ -5,12 +5,7 @@
 //! ```
 //!
 //! The bot joins a Stream call, connects to OpenAI Realtime, and bridges audio
-//! in both directions. It also sends downscaled H264 video frames to OpenAI.
-//!
-//! The OpenAI video track uses H264. [`LocalVideoTrack`] performs the encode and
-//! RTP packetization in-process through OpenH264. OpenH264 is BSD-2-Clause;
-//! applications distributing H264 functionality must evaluate their own patent
-//! obligations.
+//! in both directions.
 //!
 //! # OpenAI Realtime handshake
 //!
@@ -28,22 +23,20 @@
 //! after ICE gathering completes. OpenAI advertises host candidates only, so
 //! that PeerConnection needs no ICE servers.
 //!
-//! # OpenAI video is H264-only
+//! # Voice only
 //!
-//! Offering VP8, VP9, AV1, H265, and H264 returns an answer with nine H264
-//! payload types and nothing else (`packetization-mode` 0/1, profiles `42001f`,
-//! `42e01f`, `640028`–`640033`). With a video transceiver in the offer and no
-//! H264 encoder, applying that answer fails with `unable to start track, codec
-//! is not supported by remote` and takes the *audio* leg down with it. OpenAI
-//! cannot renegotiate video mid-session without losing session state, so this is
-//! decided at connect time — hence the in-process H264 encode below.
+//! OpenAI accepts only H264 on a WebRTC video track: an offer with VP8, VP9,
+//! AV1, H265, and H264 gets an answer with H264 payload types and nothing else.
+//! The SDK has no H264 encoder, and a video transceiver that cannot send the
+//! answered codec fails `set_remote_description` and takes the audio leg down
+//! with it. So the bot offers audio only.
 //!
 //! Env: `STREAM_API_KEY`, `STREAM_API_SECRET`, `OPENAI_API_KEY`,
 //! `OPENAI_REALTIME_MODEL` (fallback `OPENAI_MODEL`, default `gpt-realtime`),
 //! optional `EXAMPLE_BASE_URL` / `EXAMPLE_CALL_TYPE` / `EXAMPLE_CALL_ID`.
 
 use std::future::Future;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
@@ -51,8 +44,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use getstream::models::{CallRequest, GetOrCreateCallRequest, MemberRequest, UserRequest};
 use getstream::rtc::proto::models::TrackType;
 use getstream::rtc::{
-    JoinCallData, LocalAudioTrack, LocalAudioTrackConfig, LocalVideoTrack, RemoteTrack, RtcError,
-    SubscriptionConfig, TrackSubscriptionConfig, VideoFrame,
+    JoinCallData, LocalAudioTrack, LocalAudioTrackConfig, RemoteTrack, RtcError, SubscriptionConfig,
 };
 use getstream::video::Call;
 use getstream::{Stream, TokenOptions};
@@ -78,8 +70,6 @@ const OPENAI_EVENT_CHANNEL: &str = "oai-events";
 const OPENAI_CONNECT_TIMEOUT: Duration = Duration::from_secs(45);
 const TRACK_EVENT_CAPACITY: usize = 32;
 const BRIDGE_STOP_TIMEOUT: Duration = Duration::from_secs(5);
-const VIDEO_SEND_INTERVAL: Duration = Duration::from_secs(1);
-const VIDEO_SEND_MAX_EDGE: u32 = 512;
 /// OpenAI Realtime connection settings resolved from the environment.
 #[derive(Clone)]
 pub struct OpenAiConfig {
@@ -116,26 +106,9 @@ impl BotHandle {
         self.progress.audio_seen.load(Ordering::Relaxed)
     }
 
-    /// Number of inbound video frames decoded by the bot.
-    pub fn video_frames_decoded(&self) -> u64 {
-        self.progress.frames_decoded.load(Ordering::Relaxed)
-    }
-
-    /// Number of video frames encoded for OpenAI.
-    pub fn video_frames_encoded(&self) -> u64 {
-        self.progress.frames_encoded.load(Ordering::Relaxed)
-    }
-
     /// The OpenAI PeerConnection's connection state (ICE + DTLS).
     pub fn openai_connection_state(&self) -> RTCPeerConnectionState {
         self.openai.pc.connection_state()
-    }
-
-    /// The codec OpenAI negotiated on the video m-line, or `None` if its answer
-    /// carried no video at all.
-    pub async fn openai_video_codec(&self) -> Option<String> {
-        let remote = self.openai.pc.remote_description().await?;
-        negotiated_video_codec(&remote.sdp)
     }
 
     /// Cancel and reap bridge tasks, close OpenAI, and leave the Stream call.
@@ -151,7 +124,6 @@ struct OpenAiSession {
     pc: Arc<RTCPeerConnection>,
     _events: Arc<RTCDataChannel>,
     mic: LocalAudioTrack,
-    camera: LocalVideoTrack,
     tasks: TaskGroup,
 }
 
@@ -340,14 +312,6 @@ async fn configure_openai(
         })
     }));
 
-    let camera = LocalVideoTrack::h264().context("H264 track for OpenAI")?;
-    spawn_rtcp_drain(
-        &tasks,
-        pc.add_track(camera.webrtc_track())
-            .await
-            .context("add video track to the OpenAI PeerConnection")?,
-    );
-
     let weak_pc = Arc::downgrade(&pc);
     let to_stream = stream_audio.clone();
     let audio_tasks = tasks.clone();
@@ -395,7 +359,7 @@ async fn configure_openai(
         })
     }));
 
-    let instructions = "You are a friendly voice assistant on a live video call. \
+    let instructions = "You are a friendly voice assistant on a live call. \
         Greet the caller warmly in one short sentence, then answer questions concisely.";
 
     let offer = pc.create_offer(None).await.context("create offer")?;
@@ -411,12 +375,6 @@ async fn configure_openai(
         .sdp;
 
     let answer = exchange_sdp(cfg, &offer_sdp, &session_config(cfg, instructions)).await?;
-    match negotiated_video_codec(&answer) {
-        Some(codec) => tracing::info!(%codec, "gpt_realtime_bot: OpenAI negotiated video"),
-        None => tracing::warn!(
-            "gpt_realtime_bot: OpenAI's answer carries no video m-line — the model will not see the caller"
-        ),
-    }
     pc.set_remote_description(
         RTCSessionDescription::answer(answer).context("parse OpenAI SDP answer")?,
     )
@@ -428,7 +386,6 @@ async fn configure_openai(
         pc,
         _events: events,
         mic,
-        camera,
         tasks,
     })
 }
@@ -441,19 +398,6 @@ fn spawn_rtcp_drain(
         let mut buf = vec![0u8; 1500];
         while sender.read(&mut buf).await.is_ok() {}
     });
-}
-
-/// The codec on the answer's video m-line, e.g. `H264/90000 (payload type 100)`.
-/// `None` means the answer has no video at all.
-fn negotiated_video_codec(sdp: &str) -> Option<String> {
-    let m_line = sdp.lines().find(|l| l.starts_with("m=video"))?;
-    let payload_type = m_line.split_whitespace().nth(3)?;
-    let rtpmap = format!("a=rtpmap:{payload_type} ");
-    let codec = sdp
-        .lines()
-        .find_map(|l| l.strip_prefix(&rtpmap))
-        .unwrap_or("unknown");
-    Some(format!("{codec} (payload type {payload_type})"))
 }
 
 async fn send_event(channel: &Arc<RTCDataChannel>, event: &Value) -> Result<()> {
@@ -483,9 +427,6 @@ fn handle_openai_event(payload: &[u8], stream_audio: &LocalAudioTrack) {
 #[derive(Default)]
 struct MediaProgress {
     audio_seen: AtomicBool,
-    frames_decoded: AtomicU64,
-    frames_encoded: AtomicU64,
-    latest_frame: StdMutex<Option<VideoFrame>>,
 }
 
 async fn pump_audio_in(
@@ -512,82 +453,6 @@ async fn pump_audio_in(
     }
 }
 
-async fn pump_video_in(
-    remote: RemoteTrack,
-    progress: Arc<MediaProgress>,
-    mut cancel: watch::Receiver<bool>,
-) {
-    let user = remote.participant().user_id.clone();
-    tracing::info!(%user, codec = %remote.codec().mime_type, "gpt_realtime_bot: video track");
-
-    loop {
-        let frame = tokio::select! {
-            _ = cancel.changed() => return,
-            frame = remote.next_video_frame() => frame,
-        };
-        let Some(frame) = frame else { break };
-        let n = progress.frames_decoded.fetch_add(1, Ordering::Relaxed) + 1;
-        if n == 1 || n.is_multiple_of(30) {
-            tracing::info!(
-                %user,
-                frames = n,
-                width = frame.width,
-                height = frame.height,
-                "gpt_realtime_bot: decoded video"
-            );
-        }
-        *progress
-            .latest_frame
-            .lock()
-            .unwrap_or_else(|e| e.into_inner()) = Some(frame);
-    }
-    tracing::info!(%user, "gpt_realtime_bot: video track ended");
-}
-
-async fn pump_video_encoder(
-    progress: Arc<MediaProgress>,
-    camera: LocalVideoTrack,
-    mut cancel: watch::Receiver<bool>,
-) {
-    let mut interval = tokio::time::interval(VIDEO_SEND_INTERVAL);
-    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    loop {
-        tokio::select! {
-            _ = cancel.changed() => return,
-            _ = interval.tick() => {}
-        }
-        let Some(frame) = progress
-            .latest_frame
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .take()
-        else {
-            continue;
-        };
-        let frame = frame.downscale_to_fit(VIDEO_SEND_MAX_EDGE);
-
-        match camera
-            .write_i420(&frame.data, frame.width, frame.height, VIDEO_SEND_INTERVAL)
-            .await
-        {
-            Ok(()) => {
-                let n = progress.frames_encoded.fetch_add(1, Ordering::Relaxed) + 1;
-                if n == 1 {
-                    tracing::info!(
-                        width = frame.width,
-                        height = frame.height,
-                        "gpt_realtime_bot: first H264 frame for OpenAI"
-                    );
-                }
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "gpt_realtime_bot: H264 encode failed");
-                return;
-            }
-        }
-    }
-}
-
 struct MediaBridge {
     cancel: watch::Sender<bool>,
     task: JoinHandle<()>,
@@ -598,14 +463,10 @@ impl MediaBridge {
         mut track_rx: mpsc::Receiver<RemoteTrack>,
         progress: Arc<MediaProgress>,
         mic: LocalAudioTrack,
-        camera: LocalVideoTrack,
     ) -> Self {
         let (cancel, mut cancel_rx) = watch::channel(false);
-        let encoder_cancel = cancel_rx.clone();
-        let encoder_progress = progress.clone();
         let task = tokio::spawn(async move {
             let mut pumps = JoinSet::new();
-            pumps.spawn(pump_video_encoder(encoder_progress, camera, encoder_cancel));
 
             loop {
                 tokio::select! {
@@ -617,14 +478,9 @@ impl MediaBridge {
                                 progress.audio_seen.store(true, Ordering::Relaxed);
                                 pumps.spawn(pump_audio_in(track, mic.clone(), cancel_rx.clone()));
                             }
-                            TrackType::Video | TrackType::ScreenShare => {
-                                pumps.spawn(pump_video_in(
-                                    track,
-                                    progress.clone(),
-                                    cancel_rx.clone(),
-                                ));
-                            }
-                            TrackType::Unspecified => {}
+                            TrackType::Video
+                            | TrackType::ScreenShare
+                            | TrackType::Unspecified => {}
                         }
                     }
                     result = pumps.join_next(), if !pumps.is_empty() => {
@@ -687,7 +543,7 @@ async fn publish_bot_audio(call: &Call) -> Result<LocalAudioTrack> {
 }
 
 /// Join the call as `bot`, publish audio, connect the OpenAI PeerConnection, and
-/// subscribe to audio + video. Returns a [`BotHandle`]; the caller stays
+/// subscribe to audio. Returns a [`BotHandle`]; the caller stays
 /// connected and calls [`BotHandle::shutdown`] to leave.
 pub async fn start_bot(
     client: &Stream,
@@ -743,26 +599,14 @@ pub async fn start_bot(
     });
 
     if let Err(error) = call
-        .update_subscriptions(SubscriptionConfig {
-            default: TrackSubscriptionConfig {
-                track_types: vec![TrackType::Audio, TrackType::Video],
-                video_dimension: (640, 360),
-                ..Default::default()
-            },
-            ..Default::default()
-        })
+        .update_subscriptions(SubscriptionConfig::audio_all())
         .await
         .context("update_subscriptions")
     {
         return Err(cleanup_failed_bot_setup(&call, Some(openai), error).await);
     }
 
-    let bridge = MediaBridge::spawn(
-        track_rx,
-        progress.clone(),
-        openai.mic.clone(),
-        openai.camera.clone(),
-    );
+    let bridge = MediaBridge::spawn(track_rx, progress.clone(), openai.mic.clone());
 
     Ok(BotHandle {
         call,
