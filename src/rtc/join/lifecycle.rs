@@ -644,8 +644,10 @@ impl RtcCore {
 impl RtcCore {
     /// Leave the call: send `leave`, close the PeerConnections and WebSocket,
     /// abort background tasks. Succeeds from any state, including `Joining`
-    /// (JS: force to a leaving state rather than waiting for `JOINED`).
-    pub async fn leave(&self, reason: impl Into<String>) -> Result<()> {
+    /// (JS: force to a leaving state rather than waiting for `JOINED`). The
+    /// teardown runs in a runtime task, so it finishes when this future is
+    /// dropped.
+    pub async fn leave(self: &Arc<Self>, reason: impl Into<String>) -> Result<()> {
         let reason = reason.into();
         let generation = self.cancel_generation();
         let left = LeftCall {
@@ -653,18 +655,31 @@ impl RtcCore {
             generation,
         };
 
-        let connection = self.connection.lock().await.take();
-        if let Some(connection) = connection {
-            let session_id = connection.session_id.clone();
-            // Record the leave reason so the final `SendStats` (drained by
-            // `teardown`) carries the end-of-call event (JS `call.leaveReason`).
-            connection.signal.trace("call.leaveReason", json!(reason));
-            {
-                let mut sender = connection.sfu_sender.lock().await;
-                let _ = sender.send_leave(session_id, &reason).await;
-                let _ = sender.close().await;
+        let core = self.clone();
+        let teardown = self.spawn_runtime_task(async move {
+            // A join that starts after a dropped leave owns a later connection.
+            let connection = core
+                .connection
+                .lock()
+                .await
+                .take_if(|connection| connection.generation < generation);
+            if let Some(connection) = connection {
+                let session_id = connection.session_id.clone();
+                // Record the leave reason so the final `SendStats` (drained by
+                // `teardown`) carries the end-of-call event (JS `call.leaveReason`).
+                connection.signal.trace("call.leaveReason", json!(reason));
+                {
+                    let mut sender = connection.sfu_sender.lock().await;
+                    let _ = sender.send_leave(session_id, &reason).await;
+                    let _ = sender.close().await;
+                }
+                connection.teardown().await;
             }
-            connection.teardown().await;
+        });
+        if let Err(error) = teardown.await
+            && error.is_panic()
+        {
+            std::panic::resume_unwind(error.into_panic());
         }
         drop(left);
         self.stop_coordinator_events(generation).await;

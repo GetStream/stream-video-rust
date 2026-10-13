@@ -66,7 +66,7 @@ pub use reconnect::{
 pub use sfu::signal::SignalClient;
 pub use sfu::ws::{SfuReceiver, SfuSender};
 pub use stats::{DEFAULT_REPORTING_INTERVAL_MS, reporting_interval};
-pub use subscriptions::{SubscriptionConfig, SubscriptionTarget};
+pub use subscriptions::{SubscriptionConfig, SubscriptionTarget, TrackSubscriptionConfig};
 pub use tracer::{TraceRecord, Tracer};
 pub use tracks::{
     Codec, LocalAudioTrack, LocalAudioTrackConfig, LocalTrack, LocalVideoTrack,

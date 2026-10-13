@@ -52,7 +52,7 @@ use getstream::models::{CallRequest, GetOrCreateCallRequest, MemberRequest, User
 use getstream::rtc::proto::models::TrackType;
 use getstream::rtc::{
     JoinCallData, LocalAudioTrack, LocalVideoTrack, RemoteTrack, RtcError, SubscriptionConfig,
-    VideoFrame,
+    TrackSubscriptionConfig, VideoFrame,
 };
 use getstream::video::Call;
 use getstream::{Stream, TokenOptions};
@@ -744,8 +744,12 @@ pub async fn start_bot(
 
     if let Err(error) = call
         .update_subscriptions(SubscriptionConfig {
-            video_dimension: Some((640, 360)),
-            ..SubscriptionConfig::audio_video()
+            default: TrackSubscriptionConfig {
+                track_types: vec![TrackType::Audio, TrackType::Video],
+                video_dimension: (640, 360),
+                ..Default::default()
+            },
+            ..Default::default()
         })
         .await
         .context("update_subscriptions")

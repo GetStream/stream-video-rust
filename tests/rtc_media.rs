@@ -23,7 +23,7 @@ use getstream::rtc::proto::models::TrackType;
 use getstream::rtc::{
     CallingState, ClientCallEvent, ClientPublishOptions, JoinCallData, LocalAudioTrack, LocalTrack,
     LocalVideoTrack, PcmFrame, PreferredVideoCodec, RemoteTrack, RtcError, SfuCallEvent,
-    SubscriptionConfig, VideoFrame,
+    SubscriptionConfig, SubscriptionTarget, TrackSubscriptionConfig, VideoFrame,
 };
 use getstream::video::Call;
 use tokio::sync::mpsc::{Receiver, channel};
@@ -914,9 +914,9 @@ async fn publish_blue_video_reaches_raw_rtp_and_i420_decoder() {
     outcome.expect("VP9 RTP/decode test timed out");
 }
 
-/// A video subscription without a dimension hint is accepted and delivers video.
+/// A video target without a dimension hint is accepted and delivers video.
 #[tokio::test]
-async fn video_subscription_without_a_dimension_receives_video() {
+async fn video_target_without_a_dimension_receives_video() {
     let Some(client) = common::client_or_skip() else {
         return;
     };
@@ -946,13 +946,11 @@ async fn video_subscription_without_a_dimension_receives_video() {
             .join(JoinCallData::new(&user_b))
             .await
             .expect("B join");
+        let session_a = call_a.session_id().await.expect("A session id");
         call_b
-            .update_subscriptions(SubscriptionConfig {
-                video_dimension: None,
-                ..SubscriptionConfig::audio_video()
-            })
+            .update_subscription_targets(vec![SubscriptionTarget::new(session_a, TrackType::Video)])
             .await
-            .expect("B update_subscriptions without a dimension");
+            .expect("B update_subscription_targets without a dimension");
         recv_track(
             &mut rx_b,
             &user_a,
@@ -1053,10 +1051,12 @@ async fn vp9_svc_preserves_one_ssrc_and_adapts_all_spatial_layers() {
         // transition accidentally.
         call_b
             .update_subscriptions(SubscriptionConfig {
-                audio: false,
-                video: true,
-                screen_share: false,
-                video_dimension: Some((320, 180)),
+                default: TrackSubscriptionConfig {
+                    track_types: vec![TrackType::Video],
+                    video_dimension: (320, 180),
+                    ..Default::default()
+                },
+                ..Default::default()
             })
             .await
             .map_err(|error| format!("VP9 SVC low-quality subscription failed: {error}"))?;
@@ -1074,10 +1074,12 @@ async fn vp9_svc_preserves_one_ssrc_and_adapts_all_spatial_layers() {
         // picture with truthful SS dimensions after the encoder reconfiguration.
         call_b
             .update_subscriptions(SubscriptionConfig {
-                audio: false,
-                video: true,
-                screen_share: false,
-                video_dimension: Some((1280, 720)),
+                default: TrackSubscriptionConfig {
+                    track_types: vec![TrackType::Video],
+                    video_dimension: (1280, 720),
+                    ..Default::default()
+                },
+                ..Default::default()
             })
             .await
             .map_err(|error| format!("VP9 SVC high-quality subscription failed: {error}"))?;

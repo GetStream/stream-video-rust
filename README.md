@@ -31,8 +31,8 @@ remote audio and video, transform it, and publish media back into the call.
   feedback, and client call-event reporting.
 - Join a call as a server-side SFU participant with retry, reconnect, and
   migration handling.
-- Subscribe globally or by participant session to remote audio, video, and
-  screen-share tracks.
+- Subscribe globally, by participant role, or by participant session to remote
+  audio, video, and screen-share tracks.
 - Observe typed participant, connection-quality, pin, grant, and inbound-pause
   state from the SFU.
 - Read Opus audio as PCM, decode VP8/VP9/H264 video as I420, or work with raw
@@ -252,8 +252,9 @@ async fn run_media_bridge(call: &Call) -> Result<(), Box<dyn std::error::Error>>
 For a complete bridge with cancellation, barge-in, audio and video processing,
 and deterministic cleanup, see [`gpt_realtime_bot`](https://github.com/GetStream/stream-video-rust/blob/main/examples/gpt_realtime_bot.rs).
 
-For selective agents, use `Call::update_subscription_targets` with
-`SubscriptionTarget` values instead of subscribing to every participant. A
+For selective agents, set `role_filters` and `max_subscriptions` in
+`SubscriptionConfig`, or use `Call::update_subscription_targets` with
+`SubscriptionTarget` values for an exact list of participant sessions. A
 temporary `mute_track` / `unmute_track` preserves the same local track and
 sender; `stop_publish` remains terminal for that local track handle. The latest
 SFU view is available synchronously through `Call::call_state`.

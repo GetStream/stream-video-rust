@@ -523,6 +523,28 @@ async fn each_event_goes_only_to_the_stream_of_its_source() {
     assert!(coordinator.try_recv().is_err());
 }
 
+#[test]
+fn a_call_event_stream_keeps_the_configured_number_of_events() {
+    let core = test_core_with_config(ClientConfig {
+        call_event_capacity: 2,
+        ..ClientConfig::default()
+    });
+    let generation = core.begin_join().expect("test generation");
+    let mut events = core.client_events();
+    for state in [
+        CallingState::Joined,
+        CallingState::Reconnecting,
+        CallingState::Joined,
+    ] {
+        assert!(core.set_state_if_current(generation, state));
+    }
+
+    assert!(matches!(
+        events.try_recv(),
+        Err(broadcast::error::TryRecvError::Lagged(1))
+    ));
+}
+
 #[tokio::test]
 async fn track_events_report_the_track_type_cause_and_participant() {
     let core = test_core();
@@ -652,7 +674,10 @@ async fn dropped_join_allows_a_new_join() {
 #[tokio::test]
 async fn dropped_leave_still_leaves_the_call() {
     let core = test_core();
-    prepare_joined_core(&core, "alice");
+    let generation = prepare_joined_core(&core, "alice");
+    let (connection, sfu) = establish_fake(&core, generation).await;
+    let (subscriber, publisher) = (connection.subscriber.clone(), connection.publisher.clone());
+    *core.connection.lock().await = Some(connection);
     let connection_slot = core.connection.lock().await;
 
     let leave = tokio::time::timeout(Duration::from_millis(50), core.leave("dropped leave")).await;
@@ -660,7 +685,44 @@ async fn dropped_leave_still_leaves_the_call() {
     drop(connection_slot);
 
     assert_eq!(core.state(), CallingState::Left);
+    let requests = requests_until_close(sfu).await;
+    assert!(requests.iter().any(|request| matches!(
+        request.request_payload,
+        Some(event::sfu_request::RequestPayload::LeaveCallRequest(_))
+    )));
+    wait_for(
+        Duration::from_secs(2),
+        || {
+            subscriber.connection_state() == RTCPeerConnectionState::Closed
+                && publisher.connection_state() == RTCPeerConnectionState::Closed
+        },
+        "closed peer connections",
+    )
+    .await;
     core.begin_join().expect("a new join can start");
+}
+
+#[tokio::test]
+async fn a_dropped_leave_keeps_the_connection_of_a_later_join() {
+    let core = test_core();
+    prepare_joined_core(&core, "alice");
+    let mut connection_slot = core.connection.lock().await;
+    let leave = tokio::time::timeout(Duration::from_millis(50), core.leave("dropped leave")).await;
+    assert!(leave.is_err(), "leave waits for the connection lock");
+
+    let generation = core.begin_join().expect("a new join can start");
+    let (connection, _sfu) = establish_fake(&core, generation).await;
+    *connection_slot = Some(connection);
+    let (_, _, completed) = core.runtime_task_snapshot();
+    drop(connection_slot);
+    wait_for(
+        Duration::from_secs(2),
+        || core.runtime_task_snapshot().2 > completed,
+        "the leave task",
+    )
+    .await;
+
+    assert!(core.connection.lock().await.is_some());
 }
 
 #[tokio::test]
@@ -1646,6 +1708,93 @@ fn participant_refresh_replaces_published_track_state() {
     let entry = participants.get("session-a").expect("participant");
     assert_eq!(entry.published.len(), 1);
     assert!(entry.published.contains(&(TrackType::Audio as i32)));
+}
+
+#[tokio::test]
+async fn turning_incoming_video_off_and_on_keeps_the_video_dimension() {
+    let core = test_core();
+    let config = SubscriptionConfig {
+        default: crate::rtc::TrackSubscriptionConfig {
+            track_types: vec![TrackType::Video],
+            video_dimension: (640, 360),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    core.update_subscriptions(config.clone())
+        .await
+        .expect("update subscriptions");
+    core.set_incoming_video_enabled(false)
+        .await
+        .expect("video off");
+    core.set_incoming_video_enabled(true)
+        .await
+        .expect("video on");
+
+    assert_eq!(
+        *core.sub_config.lock().unwrap_or_else(|e| e.into_inner()),
+        config
+    );
+}
+
+#[test]
+fn a_join_response_keeps_the_order_of_known_participants() {
+    let core = test_core();
+    let generation = core.begin_join().expect("test generation");
+    let call_state = |session_ids: &[&str]| {
+        Some(models::CallState {
+            participants: session_ids
+                .iter()
+                .map(|session_id| models::Participant {
+                    user_id: format!("user-{session_id}"),
+                    session_id: (*session_id).to_owned(),
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        })
+    };
+    assert!(core.apply_join_call_state_if_current(
+        generation,
+        "me",
+        "me",
+        call_state(&["c", "a", "b"])
+    ));
+    assert!(core.apply_join_call_state_if_current(
+        generation,
+        "me",
+        "me",
+        call_state(&["d", "b", "a"])
+    ));
+
+    let order: Vec<_> = core
+        .participants()
+        .into_iter()
+        .map(|participant| participant.session_id)
+        .collect();
+    assert_eq!(order, ["me", "a", "b", "d"]);
+}
+
+#[test]
+fn participants_keep_the_order_in_which_the_call_learned_them() {
+    let core = test_core();
+    let participant = |session_id: &str, user_id: &str| models::Participant {
+        user_id: user_id.to_owned(),
+        session_id: session_id.to_owned(),
+        ..Default::default()
+    };
+    for session_id in ["h", "c", "f", "a", "g", "b", "e", "d"] {
+        core.upsert_participant(&participant(session_id, "user"));
+    }
+    core.remove_participant("f");
+    core.upsert_participant(&participant("c", "changed"));
+
+    let order: Vec<_> = core
+        .participants()
+        .into_iter()
+        .map(|participant| participant.session_id)
+        .collect();
+    assert_eq!(order, ["h", "c", "a", "g", "b", "e", "d"]);
 }
 
 #[test]

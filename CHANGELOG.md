@@ -35,6 +35,36 @@ receiver loses events only from its own stream.
 `TrackUnpublished` also adds `cause`. Patterns that match these variants must
 use the new fields or `..`.
 
+### Decoded audio frames carry their RTP timestamp
+
+`PcmFrame` adds `pts: Option<u32>`: the RTP timestamp of the first sample, in
+units of 1/48000 s, wrapping like RTP. `RemoteTrack::next_pcm` sets it; a frame
+rebuilt for a lost packet continues from the frame before it. Frames that the
+application or a conversion builds have `None`, and `write_pcm` ignores the
+field. Code that builds `PcmFrame` with a struct literal must set `pts` or use
+`PcmFrame::new` / `PcmFrame::mono`.
+
+### Subscription config has the stream-py shape
+
+`SubscriptionConfig` replaces `audio`, `video`, `screen_share` and
+`video_dimension` with the fields of the stream-py `SubscriptionConfig`:
+
+- `default: TrackSubscriptionConfig` gives `track_types`, `video_dimension`
+  and `screenshare_dimension`. Screen-share video and screen-share audio are
+  now separate track types, and screen share has its own dimension.
+- `role_filters` gives a rule by participant role. The first role of the
+  participant that has a rule selects it; other participants use `default`.
+- `max_subscriptions` limits the number of tracks. The tracks of the
+  participants that the call learned about first are kept.
+
+`SubscriptionConfig::default()` now subscribes to nothing, and
+`SubscriptionConfig::matches` is removed. The presets `audio_all`,
+`audio_video`, `all` and `none` stay. The default video and screen-share
+dimension is now 1920×1080 (it was 1280×720), also for a `SubscriptionTarget`
+without a dimension. `Call::participants` gives the participants in the order
+the call learned about them. `set_incoming_video_enabled` keeps the configured
+video dimension.
+
 ## New Features
 
 ### A token-only client can prepare a call before the join
@@ -52,6 +82,14 @@ client with an API secret; both handles share one session. `RtcCall` also adds
 `participant_count_changed`. `ClientCallEvent::name` gives
 `calling_state_changed`. A `CoordinatorEvent` has its coordinator `event_type`
 (for example `call.created`).
+
+### Configurable call event buffer
+
+`ClientConfig::call_event_capacity` sets how many events each call event
+stream keeps for a slow receiver. The default stays 256. A larger value makes a
+lag less likely, but each call allocates all slots of its three streams. Code
+that builds `ClientConfig` with a struct literal must set the new field or use
+`..ClientConfig::default()`.
 
 ### Video REST: advanced call statistics and reporting
 
