@@ -236,6 +236,12 @@ on `Call` (`get_call_participant_session_metrics`,
 - `LocalAudioTrack::flush` also drops the audio in the resampler and the audio
   of a `write_pcm` that started before the flush. It does not wait for a
   `write_pcm` in progress.
+- The first VP8 and VP9 picture ID and the first VP9 TL0PICIDX of a video track
+  are random, as RFC 9628 recommends. Before, they came from the clock and had
+  few possible values.
+- A VP8 or VP9 track continues its picture IDs when its encoder is set up again,
+  for example after a size or bitrate change. Before, the picture ID jumped to a
+  new value on the same SSRC, which RFC 7741 does not permit.
 
 # v0.1.0-preview.2
 

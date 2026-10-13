@@ -18,7 +18,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use getstream::models::UserRequest;
-use getstream::models::{CallRequest, DeleteCallRequest, GetOrCreateCallRequest, MemberRequest};
+use getstream::models::{CallRequest, GetOrCreateCallRequest, MemberRequest};
 use getstream::rtc::proto::models::TrackType;
 use getstream::rtc::{
     CallingState, ClientCallEvent, JoinCallData, LocalAudioTrack, LocalTrack, LocalVideoTrack,
@@ -435,7 +435,7 @@ async fn a_publishes_tone_b_receives_rtp_and_pcm() {
     let user_b = common::unique_id("b");
     let (admin, call_id) = setup_call(&client, &[&user_a, &user_b]).await;
 
-    let outcome = tokio::time::timeout(Duration::from_secs(150), async {
+    common::run_then_delete(admin, Duration::from_secs(150), async move {
         let call_a = client.video().call("default", &call_id);
         let call_b = client.video().call("default", &call_id);
 
@@ -511,11 +511,6 @@ async fn a_publishes_tone_b_receives_rtp_and_pcm() {
         call_b.leave().await.expect("B leave");
     })
     .await;
-
-    if std::env::var("LIVE_KEEP_CALL").is_err() {
-        let _ = admin.delete(DeleteCallRequest { hard: Some(true) }).await;
-    }
-    outcome.expect("test 1 timed out");
 }
 
 /// Test 2: A -> B (PCM bridge) -> C receives non-silent audio (KEY)
@@ -531,7 +526,7 @@ async fn republish_pcm_bridge_a_to_b_to_c() {
     let user_c = common::unique_id("c");
     let (admin, call_id) = setup_call(&client, &[&user_a, &user_b, &user_c]).await;
 
-    let outcome = tokio::time::timeout(Duration::from_secs(180), async {
+    common::run_then_delete(admin, Duration::from_secs(180), async move {
         let call_a = client.video().call("default", &call_id);
         let call_b = client.video().call("default", &call_id);
         let call_c = client.video().call("default", &call_id);
@@ -614,9 +609,6 @@ async fn republish_pcm_bridge_a_to_b_to_c() {
         call_c.leave().await.expect("C leave");
     })
     .await;
-
-    let _ = admin.delete(DeleteCallRequest { hard: Some(true) }).await;
-    outcome.expect("test 2 (PCM bridge) timed out");
 }
 
 /// Test 3: A -> B (RTP forward, same codec) -> C receives audio
@@ -632,7 +624,7 @@ async fn republish_rtp_forward_a_to_b_to_c() {
     let user_c = common::unique_id("c");
     let (admin, call_id) = setup_call(&client, &[&user_a, &user_b, &user_c]).await;
 
-    let outcome = tokio::time::timeout(Duration::from_secs(180), async {
+    common::run_then_delete(admin, Duration::from_secs(180), async move {
         let call_a = client.video().call("default", &call_id);
         let call_b = client.video().call("default", &call_id);
         let call_c = client.video().call("default", &call_id);
@@ -712,9 +704,6 @@ async fn republish_rtp_forward_a_to_b_to_c() {
         call_c.leave().await.expect("C leave");
     })
     .await;
-
-    let _ = admin.delete(DeleteCallRequest { hard: Some(true) }).await;
-    outcome.expect("test 3 (RTP forward) timed out");
 }
 
 /// Test 5: no video on_track without a video subscription
@@ -729,7 +718,7 @@ async fn no_video_on_track_without_video_subscription() {
     let user_b = common::unique_id("b");
     let (admin, call_id) = setup_call(&client, &[&user_a, &user_b]).await;
 
-    let outcome = tokio::time::timeout(Duration::from_secs(150), async {
+    common::run_then_delete(admin, Duration::from_secs(150), async move {
         let call_a = client.video().call("default", &call_id);
         let call_b = client.video().call("default", &call_id);
 
@@ -790,9 +779,6 @@ async fn no_video_on_track_without_video_subscription() {
         call_b.leave().await.expect("B leave");
     })
     .await;
-
-    let _ = admin.delete(DeleteCallRequest { hard: Some(true) }).await;
-    outcome.expect("test 5 (no-video) timed out");
 }
 
 /// Test 6: A publishes video; B reads RTP and C decodes a frame
@@ -808,7 +794,7 @@ async fn publish_blue_video_reaches_raw_rtp_and_i420_decoder() {
     let user_c = common::unique_id("c");
     let (admin, call_id) = setup_call(&client, &[&user_a, &user_b, &user_c]).await;
 
-    let outcome = tokio::time::timeout(Duration::from_secs(160), async {
+    common::run_then_delete(admin, Duration::from_secs(160), async move {
         let call_a = client.video().call("default", &call_id);
         let call_b = client.video().call("default", &call_id);
         let call_c = client.video().call("default", &call_id);
@@ -909,9 +895,6 @@ async fn publish_blue_video_reaches_raw_rtp_and_i420_decoder() {
         call_c.leave().await.expect("C leave");
     })
     .await;
-
-    let _ = admin.delete(DeleteCallRequest { hard: Some(true) }).await;
-    outcome.expect("VP9 RTP/decode test timed out");
 }
 
 /// A video target without a dimension hint is accepted and delivers video.
@@ -926,7 +909,7 @@ async fn video_target_without_a_dimension_receives_video() {
     let user_b = common::unique_id("b");
     let (admin, call_id) = setup_call(&client, &[&user_a, &user_b]).await;
 
-    let outcome = tokio::time::timeout(Duration::from_secs(120), async {
+    common::run_then_delete(admin, Duration::from_secs(120), async move {
         let call_a = client.video().call("default", &call_id);
         let call_b = client.video().call("default", &call_id);
 
@@ -965,9 +948,6 @@ async fn video_target_without_a_dimension_receives_video() {
         call_b.leave().await.expect("B leave");
     })
     .await;
-
-    let _ = admin.delete(DeleteCallRequest { hard: Some(true) }).await;
-    outcome.expect("dimensionless video subscription test timed out");
 }
 
 #[tokio::test]
@@ -980,145 +960,146 @@ async fn vp9_svc_preserves_one_ssrc_and_adapts_all_spatial_layers() {
     let user_a = common::unique_id("svc-a");
     let user_b = common::unique_id("svc-b");
     let (admin, call_id) = setup_call(&client, &[&user_a, &user_b]).await;
-    let call_a = client.video().call("default", &call_id);
-    let call_b = client.video().call("default", &call_id);
-    let mut feeder = None;
 
-    let outcome = tokio::time::timeout(Duration::from_secs(240), async {
-        call_a
-            .join(JoinCallData::new(&user_a))
+    common::run_then_delete(admin, Duration::from_secs(240), async move {
+        let call_a = client.video().call("default", &call_id);
+        let call_b = client.video().call("default", &call_id);
+        let mut feeder = None;
+
+        let outcome = async {
+            call_a
+                .join(JoinCallData::new(&user_a))
+                .await
+                .map_err(|error| format!("VP9 SVC publisher join failed: {error}"))?;
+            let video = LocalVideoTrack::vp9_svc()
+                .map_err(|error| format!("VP9 SVC track creation failed: {error}"))?;
+            call_a
+                .publish_video(video.clone())
+                .await
+                .map_err(|error| format!("VP9 SVC publish failed: {error}"))?;
+            // The current SFU camera PublishOption advertises 1280x720 as its full
+            // layer. Layered raw input intentionally has to match that truthful
+            // announced dimension.
+            feeder = Some(spawn_blue_video_at(video, 1280, 720));
+
+            let mut tracks = track_sink(&call_b);
+            call_b
+                .join(JoinCallData::new(&user_b))
+                .await
+                .map_err(|error| format!("VP9 SVC subscriber join failed: {error}"))?;
+            call_b
+                .update_subscriptions(SubscriptionConfig::audio_video())
+                .await
+                .map_err(|error| format!("VP9 SVC subscription failed: {error}"))?;
+            let remote = recv_track(
+                &mut tracks,
+                &user_a,
+                TrackType::Video,
+                Duration::from_secs(60),
+            )
             .await
-            .map_err(|error| format!("VP9 SVC publisher join failed: {error}"))?;
-        let video = LocalVideoTrack::vp9_svc()
-            .map_err(|error| format!("VP9 SVC track creation failed: {error}"))?;
-        call_a
-            .publish_video(video.clone())
-            .await
-            .map_err(|error| format!("VP9 SVC publish failed: {error}"))?;
-        // The current SFU camera PublishOption advertises 1280x720 as its full
-        // layer. Layered raw input intentionally has to match that truthful
-        // announced dimension.
-        feeder = Some(spawn_blue_video_at(video, 1280, 720));
+            .ok_or_else(|| "subscriber did not receive the VP9 SVC track".to_owned())?;
+            if !remote.codec().mime_type.eq_ignore_ascii_case("video/vp9") {
+                return Err(format!(
+                    "expected VP9 SVC, negotiated {}",
+                    remote.codec().mime_type
+                ));
+            }
 
-        let mut tracks = track_sink(&call_b);
-        call_b
-            .join(JoinCallData::new(&user_b))
-            .await
-            .map_err(|error| format!("VP9 SVC subscriber join failed: {error}"))?;
-        call_b
-            .update_subscriptions(SubscriptionConfig::audio_video())
-            .await
-            .map_err(|error| format!("VP9 SVC subscription failed: {error}"))?;
-        let remote = recv_track(
-            &mut tracks,
-            &user_a,
-            TrackType::Video,
-            Duration::from_secs(60),
-        )
-        .await
-        .ok_or_else(|| "subscriber did not receive the VP9 SVC track".to_owned())?;
-        if !remote.codec().mime_type.eq_ignore_ascii_case("video/vp9") {
-            return Err(format!(
-                "expected VP9 SVC, negotiated {}",
-                remote.codec().mime_type
-            ));
-        }
+            let full_dimensions = [(320, 180), (640, 360), (1280, 720)];
+            let mut all_ssrcs = BTreeSet::new();
 
-        let full_dimensions = [(320, 180), (640, 360), (1280, 720)];
-        let mut all_ssrcs = BTreeSet::new();
+            // High quality must carry a complete q/h/f key picture. Besides seeing
+            // every SID, this verifies that the three spatial frames share one RTP
+            // timestamp, picture ID, temporal ID, and TL0PICIDX; each layer has
+            // proper B/E boundaries; and only f carries the marker.
+            let initial_high = await_vp9_svc_layers(
+                &remote,
+                &[0, 1, 2],
+                Some(&full_dimensions),
+                1,
+                Duration::from_secs(60),
+                &mut all_ssrcs,
+            )
+            .await?;
+            if initial_high.predicted_values != BTreeSet::from([false]) {
+                return Err(format!(
+                    "VP9 scalability structure must arrive on a key picture, observed {initial_high:?}"
+                ));
+            }
 
-        // High quality must carry a complete q/h/f key picture. Besides seeing
-        // every SID, this verifies that the three spatial frames share one RTP
-        // timestamp, picture ID, temporal ID, and TL0PICIDX; each layer has
-        // proper B/E boundaries; and only f carries the marker.
-        let initial_high = await_vp9_svc_layers(
-            &remote,
-            &[0, 1, 2],
-            Some(&full_dimensions),
-            1,
-            Duration::from_secs(60),
-            &mut all_ssrcs,
-        )
-        .await?;
-        if initial_high.predicted_values != BTreeSet::from([false]) {
-            return Err(format!(
-                "VP9 scalability structure must arrive on a key picture, observed {initial_high:?}"
-            ));
-        }
-
-        // Ask the SFU for the q dimension. Require three consecutive complete
-        // base-only pictures so queued high-quality RTP cannot satisfy the
-        // transition accidentally.
-        call_b
-            .update_subscriptions(SubscriptionConfig {
-                default: TrackSubscriptionConfig {
-                    track_types: vec![TrackType::Video],
-                    video_dimension: (320, 180),
+            // Ask the SFU for the q dimension. Require three consecutive complete
+            // base-only pictures so queued high-quality RTP cannot satisfy the
+            // transition accidentally.
+            call_b
+                .update_subscriptions(SubscriptionConfig {
+                    default: TrackSubscriptionConfig {
+                        track_types: vec![TrackType::Video],
+                        video_dimension: (320, 180),
+                        ..Default::default()
+                    },
                     ..Default::default()
-                },
-                ..Default::default()
-            })
-            .await
-            .map_err(|error| format!("VP9 SVC low-quality subscription failed: {error}"))?;
-        await_vp9_svc_layers(
-            &remote,
-            &[0],
-            None,
-            3,
-            Duration::from_secs(60),
-            &mut all_ssrcs,
-        )
-        .await?;
+                })
+                .await
+                .map_err(|error| format!("VP9 SVC low-quality subscription failed: {error}"))?;
+            await_vp9_svc_layers(
+                &remote,
+                &[0],
+                None,
+                3,
+                Duration::from_secs(60),
+                &mut all_ssrcs,
+            )
+            .await?;
 
-        // Restoring the full dimension must restore q/h/f and emit a new key
-        // picture with truthful SS dimensions after the encoder reconfiguration.
-        call_b
-            .update_subscriptions(SubscriptionConfig {
-                default: TrackSubscriptionConfig {
-                    track_types: vec![TrackType::Video],
-                    video_dimension: (1280, 720),
+            // Restoring the full dimension must restore q/h/f and emit a new key
+            // picture with truthful SS dimensions after the encoder reconfiguration.
+            call_b
+                .update_subscriptions(SubscriptionConfig {
+                    default: TrackSubscriptionConfig {
+                        track_types: vec![TrackType::Video],
+                        video_dimension: (1280, 720),
+                        ..Default::default()
+                    },
                     ..Default::default()
-                },
-                ..Default::default()
-            })
-            .await
-            .map_err(|error| format!("VP9 SVC high-quality subscription failed: {error}"))?;
-        let restored_high = await_vp9_svc_layers(
-            &remote,
-            &[0, 1, 2],
-            Some(&full_dimensions),
-            1,
-            Duration::from_secs(60),
-            &mut all_ssrcs,
-        )
-        .await?;
-        if restored_high.predicted_values != BTreeSet::from([false]) {
-            return Err(format!(
-                "restored VP9 SVC layers must start with a key picture, observed {restored_high:?}"
-            ));
+                })
+                .await
+                .map_err(|error| format!("VP9 SVC high-quality subscription failed: {error}"))?;
+            let restored_high = await_vp9_svc_layers(
+                &remote,
+                &[0, 1, 2],
+                Some(&full_dimensions),
+                1,
+                Duration::from_secs(60),
+                &mut all_ssrcs,
+            )
+            .await?;
+            if restored_high.predicted_values != BTreeSet::from([false]) {
+                return Err(format!(
+                    "restored VP9 SVC layers must start with a key picture, observed {restored_high:?}"
+                ));
+            }
+            if all_ssrcs.len() != 1 {
+                return Err(format!(
+                    "VP9 SVC must retain one SSRC across quality changes, observed {all_ssrcs:?}"
+                ));
+            }
+            Ok::<(), String>(())
         }
-        if all_ssrcs.len() != 1 {
-            return Err(format!(
-                "VP9 SVC must retain one SSRC across quality changes, observed {all_ssrcs:?}"
-            ));
+        .await;
+
+        if let Some(feeder) = feeder {
+            feeder.abort();
+            let _ = feeder.await;
         }
-        Ok::<(), String>(())
+        let _ = call_a.leave().await;
+        let _ = call_b.leave().await;
+
+        if let Err(error) = outcome {
+            panic!("{error}");
+        }
     })
     .await;
-
-    if let Some(feeder) = feeder {
-        feeder.abort();
-        let _ = feeder.await;
-    }
-    let _ = call_a.leave().await;
-    let _ = call_b.leave().await;
-    let _ = admin.delete(DeleteCallRequest { hard: Some(true) }).await;
-
-    match outcome {
-        Ok(Ok(())) => {}
-        Ok(Err(error)) => panic!("{error}"),
-        Err(_) => panic!("VP9 SVC live media test timed out"),
-    }
 }
 
 // Test 8: the SFU reports A taking over as speaking / dominant
@@ -1182,7 +1163,7 @@ async fn loud_publisher_is_reported_speaking_and_dominant() {
     let user_b = common::unique_id("b");
     let (admin, call_id) = setup_call(&client, &[&user_a, &user_b]).await;
 
-    let outcome = tokio::time::timeout(Duration::from_secs(150), async {
+    common::run_then_delete(admin, Duration::from_secs(150), async move {
         let call_a = client.video().call("default", &call_id);
         let call_b = client.video().call("default", &call_id);
 
@@ -1251,9 +1232,6 @@ async fn loud_publisher_is_reported_speaking_and_dominant() {
         );
     })
     .await;
-
-    let _ = admin.delete(DeleteCallRequest { hard: Some(true) }).await;
-    outcome.expect("test 8 (audio level) timed out");
 }
 
 /// Test 9: stopping the sole publication is accepted and un-announced
@@ -1281,7 +1259,7 @@ async fn sole_audio_can_be_stopped_and_published_again() {
     let user_b = common::unique_id("b");
     let (admin, call_id) = setup_call(&client, &[&user_a, &user_b]).await;
 
-    let outcome = tokio::time::timeout(Duration::from_secs(150), async {
+    common::run_then_delete(admin, Duration::from_secs(150), async move {
         let call_a = client.video().call("default", &call_id);
         let call_b = client.video().call("default", &call_id);
 
@@ -1351,6 +1329,11 @@ async fn sole_audio_can_be_stopped_and_published_again() {
             "SFU never reported A's audio TrackUnpublished after stop_publish \
              (mute state not propagated to peers)"
         );
+        // The queued audio of the stopped track, and the silence that the SFU
+        // sends after the stop.
+        while let Ok(Some(_)) =
+            tokio::time::timeout(Duration::from_secs(2), remote_a.next_pcm()).await
+        {}
 
         // Publish a new audio track on the same session, as after an unmute.
         let audio_again = LocalAudioTrack::opus().expect("opus track");
@@ -1392,9 +1375,6 @@ async fn sole_audio_can_be_stopped_and_published_again() {
         call_b.leave().await.expect("B leave");
     })
     .await;
-
-    let _ = admin.delete(DeleteCallRequest { hard: Some(true) }).await;
-    outcome.expect("test 9 (stop sole publication) timed out");
 }
 
 /// A stopped camera track is replaced by a new track
@@ -1414,7 +1394,7 @@ async fn sole_video_can_be_stopped_and_published_again() {
     let user_b = common::unique_id("b");
     let (admin, call_id) = setup_call(&client, &[&user_a, &user_b]).await;
 
-    let outcome = tokio::time::timeout(Duration::from_secs(150), async {
+    common::run_then_delete(admin, Duration::from_secs(150), async move {
         let call_a = client.video().call("default", &call_id);
         let call_b = client.video().call("default", &call_id);
 
@@ -1518,9 +1498,6 @@ async fn sole_video_can_be_stopped_and_published_again() {
         call_b.leave().await.expect("B leave");
     })
     .await;
-
-    let _ = admin.delete(DeleteCallRequest { hard: Some(true) }).await;
-    outcome.expect("stop and publish video again timed out");
 }
 
 /// An audio track that B drops while A is muted arrives again after the unmute
@@ -1539,7 +1516,7 @@ async fn an_audio_track_dropped_while_muted_arrives_again_after_unmute() {
     let user_b = common::unique_id("b");
     let (admin, call_id) = setup_call(&client, &[&user_a, &user_b]).await;
 
-    let outcome = tokio::time::timeout(Duration::from_secs(150), async {
+    common::run_then_delete(admin, Duration::from_secs(150), async move {
         let call_a = client.video().call("default", &call_id);
         let call_b = client.video().call("default", &call_id);
 
@@ -1620,9 +1597,6 @@ async fn an_audio_track_dropped_while_muted_arrives_again_after_unmute() {
         call_b.leave().await.expect("B leave");
     })
     .await;
-
-    let _ = admin.delete(DeleteCallRequest { hard: Some(true) }).await;
-    outcome.expect("audio track dropped while muted timed out");
 }
 
 /// A video track that B drops while A is muted arrives again after the unmute
@@ -1637,7 +1611,7 @@ async fn a_video_track_dropped_while_muted_arrives_again_after_unmute() {
     let user_b = common::unique_id("b");
     let (admin, call_id) = setup_call(&client, &[&user_a, &user_b]).await;
 
-    let outcome = tokio::time::timeout(Duration::from_secs(150), async {
+    common::run_then_delete(admin, Duration::from_secs(150), async move {
         let call_a = client.video().call("default", &call_id);
         let call_b = client.video().call("default", &call_id);
 
@@ -1718,9 +1692,6 @@ async fn a_video_track_dropped_while_muted_arrives_again_after_unmute() {
         call_b.leave().await.expect("B leave");
     })
     .await;
-
-    let _ = admin.delete(DeleteCallRequest { hard: Some(true) }).await;
-    outcome.expect("video track dropped while muted timed out");
 }
 
 /// A track that B keeps through a mute gets the audio again after the unmute,
@@ -1736,7 +1707,7 @@ async fn a_kept_track_resumes_after_unmute_without_a_second_track() {
     let user_b = common::unique_id("b");
     let (admin, call_id) = setup_call(&client, &[&user_a, &user_b]).await;
 
-    let outcome = tokio::time::timeout(Duration::from_secs(150), async {
+    common::run_then_delete(admin, Duration::from_secs(150), async move {
         let call_a = client.video().call("default", &call_id);
         let call_b = client.video().call("default", &call_id);
 
@@ -1782,6 +1753,11 @@ async fn a_kept_track_resumes_after_unmute_without_a_second_track() {
             .await,
             "B never received A's audio TrackUnpublished after the mute"
         );
+        // The queued audio from before the mute, and the silence that the SFU
+        // sends after the mute.
+        while let Ok(Some(_)) =
+            tokio::time::timeout(Duration::from_secs(2), remote_a.next_pcm()).await
+        {}
         call_a
             .unmute_track(TrackType::Audio)
             .await
@@ -1819,9 +1795,6 @@ async fn a_kept_track_resumes_after_unmute_without_a_second_track() {
         call_b.leave().await.expect("B leave");
     })
     .await;
-
-    let _ = admin.delete(DeleteCallRequest { hard: Some(true) }).await;
-    outcome.expect("kept track through a mute timed out");
 }
 
 /// A track that B drops while A keeps sending does not come back
@@ -1836,7 +1809,7 @@ async fn a_dropped_live_track_does_not_come_back() {
     let user_b = common::unique_id("b");
     let (admin, call_id) = setup_call(&client, &[&user_a, &user_b]).await;
 
-    let outcome = tokio::time::timeout(Duration::from_secs(150), async {
+    common::run_then_delete(admin, Duration::from_secs(150), async move {
         let call_a = client.video().call("default", &call_id);
         let call_b = client.video().call("default", &call_id);
 
@@ -1889,7 +1862,4 @@ async fn a_dropped_live_track_does_not_come_back() {
         call_b.leave().await.expect("B leave");
     })
     .await;
-
-    let _ = admin.delete(DeleteCallRequest { hard: Some(true) }).await;
-    outcome.expect("dropped live track timed out");
 }
