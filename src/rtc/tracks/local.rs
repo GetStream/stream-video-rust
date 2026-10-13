@@ -21,7 +21,11 @@
 //!   packetizes and writes. The caller controls pacing.
 //! - `write_rtp` — forward an inbound [`RtpPacket`]. The SDK allocates a fresh
 //!   SSRC (webrtc-rs binding) and **rewrites the sequence number**, dropping the
-//!   inbound header extensions; callers must not reuse inbound headers.
+//!   inbound header extensions; callers must not reuse inbound headers. The
+//!   timestamps keep the spacing of the inbound ones.
+//!
+//! The write paths of a track share one RTP timeline. A track that takes over
+//! the sender of a stopped track continues the timeline of that track.
 //!
 //! Outbound audio packets carry the RFC 6464 `ssrc-audio-level` extension: the
 //! SFU marks a participant speaking only from that level, and remote UIs draw
@@ -34,7 +38,7 @@
 
 use std::collections::VecDeque;
 use std::num::NonZeroU8;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, AtomicU16, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock, TryLockError, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -109,16 +113,15 @@ pub fn audio_level_dbov(rms: f64) -> u8 {
 }
 
 /// Shared outbound-track machinery: the webrtc track, its packetizer, and the
-/// forward-path sequence counter.
+/// RTP timeline of all write paths.
 struct TrackCore {
     track: Arc<TrackLocalStaticRTP>,
     /// Packetizer for the encoded-sample paths (`write_pcm` pacer + `write_sample`).
+    /// `rtp` replaces its sequence numbers and timestamps.
     packetizer: StdMutex<Box<dyn Packetizer + Send + Sync>>,
     clock_rate: u32,
     mime_type: String,
-    /// Monotonic sequence number for the RTP-forward path.
-    fwd_seq: AtomicU16,
-    fwd_init: AtomicBool,
+    rtp: StdMutex<RtpTimeline>,
     stopped: AtomicBool,
     /// The time of the first [`Self::stop`].
     stopped_at: OnceLock<Instant>,
@@ -173,8 +176,11 @@ impl TrackCore {
             packetizer: StdMutex::new(Box::new(packetizer)),
             clock_rate,
             mime_type,
-            fwd_seq: AtomicU16::new(0),
-            fwd_init: AtomicBool::new(false),
+            rtp: StdMutex::new(RtpTimeline {
+                seq: seed_u16(),
+                timestamp: None,
+                forward_offset: None,
+            }),
             stopped: AtomicBool::new(false),
             stopped_at: OnceLock::new(),
             stop_notify: Notify::new(),
@@ -219,17 +225,25 @@ impl TrackCore {
         }
         if self.muted.load(Ordering::SeqCst) || self.quality_paused.load(Ordering::SeqCst) {
             // The RTP clock keeps time while no packet goes out.
-            self.packetizer
+            self.rtp
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .skip_samples(samples);
+                .advance(samples);
             return Ok(());
         }
         let payload = Bytes::copy_from_slice(payload);
         let packets = {
             let mut p = self.packetizer.lock().unwrap_or_else(|e| e.into_inner());
-            p.packetize(&payload, samples)
-                .map_err(|e| RtcError::Media(format!("packetize: {e}")))?
+            let mut packets = p
+                .packetize(&payload, samples)
+                .map_err(|e| RtcError::Media(format!("packetize: {e}")))?;
+            let mut rtp = self.rtp.lock().unwrap_or_else(|e| e.into_inner());
+            let timestamp = rtp.advance(samples);
+            for pkt in &mut packets {
+                pkt.header.sequence_number = rtp.next_seq();
+                pkt.header.timestamp = timestamp;
+            }
+            packets
         };
         // `write_rtp_with_extensions` resolves each URI to the id negotiated for
         // the binding, so extension ids are never ours to manage. An empty slice
@@ -264,7 +278,9 @@ impl TrackCore {
     }
 
     /// Forward an inbound RTP packet under a fresh SSRC (binding) with a rewritten
-    /// sequence number and no inbound header extensions.
+    /// sequence number and no inbound header extensions. The timestamps keep
+    /// the spacing of the inbound ones and continue the RTP timeline of the
+    /// track; a new track without an earlier write keeps them unchanged.
     ///
     /// Inbound extension ids are negotiated per-PeerConnection, so carrying them
     /// across would be meaningless; they are stripped and the sender re-adds the
@@ -278,11 +294,18 @@ impl TrackCore {
                 "write to a stopped track".to_owned(),
             ));
         }
-        if self.muted.load(Ordering::SeqCst) || self.quality_paused.load(Ordering::SeqCst) {
-            return Ok(());
-        }
+        let (sequence_number, timestamp) = {
+            let mut rtp = self.rtp.lock().unwrap_or_else(|e| e.into_inner());
+            // The RTP clock keeps time while no packet goes out.
+            let timestamp = rtp.forward(packet.header.timestamp);
+            if self.muted.load(Ordering::SeqCst) || self.quality_paused.load(Ordering::SeqCst) {
+                return Ok(());
+            }
+            (rtp.next_seq(), timestamp)
+        };
         let mut pkt = packet.clone();
-        pkt.header.sequence_number = self.next_fwd_seq();
+        pkt.header.sequence_number = sequence_number;
+        pkt.header.timestamp = timestamp;
         pkt.header.extension = false;
         pkt.header.extension_profile = 0;
         pkt.header.extensions.clear();
@@ -294,14 +317,27 @@ impl TrackCore {
         Ok(())
     }
 
-    fn next_fwd_seq(&self) -> u16 {
-        if !self.fwd_init.swap(true, Ordering::SeqCst) {
-            let base = seed_u16();
-            self.fwd_seq.store(base, Ordering::SeqCst);
-            base
-        } else {
-            self.fwd_seq.fetch_add(1, Ordering::SeqCst).wrapping_add(1)
-        }
+    /// Continue the RTP timeline and the payloader state of `previous`, whose
+    /// sender this track takes over. The timestamps also count the time since
+    /// `previous` stopped.
+    fn continue_rtp_from(&self, previous: &TrackCore) {
+        let stopped_for = previous
+            .stopped_at
+            .get()
+            .map_or(Duration::ZERO, Instant::elapsed);
+        let packetizer = previous
+            .packetizer
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        *self.packetizer.lock().unwrap_or_else(|e| e.into_inner()) = packetizer;
+        let samples = (stopped_for.as_secs_f64() * f64::from(self.clock_rate)) as u32;
+        let mut rtp = *previous.rtp.lock().unwrap_or_else(|e| e.into_inner());
+        rtp.timestamp = rtp
+            .timestamp
+            .map(|timestamp| timestamp.wrapping_add(samples));
+        rtp.forward_offset = None;
+        *self.rtp.lock().unwrap_or_else(|e| e.into_inner()) = rtp;
     }
 
     fn stop(&self) {
@@ -338,8 +374,48 @@ impl TrackCore {
     }
 }
 
+/// The RTP sequence numbers and timestamps of a sender. All write paths of a
+/// track use it, and a track that takes over the sender continues it.
+#[derive(Clone, Copy)]
+struct RtpTimeline {
+    /// The last sequence number.
+    seq: u16,
+    /// The timestamp of the next frame, or of the last forwarded packet.
+    /// `None` until the first write.
+    timestamp: Option<u32>,
+    /// Added to the timestamps of forwarded packets. Set by the first one.
+    forward_offset: Option<u32>,
+}
+
+impl RtpTimeline {
+    fn next_seq(&mut self) -> u16 {
+        self.seq = self.seq.wrapping_add(1);
+        self.seq
+    }
+
+    /// Return the timestamp of a frame of `samples`, and move past it.
+    fn advance(&mut self, samples: u32) -> u32 {
+        let timestamp = self.timestamp.unwrap_or_else(|| u32::from(seed_u16()));
+        self.timestamp = Some(timestamp.wrapping_add(samples));
+        timestamp
+    }
+
+    /// Return the timestamp of a forwarded packet with the inbound timestamp
+    /// `source`. The first forwarded packet gets the timestamp of the next
+    /// frame, or keeps `source` when there was no earlier write.
+    fn forward(&mut self, source: u32) -> u32 {
+        let offset = *self
+            .forward_offset
+            .get_or_insert_with(|| self.timestamp.map_or(0, |next| next.wrapping_sub(source)));
+        let timestamp = source.wrapping_add(offset);
+        self.timestamp = Some(timestamp);
+        timestamp
+    }
+}
+
 /// A low-entropy 16-bit seed from the wall clock (no `rand` dependency), used to
-/// randomize the forward-path sequence base so it does not always start at 0.
+/// randomize the first RTP sequence numbers and timestamps so they do not always
+/// start at 0.
 fn seed_u16() -> u16 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -354,9 +430,12 @@ struct AudioInner {
     /// Resampled 48 kHz mono PCM awaiting the 20 ms pacer.
     pcm: StdMutex<VecDeque<i16>>,
     pcm_capacity_samples: usize,
-    /// Locked before `pcm`. A writer keeps it until its audio is queued, so a
-    /// flush cannot fall between the resample and the queue.
+    /// Locked before `pcm`. A writer keeps it until its audio is queued.
+    /// `flush` does not wait for it.
     resampler: StdMutex<StreamResampler>,
+    /// Counts `flush` calls. Changed and compared under the `pcm` lock. A
+    /// write queues no audio when a flush came after the write started.
+    flushes: AtomicU64,
     /// Set by `write_pcm` and cleared at each pacer tick. A resampler flush
     /// makes the next write start with silence.
     pcm_written: AtomicBool,
@@ -381,6 +460,8 @@ impl AudioInner {
     /// While a write holds the resampler, the pacer does not wait and takes no
     /// such audio.
     fn take_pcm(&self, frame: &mut [i16]) {
+        // A write that sets the flag after this point counts for the next tick.
+        let written = self.pcm_written.swap(false, Ordering::SeqCst);
         let mut buf = self.pcm.lock().unwrap_or_else(|e| e.into_inner());
         if buf.len() < frame.len() {
             drop(buf);
@@ -391,7 +472,7 @@ impl AudioInner {
             };
             buf = self.pcm.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(mut resampler) = resampler
-                && !self.pcm_written.load(Ordering::SeqCst)
+                && !written
                 && buf.len() < frame.len()
             {
                 match resampler.flush() {
@@ -409,7 +490,6 @@ impl AudioInner {
                 }
             }
         }
-        self.pcm_written.store(false, Ordering::SeqCst);
         for slot in frame.iter_mut() {
             *slot = buf.pop_front().unwrap_or(0);
         }
@@ -557,6 +637,7 @@ impl LocalAudioTrack {
                 pcm: StdMutex::new(VecDeque::new()),
                 pcm_capacity_samples,
                 resampler: StdMutex::new(StreamResampler::new(OPUS_SAMPLE_RATE, 1)),
+                flushes: AtomicU64::new(0),
                 pcm_written: AtomicBool::new(false),
                 encoder: StdMutex::new(encoder),
                 pacer: StdMutex::new(None),
@@ -601,6 +682,7 @@ impl LocalAudioTrack {
                 "write to a stopped track".to_owned(),
             ));
         }
+        let flushes = self.inner.flushes.load(Ordering::SeqCst);
         self.inner.pcm_pacing.store(true, Ordering::SeqCst);
         let frame = if frame.channels > 1 {
             let channels = usize::from(frame.channels);
@@ -626,7 +708,12 @@ impl LocalAudioTrack {
                 .unwrap_or_else(|e| e.into_inner());
             let resampled = r.push(&frame)?.samples;
             track.inner.pcm_written.store(true, Ordering::SeqCst);
-            Ok(track.queue_pcm(resampled))
+            let queued = track.queue_pcm(resampled, flushes);
+            // After a flush, the filter must not keep the audio of this write.
+            if track.inner.flushes.load(Ordering::SeqCst) != flushes {
+                r.flush()?;
+            }
+            Ok(queued)
         })
         .await
         .map_err(|error| RtcError::Media(format!("pcm resample worker failed: {error}")))??;
@@ -640,9 +727,13 @@ impl LocalAudioTrack {
     }
 
     /// Append 48 kHz mono samples to the pacer queue, dropping the oldest
-    /// audio above the capacity. Callers hold the `resampler` lock.
-    fn queue_pcm(&self, samples: Vec<i16>) -> Result<()> {
+    /// audio above the capacity. Queues nothing when a flush came after
+    /// `flushes` was read. Callers hold the `resampler` lock.
+    fn queue_pcm(&self, samples: Vec<i16>, flushes: u64) -> Result<()> {
         let mut buf = self.inner.pcm.lock().unwrap_or_else(|e| e.into_inner());
+        if self.inner.flushes.load(Ordering::SeqCst) != flushes {
+            return Ok(());
+        }
         let dropped = push_bounded_pcm(&mut buf, samples, self.inner.pcm_capacity_samples);
         if dropped == 0 {
             return Ok(());
@@ -700,7 +791,10 @@ impl LocalAudioTrack {
     }
 
     /// Forward an inbound RTP packet (same-codec republish). The SDK rewrites the
-    /// SSRC (new binding) and sequence number and drops inbound extensions.
+    /// SSRC (new binding) and sequence number and drops inbound extensions. The
+    /// timestamps keep the spacing of the inbound ones. On a sender that this
+    /// track took over, or after another write path, they continue the RTP
+    /// timeline of the earlier packets.
     ///
     /// The forwarded packets carry no audio level: the SFU does not forward one
     /// downstream, so there is nothing to preserve. Use
@@ -722,18 +816,23 @@ impl LocalAudioTrack {
     }
 
     /// Drop any buffered-but-unsent PCM (barge-in), including the audio that
-    /// the resampler still holds. Does not stop the track.
+    /// the resampler still holds and the audio of a
+    /// [`write_pcm`](Self::write_pcm) that started before this call. Does not
+    /// wait for a write in progress. Does not stop the track.
     pub fn flush(&self) {
-        let mut r = self
-            .inner
-            .resampler
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut buf = self.inner.pcm.lock().unwrap_or_else(|e| e.into_inner());
+        self.inner.flushes.fetch_add(1, Ordering::SeqCst);
+        buf.clear();
+        drop(buf);
+        // A write that holds the resampler resets it itself.
+        let mut r = match self.inner.resampler.try_lock() {
+            Ok(r) => r,
+            Err(TryLockError::Poisoned(e)) => e.into_inner(),
+            Err(TryLockError::WouldBlock) => return,
+        };
         if let Err(e) = r.flush() {
             tracing::debug!(error = %e, "stream.rtc.audio.flush_failed");
         }
-        let mut buf = self.inner.pcm.lock().unwrap_or_else(|e| e.into_inner());
-        buf.clear();
     }
 
     /// Start taking queued PCM: one 20 ms frame every 20 ms, or silence when
@@ -771,31 +870,11 @@ impl LocalAudioTrack {
     }
 
     /// Continue the RTP sequence numbers and timestamps of `previous`, whose
-    /// sender this track takes over. The SFU drops a stream whose timestamps
-    /// go back. The timestamps also count the time since `previous` stopped.
+    /// sender this track takes over, for all write paths of the two tracks.
+    /// The SFU drops a stream whose timestamps go back. The timestamps also
+    /// count the time since `previous` stopped.
     fn continue_rtp_from(&self, previous: &LocalAudioTrack) {
-        let mut packetizer = previous
-            .inner
-            .core
-            .packetizer
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone();
-        let stopped_for = previous
-            .inner
-            .core
-            .stopped_at
-            .get()
-            .map_or(Duration::ZERO, Instant::elapsed);
-        packetizer.skip_samples(
-            (stopped_for.as_secs_f64() * f64::from(self.inner.core.clock_rate)) as u32,
-        );
-        *self
-            .inner
-            .core
-            .packetizer
-            .lock()
-            .unwrap_or_else(|e| e.into_inner()) = packetizer;
+        self.inner.core.continue_rtp_from(&previous.inner.core);
     }
 
     /// Stop the pacer and reject further writes. Called by `stop_publish`/`leave`.
@@ -886,10 +965,10 @@ async fn pace_audio(track: Weak<AudioInner>) {
         if !taking || inner.core.is_output_paused() {
             inner
                 .core
-                .packetizer
+                .rtp
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .skip_samples(FRAME_SAMPLES_20MS as u32);
+                .advance(FRAME_SAMPLES_20MS as u32);
             continue;
         }
         // Measure what we are about to encode, including any silence fill, so a
@@ -949,8 +1028,8 @@ enum VideoCodecState {
     },
 }
 
-/// A video encoder plus its presentation clock, RTP packetizer, and outbound
-/// RTP counters. Native codec access is serialized by the enclosing mutex.
+/// A video encoder plus its presentation clock and RTP packetizer. Native
+/// codec access is serialized by the enclosing mutex.
 struct VideoEncoder {
     codec: VideoCodecState,
     width: u32,
@@ -960,22 +1039,20 @@ struct VideoEncoder {
     last_key_pts: i64,
     /// Presentation time of the last frame emitted for max-framerate control.
     last_emit_pts: Option<i64>,
-    /// Outbound RTP sequence number (wraps).
-    seq: u16,
 }
 
+/// The presentation clock. The RTP timestamps of all encodings come from the
+/// RTP timeline of the first encoding.
 struct VideoClock {
     next_pts: i64,
-    rtp_ts: u32,
 }
 
 impl VideoClock {
-    /// Return the presentation time and RTP timestamp of the next frame, and
-    /// move the clock past its duration.
-    fn advance(&mut self, dur_ms: i64, samples: u32) -> (i64, u32) {
-        let current = (self.next_pts, self.rtp_ts);
+    /// Return the presentation time of the next frame, and move the clock past
+    /// its duration.
+    fn advance(&mut self, dur_ms: i64) -> i64 {
+        let current = self.next_pts;
         self.next_pts = self.next_pts.saturating_add(dur_ms);
-        self.rtp_ts = self.rtp_ts.wrapping_add(samples);
         current
     }
 }
@@ -1181,10 +1258,7 @@ impl LocalVideoTrack {
                 encodings,
                 codec_id,
                 encode_gate: Arc::new(Semaphore::new(1)),
-                clock: StdMutex::new(VideoClock {
-                    next_pts: 0,
-                    rtp_ts: u32::from(seed_u16()),
-                }),
+                clock: StdMutex::new(VideoClock { next_pts: 0 }),
                 active_encoding_count: AtomicU8::new(1),
                 layering: config.layering,
                 planned_width: AtomicU32::new(0),
@@ -1234,7 +1308,13 @@ impl LocalVideoTrack {
                 .clock
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .advance(dur_ms, samples);
+                .advance(dur_ms);
+            self.inner.encodings[0]
+                .core
+                .rtp
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .advance(samples);
             return Ok(());
         }
         if width == 0 || height == 0 || !width.is_multiple_of(2) || !height.is_multiple_of(2) {
@@ -1325,7 +1405,11 @@ impl LocalVideoTrack {
             .await
     }
 
-    /// Forward an inbound RTP packet (same-codec republish).
+    /// Forward an inbound RTP packet (same-codec republish). The SDK rewrites the
+    /// SSRC and sequence number and drops inbound extensions. The timestamps
+    /// keep the spacing of the inbound ones. On a sender that this track took
+    /// over, or after another write path, they continue the RTP timeline of
+    /// the earlier packets.
     pub async fn write_rtp(&self, packet: RtpPacket) -> Result<()> {
         self.ensure_single_layer_input("RTP forwarding")?;
         self.inner.encodings[0].core.forward_rtp(&packet).await
@@ -1338,34 +1422,26 @@ impl LocalVideoTrack {
     }
 
     /// Continue the RTP sequence numbers and timestamps of the single-encoding
-    /// `previous`, whose sender this track takes over. The encoder state moves
-    /// here, so the sequence numbers and the VP9 picture ids continue. The SFU
-    /// drops a stream whose timestamps go back. The timestamps also count the
-    /// time since `previous` stopped.
+    /// `previous`, whose sender this track takes over, for all write paths of
+    /// the two tracks. The encoder state moves here, so the VP9 picture ids
+    /// continue. The SFU drops a stream whose timestamps go back. The
+    /// timestamps also count the time since `previous` stopped.
     fn continue_rtp_from(&self, previous: &LocalVideoTrack) {
         let stopped_for = previous.inner.encodings[0]
             .core
             .stopped_at
             .get()
             .map_or(Duration::ZERO, Instant::elapsed);
-        let samples =
-            (stopped_for.as_secs_f64() * f64::from(self.inner.encodings[0].core.clock_rate)) as u32;
-        let (next_pts, rtp_ts) = {
-            let clock = previous
-                .inner
-                .clock
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            (clock.next_pts, clock.rtp_ts)
-        };
+        let next_pts = previous
+            .inner
+            .clock
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .next_pts;
         {
             let mut clock = self.inner.clock.lock().unwrap_or_else(|e| e.into_inner());
             clock.next_pts = next_pts;
-            clock.rtp_ts = rtp_ts;
-            clock.advance(
-                i64::try_from(stopped_for.as_millis()).unwrap_or(i64::MAX),
-                samples,
-            );
+            clock.advance(i64::try_from(stopped_for.as_millis()).unwrap_or(i64::MAX));
         }
         let (current, previous) = (&self.inner.encodings[0], &previous.inner.encodings[0]);
         let state = previous
@@ -1374,18 +1450,7 @@ impl LocalVideoTrack {
             .unwrap_or_else(|e| e.into_inner())
             .take();
         *current.encoder.lock().unwrap_or_else(|e| e.into_inner()) = state;
-        let mut packetizer = previous
-            .core
-            .packetizer
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone();
-        packetizer.skip_samples(samples);
-        *current
-            .core
-            .packetizer
-            .lock()
-            .unwrap_or_else(|e| e.into_inner()) = packetizer;
+        current.core.continue_rtp_from(&previous.core);
     }
 
     /// The underlying webrtc-rs track, for attaching this track to a
@@ -1758,11 +1823,17 @@ fn encode_i420_layers(
     dur_ms: i64,
     samples: u32,
 ) -> Result<Vec<(usize, Vec<RtpPacket>)>> {
-    let (pts, timestamp) = inner
+    let pts = inner
         .clock
         .lock()
         .unwrap_or_else(|error| error.into_inner())
-        .advance(dur_ms, samples);
+        .advance(dur_ms);
+    let timestamp = inner.encodings[0]
+        .core
+        .rtp
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .advance(samples);
     let count = usize::from(inner.active_encoding_count.load(Ordering::SeqCst));
     let mut output = Vec::with_capacity(count);
     for (index, encoding) in inner.encodings.iter().take(count).enumerate() {
@@ -1832,10 +1903,6 @@ fn encode_layer_packets(
         None => true,
     };
     if needs_new {
-        let seq = guard
-            .as_ref()
-            .map(|state| state.seq)
-            .unwrap_or_else(seed_u16);
         let prior_vp9_packetizer = guard.as_ref().and_then(|state| match &state.codec {
             VideoCodecState::Vp9Svc { packetizer, .. } => Some(packetizer.clone()),
             VideoCodecState::Vpx { .. } => None,
@@ -1864,7 +1931,6 @@ fn encode_layer_packets(
             // Force a keyframe on the first frame after (re)init.
             last_key_pts: pts - KEYFRAME_INTERVAL_MS,
             last_emit_pts: None,
-            seq,
         });
     }
     let Some(state) = guard.as_mut() else {
@@ -1887,7 +1953,6 @@ fn encode_layer_packets(
         state.last_key_pts = pts;
     }
     let mut out = Vec::new();
-    let mut seq = state.seq;
     let w16 = width.min(u32::from(u16::MAX)) as u16;
     let h16 = height.min(u32::from(u16::MAX)) as u16;
     match &mut state.codec {
@@ -1910,7 +1975,6 @@ fn encode_layer_packets(
                     let header = webrtc::rtp::header::Header {
                         version: 2,
                         payload_type: PLACEHOLDER_PT,
-                        sequence_number: seq,
                         timestamp,
                         ssrc: PLACEHOLDER_SSRC,
                         marker: payload.last,
@@ -1920,7 +1984,6 @@ fn encode_layer_packets(
                         header,
                         payload: Bytes::from(payload.data),
                     });
-                    seq = seq.wrapping_add(1);
                 }
             }
         }
@@ -1944,7 +2007,6 @@ fn encode_layer_packets(
                 let header = webrtc::rtp::header::Header {
                     version: 2,
                     payload_type: PLACEHOLDER_PT,
-                    sequence_number: seq,
                     timestamp,
                     ssrc: PLACEHOLDER_SSRC,
                     marker: payload.last,
@@ -1954,11 +2016,13 @@ fn encode_layer_packets(
                     header,
                     payload: Bytes::from(payload.data),
                 });
-                seq = seq.wrapping_add(1);
             }
         }
     }
-    state.seq = seq;
+    let mut rtp = encoding.core.rtp.lock().unwrap_or_else(|e| e.into_inner());
+    for packet in &mut out {
+        packet.header.sequence_number = rtp.next_seq();
+    }
     Ok(out)
 }
 
@@ -2271,6 +2335,8 @@ impl LocalTrack {
 
 #[cfg(test)]
 mod tests {
+    use futures_util::FutureExt;
+
     use super::*;
     use crate::rtc::peer;
     use crate::rtc::proto::models::{Codec, VideoDimension};
@@ -2495,8 +2561,8 @@ mod tests {
                     .write_pcm(PcmFrame::mono(samples.to_vec(), rate))
                     .await
                     .expect("write_pcm");
-                // The first write starts the pacer, and its first tick comes at
-                // once. Each later tick comes after two 10 ms writes.
+                // The test acts as the pacer: the first tick comes at once after
+                // the first write, and each later tick after two 10 ms writes.
                 if index % 2 == 0 {
                     track.inner.take_pcm(&mut frame);
                     played.extend_from_slice(&frame);
@@ -2568,6 +2634,58 @@ mod tests {
             taken.expect("the pacer waited for the write"),
             vec![0; FRAME_SAMPLES_20MS]
         );
+    }
+
+    #[test]
+    fn flush_returns_while_a_write_resamples() {
+        let track = unpaced_track();
+        let writing = track
+            .inner
+            .resampler
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let (flushed_tx, flushed_rx) = std::sync::mpsc::channel();
+        let flushing = track.clone();
+        std::thread::spawn(move || {
+            flushing.flush();
+            let _ = flushed_tx.send(());
+        });
+
+        let flushed = flushed_rx.recv_timeout(Duration::from_secs(5));
+        drop(writing);
+
+        flushed.expect("the flush waited for the write");
+    }
+
+    #[test]
+    fn flush_drops_a_write_that_waits_for_a_blocking_thread() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .max_blocking_threads(1)
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let track = unpaced_track();
+            let (release, released) = std::sync::mpsc::channel::<()>();
+            // Takes the only blocking thread, so the write cannot resample yet.
+            let _busy = tokio::task::spawn_blocking(move || released.recv());
+            let mut write = std::pin::pin!(track.write_pcm(loud_end_16k()));
+            assert!(write.as_mut().now_or_never().is_none());
+
+            track.flush();
+            drop(release);
+            write.await.expect("write_pcm");
+            let mut first = vec![0; FRAME_SAMPLES_20MS];
+            let mut second = vec![0; FRAME_SAMPLES_20MS];
+            track.inner.take_pcm(&mut first);
+            track.inner.take_pcm(&mut second);
+
+            assert_eq!(
+                peak(&first).max(peak(&second)),
+                0,
+                "audio from before the flush played"
+            );
+            track.stop();
+        });
     }
 
     #[test]
