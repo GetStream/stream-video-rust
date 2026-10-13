@@ -2,10 +2,10 @@
 
 use std::collections::{HashMap, HashSet};
 
-use super::super::error::Result;
-use super::super::proto::event;
-use super::super::proto::models::{self, TrackType};
+use crate::rtc::error::Result;
 use crate::rtc::peer::publisher;
+use crate::rtc::proto::event;
+use crate::rtc::proto::models::{self, TrackType};
 use crate::rtc::tracks::LocalTrack;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

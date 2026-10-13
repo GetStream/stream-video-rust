@@ -528,9 +528,11 @@ pub struct RtcCore {
     /// Fired for each inbound [`RemoteTrack`] the subscriber PC delivers.
     on_track_cb: StdMutex<Option<OnTrackCallback>>,
     /// The active subscription policy (applied once `subs_active` is set).
-    /// Audio only until `update_subscriptions` replaces it.
+    /// Audio only until `update_subscriptions` replaces it or
+    /// `set_incoming_video_enabled` changes it.
     sub_config: StdMutex<SubscriptionConfig>,
-    /// Set once the caller opts into subscriptions via `update_subscriptions`.
+    /// Set once the caller opts into subscriptions via `update_subscriptions`,
+    /// `update_subscription_targets`, or `set_incoming_video_enabled`.
     subs_active: AtomicBool,
     /// Tracks the caller explicitly dropped (unsubscribed); never re-subscribed
     /// until the publisher republishes them.

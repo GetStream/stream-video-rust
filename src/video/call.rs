@@ -1008,8 +1008,10 @@ impl Call {
     }
 
     /// Set the subscription policy and (re)send `UpdateSubscriptions`. The SFU
-    /// forwards no media until this is called; `SubscriptionConfig::default()`
-    /// subscribes to nothing.
+    /// forwards no media until this call,
+    /// [`update_subscription_targets`](Self::update_subscription_targets), or
+    /// [`set_incoming_video_enabled`](Self::set_incoming_video_enabled);
+    /// `SubscriptionConfig::default()` subscribes to nothing.
     pub async fn update_subscriptions(
         &self,
         config: crate::rtc::SubscriptionConfig,
@@ -1032,7 +1034,10 @@ impl Call {
     /// other track types. Before an `update_subscriptions` call, the current
     /// config is
     /// [`SubscriptionConfig::audio_all`](crate::rtc::SubscriptionConfig::audio_all),
-    /// so `true` subscribes to audio and video, and `false` to audio only.
+    /// so `true` subscribes to audio and video, and `false` to audio only. This
+    /// also removes a target list that
+    /// [`update_subscription_targets`](Self::update_subscription_targets) set,
+    /// so the call subscribes by the config again.
     pub async fn set_incoming_video_enabled(&self, enabled: bool) -> crate::rtc::RtcResult<()> {
         self.rtc.set_incoming_video_enabled(enabled).await
     }

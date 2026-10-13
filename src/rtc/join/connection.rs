@@ -90,7 +90,7 @@ pub(super) async fn await_join_response(
                     Some(_) => continue,
                     None => {
                         return Err(RtcError::WsConnection(
-                            super::super::error::WsConnectionError::transport(
+                            crate::rtc::error::WsConnectionError::transport(
                                 "socket closed before join response",
                             ),
                         ));

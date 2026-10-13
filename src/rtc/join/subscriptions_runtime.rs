@@ -27,7 +27,8 @@ impl RtcCore {
 
     /// Replace the desired subscriptions with an exact per-session track list.
     ///
-    /// Calling [`Self::update_subscriptions`] switches back to the coarse
+    /// Calling [`Self::update_subscriptions`] or
+    /// [`Self::set_incoming_video_enabled`] switches back to the coarse
     /// all-participant policy. Passing an empty list unsubscribes from all media.
     pub async fn update_subscription_targets(
         &self,
@@ -47,7 +48,9 @@ impl RtcCore {
     /// [`SubscriptionConfig`] and keeps the other track types. Before an
     /// `update_subscriptions` call, the current config is
     /// [`SubscriptionConfig::audio_all`], so `true` subscribes to audio and
-    /// video, and `false` to audio only.
+    /// video, and `false` to audio only. This also removes a target list that
+    /// [`Self::update_subscription_targets`] set, so the call subscribes by the
+    /// config again.
     pub async fn set_incoming_video_enabled(&self, enabled: bool) -> Result<()> {
         {
             let mut guard = self.sub_config.lock().unwrap_or_else(|e| e.into_inner());
