@@ -112,19 +112,24 @@ longer downmixes to mono.
 
 `StreamResampler` holds the newest 128 input frames in its filter: 8 ms at
 16 kHz, 5.3 ms at 24 kHz. `StreamResampler::flush` returns them. When the queue
-of a `LocalAudioTrack` holds less than one 20 ms frame, the pacer first adds
-that audio, so the end of the written audio plays without the next write. A
-track at 48 kHz holds no audio. Each time the queue runs short in the middle of
-the audio, the filter starts again: the gap is at least 11 ms at 16 kHz and
-23 ms at 8 kHz.
+of a `LocalAudioTrack` holds less than one 20 ms frame and no `write_pcm` came
+since the last pacer tick, the pacer first adds that audio, so the end of the
+written audio plays without the next write. If the queue runs short at the
+tick just after the last write, the end plays one tick later. While the writes
+continue, the pacer fills a short queue with silence only, and the filter keeps
+its audio for the next write. A track at 48 kHz holds no audio.
 
 ### Pacing control for PCM tracks
 
 `LocalAudioTrackConfig::pace` (default `true`) starts pacing at the first
-`write_pcm`, as before. With `with_pace(false)`, `write_pcm` only queues until
-`LocalAudioTrack::start_pacing`; `pause_pacing` stops pacing and keeps the
-queue. `Call::publish_audio` holds the queue of a new publication until the SFU
-publisher first connects, so the audio written before the connect is not lost.
+`write_pcm` after a negotiated PeerConnection can send the track. Until then,
+the queue keeps the written audio. Before, the pacer sent that audio to a track
+with no sender, and the audio was lost. With `with_pace(false)`, `write_pcm`
+only queues until `LocalAudioTrack::start_pacing`; `pause_pacing` stops pacing
+and keeps the queue. A `pause_pacing` before the first `write_pcm` stays in
+force until `start_pacing`. `Call::publish_audio` holds the queue of a new
+publication until the SFU publisher first connects, so the audio written
+before the publish or the connect is not lost.
 Pacing does not pause on a later disconnect: audio written during an outage is
 lost, and a reconnect adds no delay.
 
@@ -207,8 +212,11 @@ on `Call` (`get_call_participant_session_metrics`,
   decoded `PcmFrame` holds only its own samples.
 - A muted audio track no longer encodes its PCM.
 - While a track is muted, its RTP clock keeps running, for audio and video. The
-  first packet after an unmute shows the length of the mute (RFC 3550). Before,
-  the timestamps continued from the last packet before the mute.
+  clock of a PCM track also runs while `pause_pacing` or the hold of a new
+  publication stops the pacer. A new track on the sender of a stopped track
+  adds the time since the stop to the timestamps of the stopped track. The
+  first packet after the gap shows the length of the gap (RFC 3550). Before,
+  the timestamps continued from the last packet before the gap.
 - `RemoteTrack::next_video_frame` decodes the VP9 SVC that browsers send in
   flexible mode. Before, it gave the first frames and then no more frames: the
   depacketizer kept the reference indices of earlier packets and rejected each
@@ -220,6 +228,8 @@ on `Call` (`get_call_participant_session_metrics`,
 - `StreamResampler` uses a windowed-sinc filter (rubato) and removes the audio
   above the lower Nyquist frequency. Before, it interpolated linearly: from
   48 kHz to 16 kHz, a 12 kHz tone came out at 4 kHz at full level.
+  `write_pcm` runs the filter on a blocking thread, so a long frame does not
+  stop the runtime or the pacer.
 - `LocalAudioTrack::flush` also drops the audio in the resampler. A flush during
   a `write_pcm` can no longer put audio from before the flush in the queue.
 
