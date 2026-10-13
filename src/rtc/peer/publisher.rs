@@ -101,6 +101,11 @@ pub(crate) async fn restart_ice(
             }
         }
     }
+    // Media is lost until ICE connects again; the publisher `Connected` state
+    // resumes pacing.
+    for track in tracks {
+        track.pause_audio_pacing();
+    }
     negotiate_publish(publisher, signal, session_id, tracks, publish_options).await
 }
 

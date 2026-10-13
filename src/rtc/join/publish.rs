@@ -123,7 +123,9 @@ impl RtcCore {
             .user_id
             .clone();
         self.add_published_track(&user_id, &session_id, track.track_type() as i32, None);
-        track.start_media();
+        if publisher.connection_state() == RTCPeerConnectionState::Connected {
+            track.start_audio_pacing().await;
+        }
         signal
             .update_mute_states(signal::UpdateMuteStatesRequest {
                 session_id: session_id.clone(),
@@ -136,6 +138,24 @@ impl RtcCore {
         media.set_status(&track_id, PublicationStatus::Published);
         tracing::info!(cid = %self.cid(), "stream.rtc.published");
         Ok(())
+    }
+
+    /// Pace the published audio only while the current publisher is connected.
+    pub(super) async fn sync_audio_pacing(&self) {
+        let media = self.media.lock().await;
+        let connected = self
+            .publisher_handles()
+            .await
+            .is_some_and(|(publisher, ..)| {
+                publisher.connection_state() == RTCPeerConnectionState::Connected
+            });
+        for track in media.active_tracks() {
+            if connected {
+                track.start_audio_pacing().await;
+            } else {
+                track.pause_audio_pacing();
+            }
+        }
     }
 
     pub(super) async fn register_publisher_tasks(&self, tasks: Vec<JoinHandle<()>>) {

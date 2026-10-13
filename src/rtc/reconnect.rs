@@ -143,7 +143,7 @@ pub fn evaluate_join_failure(
         return JoinAttemptOutcome::Exhausted;
     }
     JoinAttemptOutcome::Retry {
-        delay: retry_interval(attempt + 1),
+        delay: retry_interval(attempt),
         switch_sfu: is_join_error_code || edge_failures >= 2,
     }
 }
@@ -371,6 +371,21 @@ mod tests {
         match evaluate_join_failure(false, false, 1, 0, 3) {
             JoinAttemptOutcome::Retry { switch_sfu, .. } => assert!(!switch_sfu),
             other => panic!("expected retry, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn join_retry_delays_stay_within_backoff_bounds() {
+        for (attempt, bounds) in [(0, 250..=500), (1, 250..=2500)] {
+            for _ in 0..100 {
+                match evaluate_join_failure(false, false, 1, attempt, 3) {
+                    JoinAttemptOutcome::Retry { delay, .. } => {
+                        let d = delay.as_millis();
+                        assert!(bounds.contains(&d), "attempt {attempt} out of range: {d}");
+                    }
+                    other => panic!("expected retry, got {other:?}"),
+                }
+            }
         }
     }
 

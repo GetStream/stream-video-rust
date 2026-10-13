@@ -17,6 +17,10 @@ impl RtcCore {
     ) -> Result<()> {
         ensure_crypto_provider();
         let generation = self.begin_join()?;
+        let _attempt = JoinAttempt {
+            core: self,
+            generation,
+        };
         // A fresh unified session id for this join lifecycle; reused across
         // reconnects so the dashboard correlates the participant end-to-end.
         {
@@ -644,6 +648,10 @@ impl RtcCore {
     pub async fn leave(&self, reason: impl Into<String>) -> Result<()> {
         let reason = reason.into();
         let generation = self.cancel_generation();
+        let left = LeftCall {
+            core: self,
+            generation,
+        };
 
         let connection = self.connection.lock().await.take();
         if let Some(connection) = connection {
@@ -658,8 +666,42 @@ impl RtcCore {
             }
             connection.teardown().await;
         }
+        drop(left);
+        self.stop_coordinator_events(generation).await;
+        Ok(())
+    }
+
+    /// The SFU or the coordinator reported the end of the call: send
+    /// [`CallEvent::CallEnded`] once and leave the call.
+    pub(super) fn end_call(self: &Arc<Self>, generation: u64) {
+        if !self.is_generation_current(generation) {
+            return;
+        }
+        let already_ended = std::mem::replace(
+            &mut self
+                .call_state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .ended,
+            true,
+        );
+        if already_ended {
+            return;
+        }
+        let _ = self.events_tx.send(CallEvent::CallEnded);
+        let this = self.clone();
+        // Not a generation task: `leave` ends the generation.
+        std::mem::drop(self.spawn_runtime_task(async move {
+            if this.is_generation_current(generation) {
+                let _ = this.leave("call ended").await;
+            }
+        }));
+    }
+
+    /// Clear the call state of `generation` and set `Left`.
+    fn finish_leave(&self, generation: u64) {
         {
-            // A join that started during the awaits above owns these fields.
+            // A join that started during the leave owns these fields.
             let lifecycle = self.lifecycle.lock().unwrap_or_else(|e| e.into_inner());
             if lifecycle.generation == generation {
                 self.participants
@@ -685,8 +727,45 @@ impl RtcCore {
             }
         }
         self.set_state_if_current(generation, CallingState::Left);
-        self.stop_coordinator_events(generation).await;
-        Ok(())
+    }
+}
+
+/// Abandons a join whose future is dropped while it is still joining. The join
+/// cannot await its cleanup there, so a new generation stops its tasks, and
+/// `Idle` allows the next join.
+struct JoinAttempt<'a> {
+    core: &'a RtcCore,
+    generation: u64,
+}
+
+impl Drop for JoinAttempt<'_> {
+    fn drop(&mut self) {
+        {
+            let mut lifecycle = self
+                .core
+                .lifecycle
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if lifecycle.generation != self.generation || lifecycle.state != CallingState::Joining {
+                return;
+            }
+            lifecycle.generation = lifecycle.generation.wrapping_add(1);
+            lifecycle.set_state(CallingState::Idle, &self.core.events_tx);
+        }
+        self.core.lifecycle_changed.notify_waiters();
+    }
+}
+
+/// Finishes a `leave` on drop, so a `leave` future that is dropped early still
+/// leaves the call. The coordinator tasks stop on the generation change.
+struct LeftCall<'a> {
+    core: &'a RtcCore,
+    generation: u64,
+}
+
+impl Drop for LeftCall<'_> {
+    fn drop(&mut self) {
+        self.core.finish_leave(self.generation);
     }
 }
 
@@ -737,7 +816,11 @@ impl RtcCore {
                         event_core
                             .apply_permissions_updated(&event, &local_user_id)
                             .await;
+                        let ended = event.event_type == "call.ended";
                         let _ = sender.send(CallEvent::Coordinator(event));
+                        if ended {
+                            event_core.end_call(generation);
+                        }
                     }
                     Ok(Some(_)) => {}
                     Ok(None) => {

@@ -914,6 +914,64 @@ async fn publish_blue_video_reaches_raw_rtp_and_i420_decoder() {
     outcome.expect("VP9 RTP/decode test timed out");
 }
 
+/// A video subscription without a dimension hint is accepted and delivers video.
+#[tokio::test]
+async fn video_subscription_without_a_dimension_receives_video() {
+    let Some(client) = common::client_or_skip() else {
+        return;
+    };
+    init_tracing();
+
+    let user_a = common::unique_id("a");
+    let user_b = common::unique_id("b");
+    let (admin, call_id) = setup_call(&client, &[&user_a, &user_b]).await;
+
+    let outcome = tokio::time::timeout(Duration::from_secs(120), async {
+        let call_a = client.video().call("default", &call_id);
+        let call_b = client.video().call("default", &call_id);
+
+        call_a
+            .join(JoinCallData::new(&user_a))
+            .await
+            .expect("A join");
+        let video_a = LocalVideoTrack::vp9().expect("vp9 track");
+        call_a
+            .publish_video(video_a.clone())
+            .await
+            .expect("A publish_video");
+        let feeder = spawn_blue_video(video_a);
+
+        let mut rx_b = track_sink(&call_b);
+        call_b
+            .join(JoinCallData::new(&user_b))
+            .await
+            .expect("B join");
+        call_b
+            .update_subscriptions(SubscriptionConfig {
+                video_dimension: None,
+                ..SubscriptionConfig::audio_video()
+            })
+            .await
+            .expect("B update_subscriptions without a dimension");
+        recv_track(
+            &mut rx_b,
+            &user_a,
+            TrackType::Video,
+            Duration::from_secs(60),
+        )
+        .await
+        .expect("B did not receive A's video track");
+
+        feeder.abort();
+        call_a.leave().await.expect("A leave");
+        call_b.leave().await.expect("B leave");
+    })
+    .await;
+
+    let _ = admin.delete(DeleteCallRequest { hard: Some(true) }).await;
+    outcome.expect("dimensionless video subscription test timed out");
+}
+
 #[tokio::test]
 async fn vp9_svc_preserves_one_ssrc_and_adapts_all_spatial_layers() {
     let Some(client) = common::client_or_skip() else {

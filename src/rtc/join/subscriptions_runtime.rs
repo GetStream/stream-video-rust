@@ -116,9 +116,10 @@ impl RtcCore {
                         user_id: entry.user_id.clone(),
                         session_id: entry.session_id.clone(),
                         track_type: target.track_type as i32,
-                        dimension: target.dimension.and_then(|(width, height)| {
-                            is_video_type(target.track_type)
-                                .then_some(models::VideoDimension { width, height })
+                        dimension: is_video_type(target.track_type).then(|| {
+                            let (width, height) =
+                                target.dimension.unwrap_or(DEFAULT_VIDEO_DIMENSION);
+                            models::VideoDimension { width, height }
                         }),
                     });
                 }
@@ -136,13 +137,11 @@ impl RtcCore {
                         {
                             continue;
                         }
-                        let dimension = if is_video_type(track_type) {
-                            config
-                                .video_dimension
-                                .map(|(width, height)| models::VideoDimension { width, height })
-                        } else {
-                            None
-                        };
+                        let dimension = is_video_type(track_type).then(|| {
+                            let (width, height) =
+                                config.video_dimension.unwrap_or(DEFAULT_VIDEO_DIMENSION);
+                            models::VideoDimension { width, height }
+                        });
                         tracks.push(signal::TrackSubscriptionDetails {
                             user_id: entry.user_id.clone(),
                             session_id: entry.session_id.clone(),
@@ -231,8 +230,11 @@ impl RtcCore {
         }
         let key = TrackKey::new(participant.session_id.clone(), track_type);
         let weak = Arc::downgrade(&self);
+        // The caller can drop the track on a thread without a runtime.
+        let runtime = tokio::runtime::Handle::current();
         let on_drop = Box::new(move || {
             if let Some(core) = weak.upgrade() {
+                let _runtime = runtime.enter();
                 let task_core = core.clone();
                 std::mem::drop(core.spawn_generation_task(generation, async move {
                     task_core

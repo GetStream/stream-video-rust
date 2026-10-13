@@ -132,7 +132,7 @@ pub enum RtcError {
         track_type: models::TrackType,
     },
 
-    /// A PCM write exceeded the track's low-latency queue. The newest samples
+    /// A PCM write exceeded the track's PCM queue capacity. The newest samples
     /// were retained and this many oldest samples were discarded.
     #[error(
         "pcm queue overflow: dropped {dropped_samples} oldest samples \
