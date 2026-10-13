@@ -703,6 +703,56 @@ async fn dropped_leave_still_leaves_the_call() {
 }
 
 #[tokio::test]
+async fn leave_stops_the_published_tracks() {
+    let core = test_core();
+    let generation = prepare_joined_core(&core, "alice");
+    let (connection, _sfu) = establish_fake(&core, generation).await;
+    *core.connection.lock().await = Some(connection);
+    let audio = LocalAudioTrack::opus().expect("opus track");
+    core.media
+        .lock()
+        .await
+        .begin_publish(LocalTrack::Audio(audio.clone()), 0);
+
+    core.leave("test leave").await.expect("leave");
+
+    let write = audio.write_pcm(PcmFrame::mono(vec![0; 960], 48_000)).await;
+    assert!(
+        matches!(write, Err(RtcError::IllegalState(_))),
+        "a track published before leave is stopped: {write:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_dropped_leave_keeps_the_tracks_of_a_later_join() {
+    let core = test_core();
+    prepare_joined_core(&core, "alice");
+    let connection_slot = core.connection.lock().await;
+    let leave = tokio::time::timeout(Duration::from_millis(50), core.leave("dropped leave")).await;
+    assert!(leave.is_err(), "leave waits for the connection lock");
+
+    core.begin_join().expect("a new join can start");
+    let audio = LocalAudioTrack::opus().expect("opus track");
+    core.media
+        .lock()
+        .await
+        .begin_publish(LocalTrack::Audio(audio.clone()), 0);
+    let (_, _, completed) = core.runtime_task_snapshot();
+    drop(connection_slot);
+    wait_for(
+        Duration::from_secs(2),
+        || core.runtime_task_snapshot().2 > completed,
+        "the leave task",
+    )
+    .await;
+
+    audio
+        .write_pcm(PcmFrame::mono(vec![0; 960], 48_000))
+        .await
+        .expect("the later join keeps its track");
+}
+
+#[tokio::test]
 async fn a_dropped_leave_keeps_the_connection_of_a_later_join() {
     let core = test_core();
     prepare_joined_core(&core, "alice");
@@ -2018,6 +2068,95 @@ fn join_state_reports_only_the_participant_changes_since_the_last_join() {
             ("left", "session-a".to_owned()),
         ]
     );
+}
+
+#[test]
+fn speaking_and_quality_events_do_not_mark_a_participant_updated_after_a_rejoin() {
+    let core = test_core();
+    let generation = core.begin_join().expect("join generation");
+    let mut events = core.sfu_events();
+    let bob = models::Participant {
+        user_id: "bob".to_owned(),
+        session_id: "session-b".to_owned(),
+        ..Default::default()
+    };
+    let call_state = || {
+        Some(models::CallState {
+            participants: vec![bob.clone()],
+            ..Default::default()
+        })
+    };
+
+    assert!(core.apply_join_call_state_if_current(generation, "local-1", "agent", call_state()));
+    core.update_audio_levels(&[event::AudioLevel {
+        user_id: "bob".to_owned(),
+        session_id: "session-b".to_owned(),
+        level: 0.37,
+        is_speaking: true,
+    }]);
+    core.update_connection_quality(&[event::ConnectionQualityInfo {
+        user_id: "bob".to_owned(),
+        session_id: "session-b".to_owned(),
+        connection_quality: models::ConnectionQuality::Excellent as i32,
+    }]);
+    core.update_dominant_speaker("session-b");
+    // A REJOIN: bob has not changed.
+    assert!(core.apply_join_call_state_if_current(generation, "local-2", "agent", call_state()));
+
+    let mut reported = Vec::new();
+    while let Ok(event) = events.try_recv() {
+        match event {
+            SfuCallEvent::ParticipantJoined(p) => reported.push(("joined", p.session_id)),
+            SfuCallEvent::ParticipantUpdated(p) => reported.push(("updated", p.session_id)),
+            SfuCallEvent::ParticipantLeft(p) => reported.push(("left", p.session_id)),
+            _ => {}
+        }
+    }
+    assert_eq!(reported, [("joined", "session-b".to_owned())]);
+}
+
+#[test]
+fn a_join_after_a_failed_join_reports_only_its_own_participants() {
+    let core = test_core();
+    let call_state = |user_id: &str, session_id: &str| {
+        Some(models::CallState {
+            participants: vec![models::Participant {
+                user_id: user_id.to_owned(),
+                session_id: session_id.to_owned(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        })
+    };
+    let failed = core.begin_join().expect("first join");
+    assert!(core.apply_join_call_state_if_current(
+        failed,
+        "local-1",
+        "agent",
+        call_state("alice", "session-a"),
+    ));
+    // The join fails after its join response.
+    assert!(core.set_state_if_current(failed, CallingState::Idle));
+
+    let mut events = core.sfu_events();
+    let generation = core.begin_join().expect("second join");
+    assert!(core.apply_join_call_state_if_current(
+        generation,
+        "local-2",
+        "agent",
+        call_state("bob", "session-b"),
+    ));
+
+    let mut reported = Vec::new();
+    while let Ok(event) = events.try_recv() {
+        match event {
+            SfuCallEvent::ParticipantJoined(p) => reported.push(("joined", p.session_id)),
+            SfuCallEvent::ParticipantUpdated(p) => reported.push(("updated", p.session_id)),
+            SfuCallEvent::ParticipantLeft(p) => reported.push(("left", p.session_id)),
+            _ => {}
+        }
+    }
+    assert_eq!(reported, [("joined", "session-b".to_owned())]);
 }
 
 #[test]

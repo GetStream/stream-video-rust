@@ -39,10 +39,10 @@ use the new fields or `..`.
 
 `PcmFrame` adds `pts: Option<u32>`: the RTP timestamp of the first sample, in
 units of 1/48000 s, wrapping like RTP. `RemoteTrack::next_pcm` sets it; a frame
-rebuilt for a lost packet continues from the frame before it. Frames that the
-application or a conversion builds have `None`, and `write_pcm` ignores the
-field. Code that builds `PcmFrame` with a struct literal must set `pts` or use
-`PcmFrame::new` / `PcmFrame::mono`.
+rebuilt for a lost packet counts back from the next packet that arrives. Frames
+that the application or a conversion builds have `None`, and `write_pcm` ignores
+the field. Code that builds `PcmFrame` with a struct literal must set `pts` or
+use `PcmFrame::new` / `PcmFrame::mono`.
 
 ### Subscription config has the stream-py shape
 
@@ -63,7 +63,16 @@ field. Code that builds `PcmFrame` with a struct literal must set `pts` or use
 dimension is now 1920×1080 (it was 1280×720), also for a `SubscriptionTarget`
 without a dimension. `Call::participants` gives the participants in the order
 the call learned about them. `set_incoming_video_enabled` keeps the configured
-video dimension.
+video dimension and changes only the video track type of the current config.
+Before an `update_subscriptions` call, `set_incoming_video_enabled(true)` now
+subscribes to video only (it was audio and video), and `false` subscribes to
+nothing (it was audio).
+
+### Leave stops the published tracks
+
+`leave` stops every published local track, as JS does with `stopOnLeave`. A
+write to a stopped track returns `RtcError::IllegalState`, so a later join must
+publish new tracks.
 
 ## New Features
 
