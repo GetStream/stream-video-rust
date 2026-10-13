@@ -1483,3 +1483,129 @@ async fn sole_audio_can_be_stopped_and_published_again() {
     let _ = admin.delete(DeleteCallRequest { hard: Some(true) }).await;
     outcome.expect("test 9 (stop sole publication) timed out");
 }
+
+/// A stopped camera track is replaced by a new track
+///
+/// A publishes VP9 video, stops it, and publishes a new VP9 track on the same
+/// session. The new track takes over the sender that the stop kept, as JS
+/// `replaceTrack` does, so B decodes the new track on the remote track it
+/// already has, and A does not reconnect.
+#[tokio::test]
+async fn sole_video_can_be_stopped_and_published_again() {
+    let Some(client) = common::client_or_skip() else {
+        return;
+    };
+    init_tracing();
+
+    let user_a = common::unique_id("a");
+    let user_b = common::unique_id("b");
+    let (admin, call_id) = setup_call(&client, &[&user_a, &user_b]).await;
+
+    let outcome = tokio::time::timeout(Duration::from_secs(150), async {
+        let call_a = client.video().call("default", &call_id);
+        let call_b = client.video().call("default", &call_id);
+
+        let mut tracks_b = track_sink(&call_b);
+        call_b
+            .join(JoinCallData::new(&user_b))
+            .await
+            .expect("B join");
+        call_b
+            .update_subscriptions(SubscriptionConfig::audio_video())
+            .await
+            .expect("B update_subscriptions");
+        let mut events_b = call_b.sfu_events();
+
+        call_a
+            .join(JoinCallData::new(&user_a))
+            .await
+            .expect("A join");
+        let mut events_a = call_a.client_events();
+        let video_a = LocalVideoTrack::vp9().expect("vp9 track");
+        call_a
+            .publish_video(video_a.clone())
+            .await
+            .expect("A publish_video");
+        let feeder = spawn_blue_video(video_a.clone());
+        let remote_a = recv_track(
+            &mut tracks_b,
+            &user_a,
+            TrackType::Video,
+            Duration::from_secs(45),
+        )
+        .await
+        .expect("B never received A's video track");
+        tokio::time::timeout(Duration::from_secs(45), remote_a.next_video_frame())
+            .await
+            .expect("B decoded no frame before the stop")
+            .expect("B's video track ended before the stop");
+
+        call_a
+            .stop_publish(LocalTrack::Video {
+                track: video_a,
+                track_type: TrackType::Video,
+            })
+            .await
+            .expect("A stop_publish");
+        feeder.abort();
+        let video_unpublished = await_track_event(
+            &mut events_b,
+            &user_a,
+            TrackType::Video,
+            false,
+            Duration::from_secs(45),
+        )
+        .await;
+        assert!(
+            video_unpublished,
+            "B never received A's video TrackUnpublished after stop_publish"
+        );
+        // Frames of the first track that B still has queued.
+        while let Ok(Some(_)) =
+            tokio::time::timeout(Duration::from_secs(2), remote_a.next_video_frame()).await
+        {
+        }
+
+        let video_again = LocalVideoTrack::vp9().expect("vp9 track");
+        call_a
+            .publish_video(video_again.clone())
+            .await
+            .expect("A publish_video again on the same session");
+        let feeder_again = spawn_blue_video(video_again);
+        let video_republished = await_track_event(
+            &mut events_b,
+            &user_a,
+            TrackType::Video,
+            true,
+            Duration::from_secs(45),
+        )
+        .await;
+        assert!(
+            video_republished,
+            "B never received A's video TrackPublished after the second publish"
+        );
+        let frame = tokio::time::timeout(Duration::from_secs(45), remote_a.next_video_frame())
+            .await
+            .expect("B decoded no frame of the new track on its remote track")
+            .expect("B's video track ended after the second publish");
+        feeder_again.abort();
+        assert_packed_blue_frame(&frame);
+        let mut reconnected = false;
+        while let Ok(event) = events_a.try_recv() {
+            reconnected |= matches!(
+                event,
+                ClientCallEvent::CallingStateChanged(
+                    CallingState::Reconnecting | CallingState::Migrating
+                )
+            );
+        }
+        assert!(!reconnected, "A reconnected after the second publish");
+
+        call_a.leave().await.expect("A leave");
+        call_b.leave().await.expect("B leave");
+    })
+    .await;
+
+    let _ = admin.delete(DeleteCallRequest { hard: Some(true) }).await;
+    outcome.expect("stop and publish video again timed out");
+}

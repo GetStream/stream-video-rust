@@ -378,7 +378,10 @@ impl RtcCall {
         self.core.stop_noise_cancellation().await
     }
 
-    /// Stop publishing a local media track.
+    /// Stop publishing a local media track. A new track of the same kind that
+    /// is published later takes over its sender, except for a simulcast track
+    /// ([`RtcError::SimulcastReplace`]); use [`mute_track`](Self::mute_track)
+    /// for that.
     pub async fn stop_publish(&self, track: LocalTrack) -> Result<()> {
         self.core.stop_publish(track).await
     }

@@ -984,23 +984,13 @@ async fn stale_coordinator_stop_keeps_the_current_coordinator() {
 }
 
 #[tokio::test]
-async fn published_audio_is_paced_only_while_the_publisher_is_connected() {
+async fn published_audio_paces_from_the_first_connect_through_a_disconnect() {
     let core = test_core();
     let generation = prepare_joined_core(&core, "alice");
     let (connection, _sfu) = establish_fake(&core, generation).await;
     let publisher = connection.publisher.clone();
     *core.connection.lock().await = Some(connection);
     let audio = LocalAudioTrack::opus().expect("opus track");
-    let tone = (0..960_u32)
-        .map(|n| {
-            (12_000.0 * (std::f64::consts::TAU * 440.0 * f64::from(n) / 48_000.0).sin()) as i16
-        })
-        .collect::<Vec<_>>()
-        .repeat(50);
-    audio
-        .write_pcm(PcmFrame::mono(tone, 48_000))
-        .await
-        .expect("one second fits the queue");
     publisher
         .add_track(audio.webrtc_track())
         .await
@@ -1009,21 +999,154 @@ async fn published_audio_is_paced_only_while_the_publisher_is_connected() {
         .lock()
         .await
         .begin_publish(LocalTrack::Audio(audio.clone()), 0);
+    // A second peer on the same track receives every paced packet.
+    let observer = peer::new_peer_connection(&[]).await.expect("observer");
+    observer
+        .add_track(audio.webrtc_track())
+        .await
+        .expect("add observed track");
+    let (observer_receiver, mut observed) = peer::connect_audio_receiver(&observer).await;
+    audio
+        .write_pcm(PcmFrame::mono(vec![0; 960], 48_000))
+        .await
+        .expect("write before the publisher connects");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), observed.recv())
+            .await
+            .is_err(),
+        "a publication takes no audio before the publisher connects"
+    );
+    let (receiver, _remote) = peer::connect_audio_receiver(&publisher).await;
+    let observed = tokio::time::timeout(Duration::from_secs(5), observed.recv())
+        .await
+        .expect("pacing starts when the publisher connects")
+        .expect("observed track");
 
-    let (receiver, mut remote) = peer::connect_audio_receiver(&publisher).await;
+    publisher.close().await.expect("close publisher");
+    let (at_close, _) = observed.read_rtp().await.expect("observed packet");
+    let second_later = at_close.header.timestamp.wrapping_add(48_000);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let (packet, _) = observed.read_rtp().await.expect("observed packet");
+            if packet.header.timestamp.wrapping_sub(second_later) < u32::MAX / 2 {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("pacing continues after the publisher closes");
 
+    let _ = receiver.close().await;
+    let _ = observer_receiver.close().await;
+    let _ = observer.close().await;
+    core.leave("test cleanup").await.expect("leave");
+}
+
+#[tokio::test]
+async fn a_failed_publish_does_not_hold_the_track() {
+    let core = test_core();
+    let generation = prepare_joined_core(&core, "alice");
+    let (mut connection, _sfu) = establish_fake(&core, generation).await;
+    connection.publish_options = vec![models::PublishOption {
+        track_type: TrackType::Audio as i32,
+        codec: Some(models::Codec {
+            name: "opus".to_owned(),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }];
+    *core.connection.lock().await = Some(connection);
+    core.own_capabilities
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .insert("send-audio".to_owned());
+    let audio = LocalAudioTrack::opus().expect("opus track");
+
+    // The fake SFU has no SetPublisher endpoint.
+    core.publish(LocalTrack::Audio(audio.clone()))
+        .await
+        .expect_err("publish without SetPublisher");
+
+    let sender = peer::new_peer_connection(&[]).await.expect("sender");
+    sender
+        .add_track(audio.webrtc_track())
+        .await
+        .expect("add track");
+    let (receiver, mut remote) = peer::connect_audio_receiver(&sender).await;
+    audio
+        .write_pcm(PcmFrame::mono(vec![0; 960], 48_000))
+        .await
+        .expect("write");
     tokio::time::timeout(Duration::from_secs(5), remote.recv())
         .await
-        .expect("paced audio reaches the receiver")
+        .expect("the track paces on its own PeerConnection")
         .expect("remote track");
-    publisher.close().await.expect("close publisher");
-    wait_for(
-        Duration::from_secs(2),
-        || !audio.is_pacing(),
-        "closed publisher pauses pacing",
-    )
-    .await;
+    audio.stop();
+    let _ = sender.close().await;
     let _ = receiver.close().await;
+    core.leave("test cleanup").await.expect("leave");
+}
+
+#[tokio::test]
+async fn a_stopped_simulcast_publication_is_not_replaced() {
+    let core = test_core();
+    let generation = prepare_joined_core(&core, "alice");
+    let (mut connection, _sfu) = establish_fake(&core, generation).await;
+    connection.publish_options = vec![models::PublishOption {
+        id: 1,
+        track_type: TrackType::Video as i32,
+        codec: Some(models::Codec {
+            name: "h264".to_owned(),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }];
+    let stopped = LocalTrack::Video {
+        track: LocalVideoTrack::h264_simulcast().expect("simulcast track"),
+        track_type: TrackType::Video,
+    };
+    let reader_tasks = crate::rtc::peer::publisher::add_transceiver_for_track(
+        &connection.publisher,
+        &stopped,
+        &connection.publish_options,
+    )
+    .await
+    .expect("simulcast transceiver");
+    *core.connection.lock().await = Some(connection);
+    core.own_capabilities
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .insert("send-video".to_owned());
+    {
+        let mut media = core.media.lock().await;
+        media.begin_publish(stopped.clone(), 1);
+        media.retire(&stopped.track_id());
+    }
+    stopped.stop();
+
+    for track in [
+        LocalVideoTrack::h264_simulcast().expect("new simulcast track"),
+        LocalVideoTrack::h264().expect("new single-layer track"),
+    ] {
+        let result = core
+            .publish(LocalTrack::Video {
+                track,
+                track_type: TrackType::Video,
+            })
+            .await;
+        assert!(
+            matches!(
+                result,
+                Err(RtcError::SimulcastReplace {
+                    track_type: TrackType::Video
+                })
+            ),
+            "{result:?}"
+        );
+    }
+    for task in reader_tasks {
+        task.abort();
+    }
     core.leave("test cleanup").await.expect("leave");
 }
 

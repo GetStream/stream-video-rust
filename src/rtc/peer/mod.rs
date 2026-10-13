@@ -13,7 +13,7 @@ pub mod publisher;
 mod subscriber;
 
 #[cfg(test)]
-pub(crate) use connection::connect_audio_receiver;
+pub(crate) use connection::{connect_audio_receiver, connect_receiver};
 pub use connection::{generic_sdp, new_peer_connection, to_rtc_ice_servers, trace_peer_events};
 pub(super) use ice::{PendingIce, register_ice_trickle};
 pub(super) use subscriber::negotiate_subscriber;

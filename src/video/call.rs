@@ -997,7 +997,11 @@ impl Call {
     /// Stop publishing a previously published track. The publisher keeps its
     /// transceiver in the negotiated envelope and signals the stop to the SFU
     /// via `UpdateMuteStates` (no publisher renegotiation), matching
-    /// `stream-video-js`.
+    /// `stream-video-js`. A new track of the same kind that is published later
+    /// takes over that transceiver. A simulcast track cannot do this
+    /// ([`RtcError::SimulcastReplace`](crate::rtc::RtcError::SimulcastReplace));
+    /// turn it off and on with [`mute_track`](Self::mute_track) and
+    /// [`unmute_track`](Self::unmute_track).
     pub async fn stop_publish(&self, track: crate::rtc::LocalTrack) -> crate::rtc::RtcResult<()> {
         self.rtc.stop_publish(track).await
     }
