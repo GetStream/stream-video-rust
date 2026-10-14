@@ -113,12 +113,14 @@ The following example creates a user and token, creates a call, joins it as a
 backend participant, sends a reaction, and leaves cleanly:
 
 ```rust,no_run
+use std::time::Duration;
+
 use getstream::models::{
     CallRequest, GetOrCreateCallRequest, MemberRequest, SendVideoReactionRequest,
     UserRequest,
 };
 use getstream::rtc::JoinCallData;
-use getstream::Stream;
+use getstream::{Stream, TokenOptions};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -129,11 +131,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .upsert_users([UserRequest::new(user_id)])
         .await?;
 
+    let call = client.video().call("default", "agent-demo");
+
     // Return this token to a trusted client that connects as `user_id`.
     // The server-side SDK keeps STREAM_API_SECRET on the backend.
-    let _user_token = client.create_token(user_id)?;
+    let _user_token = client.create_token_with(
+        user_id,
+        TokenOptions {
+            expiration: Some(Duration::from_secs(60 * 60)),
+            call_cids: Some(vec![call.cid()]),
+            ..Default::default()
+        },
+    )?;
 
-    let call = client.video().call("default", "agent-demo");
     call.get_or_create(GetOrCreateCallRequest {
         data: Some(CallRequest {
             created_by_id: Some(user_id.to_owned()),
@@ -158,7 +168,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 ```
 
 `Call::join` authenticates the backend participant internally. The token from
-`create_token` is for a user connecting through another trusted client.
+`create_token_with` is for a user connecting through another trusted client. It
+gives access only to the `default:agent-demo` call. It expires after 1 hour, so
+that client must get a new token before then. A token from `create_token` does
+not expire.
 
 ## Accessing and transforming media tracks
 
