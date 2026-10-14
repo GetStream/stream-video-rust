@@ -249,6 +249,71 @@ async fn establish_fake(
     (connection, sfu)
 }
 
+/// A local SFU Twirp endpoint that sends the path of each request to the
+/// channel and answers it with an empty 200.
+async fn recording_twirp_server() -> (String, tokio::sync::mpsc::UnboundedReceiver<String>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind Twirp server");
+    let address = listener.local_addr().expect("Twirp server address");
+    let (paths, received) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            let paths = paths.clone();
+            tokio::spawn(async move {
+                let mut head = Vec::new();
+                let mut buffer = [0_u8; 4096];
+                while !head.windows(4).any(|window| window == b"\r\n\r\n") {
+                    match stream.read(&mut buffer).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(read) => head.extend_from_slice(&buffer[..read]),
+                    }
+                }
+                if let Some(path) = String::from_utf8_lossy(&head).split_whitespace().nth(1) {
+                    let _ = paths.send(path.to_owned());
+                }
+                let _ = stream
+                    .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+                    .await;
+            });
+        }
+    });
+    (format!("http://{address}/twirp"), received)
+}
+
+/// [`establish_fake`] whose signal RPCs go to a [`recording_twirp_server`].
+async fn establish_fake_recording_rpcs(
+    core: &Arc<RtcCore>,
+    generation: u64,
+) -> (
+    Connection,
+    tokio::sync::mpsc::UnboundedReceiver<event::SfuRequest>,
+    tokio::sync::mpsc::UnboundedReceiver<String>,
+) {
+    let (mut credentials, sfu) = fake_sfu(true).await;
+    let (twirp_url, rpcs) = recording_twirp_server().await;
+    credentials.server.url = twirp_url;
+    let connection = core
+        .clone()
+        .establish(
+            &credentials,
+            0,
+            ReconnectStrategy::Fast,
+            None,
+            generation,
+            None,
+        )
+        .await
+        .expect("establish against fake SFU");
+    (connection, sfu, rpcs)
+}
+
+fn received_paths(rpcs: &mut tokio::sync::mpsc::UnboundedReceiver<String>) -> Vec<String> {
+    std::iter::from_fn(|| rpcs.try_recv().ok()).collect()
+}
+
 /// The event loop context of the current `connection`.
 fn event_context(core: &Arc<RtcCore>, connection: &Connection) -> EventLoopContext {
     EventLoopContext {
@@ -1202,6 +1267,130 @@ async fn a_failed_publish_does_not_hold_the_track() {
     audio.stop();
     let _ = sender.close().await;
     let _ = receiver.close().await;
+    core.leave("test cleanup").await.expect("leave");
+}
+
+#[tokio::test]
+async fn a_publish_that_waits_for_a_reconnect_negotiates_with_the_new_session() {
+    let core = test_core();
+    let generation = prepare_joined_core(&core, "alice");
+    let (mut old, _old_sfu, mut old_rpcs) = establish_fake_recording_rpcs(&core, generation).await;
+    let (mut new, _new_sfu, mut new_rpcs) = establish_fake_recording_rpcs(&core, generation).await;
+    for connection in [&mut old, &mut new] {
+        connection.publish_options = vec![models::PublishOption {
+            track_type: TrackType::Audio as i32,
+            codec: Some(models::Codec {
+                name: "opus".to_owned(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }];
+    }
+    *core.connection.lock().await = Some(old);
+    core.own_capabilities
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .insert("send-audio".to_owned());
+    let audio = LocalAudioTrack::opus().expect("opus track");
+
+    // Another media operation holds the lock while a reconnect replaces the
+    // connection. In a migration, the old SFU session stays reachable.
+    let busy = core.media.lock().await;
+    let publish = tokio::spawn({
+        let core = core.clone();
+        let track = LocalTrack::Audio(audio.clone());
+        async move { core.publish(track).await }
+    });
+    tokio::task::yield_now().await;
+    let old = core
+        .connection
+        .lock()
+        .await
+        .replace(new)
+        .expect("old connection");
+    drop(busy);
+    publish
+        .await
+        .expect("publish task")
+        .expect_err("the fake SFU answers no SDP");
+
+    let set_publisher = "/twirp/stream.video.sfu.signal.SignalServer/SetPublisher";
+    assert!(
+        received_paths(&mut new_rpcs)
+            .iter()
+            .any(|path| path == set_publisher)
+    );
+    assert!(
+        !received_paths(&mut old_rpcs)
+            .iter()
+            .any(|path| path == set_publisher)
+    );
+    old.teardown().await;
+    audio.stop();
+    core.leave("test cleanup").await.expect("leave");
+}
+
+#[tokio::test]
+async fn restoring_publications_adds_no_second_sender_for_a_track_published_meanwhile() {
+    let core = test_core();
+    let generation = prepare_joined_core(&core, "alice");
+    let (mut connection, _sfu) = establish_fake(&core, generation).await;
+    connection.publish_options = ["opus", "vp8"]
+        .into_iter()
+        .zip([TrackType::Audio, TrackType::Video])
+        .map(|(codec, track_type)| models::PublishOption {
+            track_type: track_type as i32,
+            codec: Some(models::Codec {
+                name: codec.to_owned(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        })
+        .collect();
+    let publisher = connection.publisher.clone();
+    let publish_options = connection.publish_options.clone();
+    *core.connection.lock().await = Some(connection);
+    core.own_capabilities
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .extend(["send-audio".to_owned(), "send-video".to_owned()]);
+    let earlier = LocalTrack::Video {
+        track: LocalVideoTrack::vp8().expect("vp8 track"),
+        track_type: TrackType::Video,
+    };
+    let meanwhile = LocalTrack::Audio(LocalAudioTrack::opus().expect("opus track"));
+    let reader_tasks =
+        publisher::add_transceiver_for_track(&publisher, &meanwhile, &publish_options)
+            .await
+            .expect("audio transceiver");
+    {
+        let mut media = core.media.lock().await;
+        for track in [&earlier, &meanwhile] {
+            media.begin_publish(track.clone(), 0);
+            media.set_status(&track.track_id(), PublicationStatus::Published);
+        }
+    }
+
+    // The fake SFU has no SetPublisher endpoint.
+    core.restore_published_tracks()
+        .await
+        .expect_err("restore without SetPublisher");
+
+    let mut sender_tracks = Vec::new();
+    for transceiver in publisher.get_transceivers().await {
+        if let Some(track) = transceiver.sender().await.track().await {
+            sender_tracks.push(track.id().to_owned());
+        }
+    }
+    sender_tracks.sort();
+    let mut expected = vec![earlier.track_id(), meanwhile.track_id()];
+    expected.sort();
+    assert_eq!(sender_tracks, expected);
+    for task in reader_tasks {
+        task.abort();
+    }
+    earlier.stop();
+    meanwhile.stop();
     core.leave("test cleanup").await.expect("leave");
 }
 

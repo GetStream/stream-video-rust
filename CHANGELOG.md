@@ -248,6 +248,14 @@ on `Call` (`get_call_participant_session_metrics`,
   `get_stats()` samples only in the `getstats` records of `rtc_stats`. Before,
   it also sent them as JSON strings in `subscriber_stats` and
   `publisher_stats`.
+- A `publish` that waits for another media operation uses the connection that
+  is current at the end of the wait. Before, it could use the session that a
+  reconnect replaced. After a rejoin, this `publish` failed although the call
+  was connected again.
+- A reconnect restores each publication with one sender. This includes a track
+  that `publish` adds to the new connection before the restore. Before, that
+  track got a second m-line. The SFU rejected the negotiation, and the SDK
+  started one more rejoin.
 
 # v0.1.0-preview.2
 

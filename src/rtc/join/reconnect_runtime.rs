@@ -35,6 +35,10 @@ impl RtcCore {
         if !tracks.is_empty() {
             let mut publisher_rtcp_tasks = Vec::new();
             for track in &tracks {
+                // A `publish` after the connection swap can add this sender first.
+                if has_sender_for_track(&publisher, &track.track_id()).await {
+                    continue;
+                }
                 match publisher::add_transceiver_for_track(&publisher, track, &publish_options)
                     .await
                 {
@@ -963,4 +967,19 @@ impl RtcCore {
             .map(|c| c.stats.clone())?;
         Some(reporter.report_once().await)
     }
+}
+
+async fn has_sender_for_track(publisher: &Arc<RTCPeerConnection>, track_id: &str) -> bool {
+    for transceiver in publisher.get_transceivers().await {
+        if transceiver
+            .sender()
+            .await
+            .track()
+            .await
+            .is_some_and(|bound| bound.id() == track_id)
+        {
+            return true;
+        }
+    }
+    false
 }

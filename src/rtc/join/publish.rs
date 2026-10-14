@@ -14,6 +14,8 @@ impl RtcCore {
                 "a video track cannot be published as {track_type:?}"
             )));
         }
+        // A reconnect can replace the connection while `publish` waits for the lock.
+        let mut media = self.media.lock().await;
         let Some((publisher, signal, session_id, publish_options)) = self.publisher_handles().await
         else {
             return Err(RtcError::IllegalState("publish() before join()".to_owned()));
@@ -27,7 +29,6 @@ impl RtcCore {
         {
             return Err(RtcError::PermissionDenied { capability });
         }
-        let mut media = self.media.lock().await;
         let track_id = track.track_id();
         let status = media
             .position(&track_id)
