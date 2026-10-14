@@ -298,6 +298,13 @@ impl Client {
         B: Serialize + ?Sized,
         R: DeserializeOwned,
     {
+        // `Url::join` resolves `.` and `..`, so a path value could select another endpoint.
+        if path
+            .split('/')
+            .any(|segment| segment == "." || segment == "..")
+        {
+            return Err(Error::Config(format!("invalid path {path:?}: dot segment")));
+        }
         let mut url = self
             .base_url
             .join(path)
@@ -375,6 +382,12 @@ impl Client {
         B: Serialize + ?Sized,
         R: DeserializeOwned,
     {
+        if path
+            .split('/')
+            .any(|segment| segment == "." || segment == "..")
+        {
+            return Err(Error::Config(format!("invalid path {path:?}: dot segment")));
+        }
         let mut url = self
             .base_url
             .join(path)
@@ -663,6 +676,26 @@ mod tests {
         let redacted = redact_json_body(b"token=must-not-leak");
         assert_eq!(redacted, "<non-JSON body omitted>");
         assert!(!redacted.contains("must-not-leak"));
+    }
+
+    #[tokio::test]
+    async fn user_requests_reject_dot_segment_paths() {
+        let config = ClientConfig {
+            base_url: "http://127.0.0.1:9".to_owned(),
+            ..ClientConfig::default()
+        };
+        let client = Client::new("key".to_owned(), "secret".to_owned(), config).expect("client");
+        let error = client
+            .request_as_user::<(), Value>(
+                Method::GET,
+                "/api/v2/video/call/default/..",
+                &[],
+                None,
+                "user-token",
+            )
+            .await
+            .expect_err("dot segment path");
+        assert!(matches!(error, Error::Config(_)), "{error:?}");
     }
 
     #[test]

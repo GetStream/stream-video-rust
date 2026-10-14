@@ -1134,6 +1134,31 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn dot_segment_path_values_are_rejected() {
+        let config = crate::ClientConfig {
+            base_url: "http://127.0.0.1:9".to_owned(),
+            ..crate::ClientConfig::default()
+        };
+        let stream = crate::Stream::with_config("key", "secret", config).expect("client");
+
+        let error = stream
+            .video()
+            .call("default", "call-1")
+            .stop_rtmp_broadcast(".")
+            .await
+            .expect_err("dot segment name");
+        assert!(matches!(error, Error::Config(_)), "{error:?}");
+
+        let error = stream
+            .video()
+            .call("default", "..")
+            .end()
+            .await
+            .expect_err("dot segment call id");
+        assert!(matches!(error, Error::Config(_)), "{error:?}");
+    }
+
     #[test]
     fn filter_conditions_query_json_encodes_map() {
         let mut filter = CustomData::new();
