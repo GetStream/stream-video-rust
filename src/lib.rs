@@ -115,6 +115,10 @@ impl Stream {
     /// This is claims inspection: it intentionally does not reject tokens based
     /// on `exp`, `nbf`, or `iat`. Operational RTC authentication separately
     /// applies a 60-second clock-skew allowance to all three temporal claims.
+    ///
+    /// To authenticate a user with the returned claims, reject the token when
+    /// `exp` is in the past or `nbf` (in [`TokenClaims::custom`]) is in the
+    /// future. Tokens from [`Self::create_token`] have no `exp` claim.
     pub fn decode_token(&self, token: &str) -> Result<TokenClaims> {
         token::decode_token(self.inner.api_secret(), token)
     }
