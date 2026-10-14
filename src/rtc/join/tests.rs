@@ -1293,8 +1293,8 @@ async fn a_publish_that_waits_for_a_reconnect_negotiates_with_the_new_session() 
         .insert("send-audio".to_owned());
     let audio = LocalAudioTrack::opus().expect("opus track");
 
-    // Another media operation holds the lock while a reconnect swaps in the new
-    // connection; a migration keeps the old SFU session reachable meanwhile.
+    // Another media operation holds the lock while a reconnect replaces the
+    // connection. In a migration, the old SFU session stays reachable.
     let busy = core.media.lock().await;
     let publish = tokio::spawn({
         let core = core.clone();
@@ -1334,7 +1334,7 @@ async fn a_publish_that_waits_for_a_reconnect_negotiates_with_the_new_session() 
 async fn restoring_publications_adds_no_second_sender_for_a_track_published_meanwhile() {
     let core = test_core();
     let generation = prepare_joined_core(&core, "alice");
-    let (mut connection, _sfu, _rpcs) = establish_fake_recording_rpcs(&core, generation).await;
+    let (mut connection, _sfu) = establish_fake(&core, generation).await;
     connection.publish_options = ["opus", "vp8"]
         .into_iter()
         .zip([TrackType::Audio, TrackType::Video])
@@ -1359,13 +1359,10 @@ async fn restoring_publications_adds_no_second_sender_for_a_track_published_mean
         track_type: TrackType::Video,
     };
     let meanwhile = LocalTrack::Audio(LocalAudioTrack::opus().expect("opus track"));
-    let reader_tasks = crate::rtc::peer::publisher::add_transceiver_for_track(
-        &publisher,
-        &meanwhile,
-        &publish_options,
-    )
-    .await
-    .expect("audio transceiver");
+    let reader_tasks =
+        publisher::add_transceiver_for_track(&publisher, &meanwhile, &publish_options)
+            .await
+            .expect("audio transceiver");
     {
         let mut media = core.media.lock().await;
         for track in [&earlier, &meanwhile] {
@@ -1374,9 +1371,10 @@ async fn restoring_publications_adds_no_second_sender_for_a_track_published_mean
         }
     }
 
+    // The fake SFU has no SetPublisher endpoint.
     core.restore_published_tracks()
         .await
-        .expect_err("the fake SFU answers no SDP");
+        .expect_err("restore without SetPublisher");
 
     let mut sender_tracks = Vec::new();
     for transceiver in publisher.get_transceivers().await {
