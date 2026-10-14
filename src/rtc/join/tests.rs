@@ -1331,6 +1331,72 @@ async fn a_publish_that_waits_for_a_reconnect_negotiates_with_the_new_session() 
 }
 
 #[tokio::test]
+async fn restoring_publications_adds_no_second_sender_for_a_track_published_meanwhile() {
+    let core = test_core();
+    let generation = prepare_joined_core(&core, "alice");
+    let (mut connection, _sfu, _rpcs) = establish_fake_recording_rpcs(&core, generation).await;
+    connection.publish_options = ["opus", "vp8"]
+        .into_iter()
+        .zip([TrackType::Audio, TrackType::Video])
+        .map(|(codec, track_type)| models::PublishOption {
+            track_type: track_type as i32,
+            codec: Some(models::Codec {
+                name: codec.to_owned(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        })
+        .collect();
+    let publisher = connection.publisher.clone();
+    let publish_options = connection.publish_options.clone();
+    *core.connection.lock().await = Some(connection);
+    core.own_capabilities
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .extend(["send-audio".to_owned(), "send-video".to_owned()]);
+    let earlier = LocalTrack::Video {
+        track: LocalVideoTrack::vp8().expect("vp8 track"),
+        track_type: TrackType::Video,
+    };
+    let meanwhile = LocalTrack::Audio(LocalAudioTrack::opus().expect("opus track"));
+    let reader_tasks = crate::rtc::peer::publisher::add_transceiver_for_track(
+        &publisher,
+        &meanwhile,
+        &publish_options,
+    )
+    .await
+    .expect("audio transceiver");
+    {
+        let mut media = core.media.lock().await;
+        for track in [&earlier, &meanwhile] {
+            media.begin_publish(track.clone(), 0);
+            media.set_status(&track.track_id(), PublicationStatus::Published);
+        }
+    }
+
+    core.restore_published_tracks()
+        .await
+        .expect_err("the fake SFU answers no SDP");
+
+    let mut sender_tracks = Vec::new();
+    for transceiver in publisher.get_transceivers().await {
+        if let Some(track) = transceiver.sender().await.track().await {
+            sender_tracks.push(track.id().to_owned());
+        }
+    }
+    sender_tracks.sort();
+    let mut expected = vec![earlier.track_id(), meanwhile.track_id()];
+    expected.sort();
+    assert_eq!(sender_tracks, expected);
+    for task in reader_tasks {
+        task.abort();
+    }
+    earlier.stop();
+    meanwhile.stop();
+    core.leave("test cleanup").await.expect("leave");
+}
+
+#[tokio::test]
 async fn a_stopped_simulcast_publication_is_not_replaced() {
     let core = test_core();
     let generation = prepare_joined_core(&core, "alice");

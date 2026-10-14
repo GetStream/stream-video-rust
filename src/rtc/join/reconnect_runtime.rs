@@ -35,6 +35,11 @@ impl RtcCore {
         if !tracks.is_empty() {
             let mut publisher_rtcp_tasks = Vec::new();
             for track in &tracks {
+                // A publish between the connection swap and this restore already
+                // added its sender; a second m-line would fail the negotiation.
+                if has_sender_for_track(&publisher, &track.track_id()).await {
+                    continue;
+                }
                 match publisher::add_transceiver_for_track(&publisher, track, &publish_options)
                     .await
                 {

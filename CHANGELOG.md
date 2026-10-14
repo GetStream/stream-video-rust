@@ -252,6 +252,9 @@ on `Call` (`get_call_participant_session_metrics`,
   connection that is current when its turn comes. Before, it could negotiate
   with the session that a reconnect had replaced, and after a rejoin it failed
   although the call had recovered.
+- A reconnect restores each publication with one sender, also a track that
+  `publish` put on the new connection before the restore. Before, that track
+  got a second m-line, the negotiation failed and the SDK rejoined again.
 
 # v0.1.0-preview.2
 
