@@ -38,7 +38,7 @@ const MAX_CALL_EVENT_CAPACITY: usize = 65_536;
 pub const DEFAULT_MAX_RESPONSE_BODY_BYTES: usize = 16 * 1024 * 1024;
 /// Default maximum inbound SFU/coordinator WebSocket frame and message size (4 MiB).
 pub const DEFAULT_MAX_WEBSOCKET_MESSAGE_BYTES: usize = 4 * 1024 * 1024;
-const REDACTED_BODY_KEYS: [&str; 3] = ["api_secret", "token", "password"];
+const REDACTED_BODY_KEYS: [&str; 4] = ["api_secret", "token", "password", "stream_key"];
 
 /// Limits for payloads buffered by the HTTP and WebSocket transports.
 #[derive(Debug, Clone, Copy)]
@@ -661,13 +661,19 @@ mod tests {
             "token":"top-secret",
             "nested":{"password":"nested-secret"},
             "array":[{"API_SECRET":"array-secret"}],
+            "rtmps":[{"stream_url":"rtmps://live.example.com/app","stream_key":"stream-key-secret"}],
             "safe":"visible"
         }"#;
         let redacted = redact_json_body(body);
-        for secret in ["top-secret", "nested-secret", "array-secret"] {
+        for secret in [
+            "top-secret",
+            "nested-secret",
+            "array-secret",
+            "stream-key-secret",
+        ] {
             assert!(!redacted.contains(secret));
         }
-        assert_eq!(redacted.matches("<redacted>").count(), 3);
+        assert_eq!(redacted.matches("<redacted>").count(), 4);
         assert!(redacted.contains("visible"));
     }
 

@@ -780,7 +780,7 @@ pub struct StopHLSBroadcastingResponse {
 }
 
 /// A single RTMP broadcast target (`RTMPBroadcastRequest`).
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Clone, Default, Serialize)]
 pub struct RtmpBroadcastRequest {
     /// Unique name for the broadcast within the call.
     pub name: String,
@@ -792,6 +792,21 @@ pub struct RtmpBroadcastRequest {
     pub quality: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub layout: Option<Value>,
+}
+
+impl std::fmt::Debug for RtmpBroadcastRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RtmpBroadcastRequest")
+            .field("name", &self.name)
+            .field("stream_url", &self.stream_url)
+            .field(
+                "stream_key",
+                &self.stream_key.as_ref().map(|_| "<redacted>"),
+            )
+            .field("quality", &self.quality)
+            .field("layout", &self.layout)
+            .finish()
+    }
 }
 
 /// `start_rtmp_broadcasts` request (`StartRTMPBroadcastsRequest`).
@@ -1101,6 +1116,21 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn rtmp_broadcast_debug_redacts_stream_key() {
+        let request = RtmpBroadcastRequest {
+            name: "youtube".to_owned(),
+            stream_url: "rtmps://live.example.com/app".to_owned(),
+            stream_key: Some("stream-key-must-not-leak".to_owned()),
+            ..Default::default()
+        };
+
+        let debug = format!("{request:?}");
+        assert!(!debug.contains("stream-key-must-not-leak"));
+        assert!(debug.contains("<redacted>"));
+        assert!(debug.contains("rtmps://live.example.com/app"));
+    }
 
     #[test]
     fn query_participants_limit_is_query_only() {
