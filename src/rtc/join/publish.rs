@@ -14,8 +14,7 @@ impl RtcCore {
                 "a video track cannot be published as {track_type:?}"
             )));
         }
-        // A reconnect can swap the connection while this waits for the lock, so
-        // snapshot the connection only after acquiring it.
+        // A reconnect can replace the connection while `publish` waits for the lock.
         let mut media = self.media.lock().await;
         let Some((publisher, signal, session_id, publish_options)) = self.publisher_handles().await
         else {

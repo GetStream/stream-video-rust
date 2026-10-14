@@ -1048,21 +1048,6 @@ async fn remove_sender_for_track(publisher: &Arc<RTCPeerConnection>, track_id: &
     Ok(())
 }
 
-async fn has_sender_for_track(publisher: &Arc<RTCPeerConnection>, track_id: &str) -> bool {
-    for transceiver in publisher.get_transceivers().await {
-        if transceiver
-            .sender()
-            .await
-            .track()
-            .await
-            .is_some_and(|bound| bound.id() == track_id)
-        {
-            return true;
-        }
-    }
-    false
-}
-
 fn media_rollback_error(
     operation: &str,
     error: impl std::fmt::Display,
