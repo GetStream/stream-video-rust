@@ -33,6 +33,8 @@ fn generate_sfu_protocol() {
     // cross-package references (signal -> models, event -> models/signal) resolve.
     let mut config = prost_build::Config::new();
     config.include_file("_sfu_proto.rs");
+    // `JoinRequest` holds the SFU token; `src/rtc/proto.rs` has its redacting `Debug`.
+    config.skip_debug([".stream.video.sfu.event.JoinRequest"]);
 
     config
         .compile_fds(file_descriptors)

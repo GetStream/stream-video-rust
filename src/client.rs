@@ -38,7 +38,7 @@ const MAX_CALL_EVENT_CAPACITY: usize = 65_536;
 pub const DEFAULT_MAX_RESPONSE_BODY_BYTES: usize = 16 * 1024 * 1024;
 /// Default maximum inbound SFU/coordinator WebSocket frame and message size (4 MiB).
 pub const DEFAULT_MAX_WEBSOCKET_MESSAGE_BYTES: usize = 4 * 1024 * 1024;
-const REDACTED_BODY_KEYS: [&str; 3] = ["api_secret", "token", "password"];
+const REDACTED_BODY_KEYS: [&str; 4] = ["api_secret", "token", "password", "stream_key"];
 
 /// Limits for payloads buffered by the HTTP and WebSocket transports.
 #[derive(Debug, Clone, Copy)]
@@ -298,6 +298,13 @@ impl Client {
         B: Serialize + ?Sized,
         R: DeserializeOwned,
     {
+        // `Url::join` resolves `.` and `..`, so a path value could select another endpoint.
+        if path
+            .split('/')
+            .any(|segment| segment == "." || segment == "..")
+        {
+            return Err(Error::Config(format!("invalid path {path:?}: dot segment")));
+        }
         let mut url = self
             .base_url
             .join(path)
@@ -375,6 +382,12 @@ impl Client {
         B: Serialize + ?Sized,
         R: DeserializeOwned,
     {
+        if path
+            .split('/')
+            .any(|segment| segment == "." || segment == "..")
+        {
+            return Err(Error::Config(format!("invalid path {path:?}: dot segment")));
+        }
         let mut url = self
             .base_url
             .join(path)
@@ -648,13 +661,19 @@ mod tests {
             "token":"top-secret",
             "nested":{"password":"nested-secret"},
             "array":[{"API_SECRET":"array-secret"}],
+            "rtmps":[{"stream_url":"rtmps://live.example.com/app","stream_key":"stream-key-secret"}],
             "safe":"visible"
         }"#;
         let redacted = redact_json_body(body);
-        for secret in ["top-secret", "nested-secret", "array-secret"] {
+        for secret in [
+            "top-secret",
+            "nested-secret",
+            "array-secret",
+            "stream-key-secret",
+        ] {
             assert!(!redacted.contains(secret));
         }
-        assert_eq!(redacted.matches("<redacted>").count(), 3);
+        assert_eq!(redacted.matches("<redacted>").count(), 4);
         assert!(redacted.contains("visible"));
     }
 
@@ -663,6 +682,26 @@ mod tests {
         let redacted = redact_json_body(b"token=must-not-leak");
         assert_eq!(redacted, "<non-JSON body omitted>");
         assert!(!redacted.contains("must-not-leak"));
+    }
+
+    #[tokio::test]
+    async fn user_requests_reject_dot_segment_paths() {
+        let config = ClientConfig {
+            base_url: "http://127.0.0.1:9".to_owned(),
+            ..ClientConfig::default()
+        };
+        let client = Client::new("key".to_owned(), "secret".to_owned(), config).expect("client");
+        let error = client
+            .request_as_user::<(), Value>(
+                Method::GET,
+                "/api/v2/video/call/default/..",
+                &[],
+                None,
+                "user-token",
+            )
+            .await
+            .expect_err("dot segment path");
+        assert!(matches!(error, Error::Config(_)), "{error:?}");
     }
 
     #[test]

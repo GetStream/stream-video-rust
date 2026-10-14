@@ -52,7 +52,11 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 /// using `secret`. Comparison is constant-time for valid signature lengths.
 ///
 /// This authenticates the payload but does not provide replay protection.
+/// An empty `secret` never verifies, because anyone can sign with an empty key.
 pub fn verify_signature(body: &[u8], signature: &str, secret: &[u8]) -> bool {
+    if secret.is_empty() {
+        return false;
+    }
     match hex_hmac(secret, body) {
         Some(expected) => constant_time_eq(expected.as_bytes(), signature.as_bytes()),
         None => false,
@@ -391,6 +395,14 @@ mod tests {
             }
             other => panic!("expected CallCreated, got {:?}", other.event_type()),
         }
+    }
+
+    #[test]
+    fn empty_secret_never_verifies() {
+        let body = br#"{"type":"call.created"}"#;
+        let signature = hex_hmac(b"", body).expect("empty HMAC key");
+
+        assert!(!verify_signature(body, &signature, b""));
     }
 
     #[test]
