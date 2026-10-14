@@ -256,6 +256,15 @@ on `Call` (`get_call_participant_session_metrics`,
   that `publish` adds to the new connection before the restore. Before, that
   track got a second m-line. The SFU rejected the negotiation, and the SDK
   started one more rejoin.
+- A REST request returns `Error::Config` when a path value is `.` or `..`, for
+  example a call ID or the name in `stop_rtmp_broadcast`. Before, the URL
+  resolved these segments and the request went to a different endpoint:
+  `stop_rtmp_broadcast(".")` stopped all RTMP broadcasts of the call.
+- `verify_signature` returns `false` for an empty secret. Before, a signature
+  made with an empty key passed.
+- The `Debug` output of `RtmpBroadcastRequest` hides `stream_key`, and the
+  `Debug` output of the SFU `JoinRequest` hides `token`. With `log_bodies` on,
+  the logged bodies also hide `stream_key`.
 
 # v0.1.0-preview.2
 
