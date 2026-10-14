@@ -248,6 +248,10 @@ on `Call` (`get_call_participant_session_metrics`,
   `get_stats()` samples only in the `getstats` records of `rtc_stats`. Before,
   it also sent them as JSON strings in `subscriber_stats` and
   `publisher_stats`.
+- A `publish` that waits for another media operation negotiates with the
+  connection that is current when its turn comes. Before, it could negotiate
+  with the session that a reconnect had replaced, and after a rejoin it failed
+  although the call had recovered.
 
 # v0.1.0-preview.2
 
