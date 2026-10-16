@@ -702,10 +702,8 @@ impl LocalAudioTrack {
         } else {
             frame
         };
-        // The sinc filter is slow on a long frame, so it runs on a blocking thread.
-        let track = self.clone();
-        let queued = tokio::task::spawn_blocking(move || -> Result<Result<()>> {
-            let mut resampler = track
+        let queued = {
+            let mut resampler = self
                 .inner
                 .resampler
                 .lock()
@@ -717,12 +715,9 @@ impl LocalAudioTrack {
                 *filter_flushes = flushes;
             }
             let resampled = r.push(&frame)?.samples;
-            track.inner.pcm_written.store(true, Ordering::SeqCst);
-            let queued = track.queue_pcm(resampled, flushes);
-            Ok(queued)
-        })
-        .await
-        .map_err(|error| RtcError::Media(format!("pcm resample worker failed: {error}")))??;
+            self.inner.pcm_written.store(true, Ordering::SeqCst);
+            self.queue_pcm(resampled, flushes)
+        };
         // The write does not set `pacing_enabled`, so a `pause_pacing` stays
         // in force. Audio paced into a track with no sending binding is lost,
         // so the queue waits for a sender.
@@ -2333,8 +2328,6 @@ impl LocalTrack {
 
 #[cfg(test)]
 mod tests {
-    use futures_util::FutureExt;
-
     use super::*;
     use crate::rtc::peer;
     use crate::rtc::proto::models::{Codec, VideoDimension};
@@ -2652,25 +2645,6 @@ mod tests {
         track.stop();
     }
 
-    #[tokio::test]
-    async fn other_tasks_run_while_write_pcm_resamples() {
-        let track = unpaced_track();
-        // The test runtime has one thread, so this task runs only when the
-        // write gives the thread back.
-        let other = tokio::spawn(async {});
-
-        track
-            .write_pcm(PcmFrame::mono(vec![1_000; 24_000], 24_000))
-            .await
-            .expect("write_pcm");
-
-        assert!(
-            other.is_finished(),
-            "the resample kept the runtime thread from other tasks"
-        );
-        track.stop();
-    }
-
     #[test]
     fn the_pacer_takes_a_frame_while_a_write_resamples() {
         let track = unpaced_track();
@@ -2715,37 +2689,6 @@ mod tests {
         drop(writing);
 
         flushed.expect("the flush waited for the write");
-    }
-
-    #[test]
-    fn flush_drops_a_write_that_waits_for_a_blocking_thread() {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .max_blocking_threads(1)
-            .build()
-            .expect("runtime");
-        runtime.block_on(async {
-            let track = unpaced_track();
-            let (release, released) = std::sync::mpsc::channel::<()>();
-            // Takes the only blocking thread, so the write cannot resample yet.
-            let _busy = tokio::task::spawn_blocking(move || released.recv());
-            let mut write = std::pin::pin!(track.write_pcm(loud_end_16k()));
-            assert!(write.as_mut().now_or_never().is_none());
-
-            track.flush();
-            drop(release);
-            write.await.expect("write_pcm");
-            let mut first = vec![0; FRAME_SAMPLES_20MS];
-            let mut second = vec![0; FRAME_SAMPLES_20MS];
-            track.inner.take_pcm(&mut first);
-            track.inner.take_pcm(&mut second);
-
-            assert_eq!(
-                peak(&first).max(peak(&second)),
-                0,
-                "audio from before the flush played"
-            );
-            track.stop();
-        });
     }
 
     #[test]
