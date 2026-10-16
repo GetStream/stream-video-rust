@@ -231,8 +231,6 @@ on `Call` (`get_call_participant_session_metrics`,
 - `StreamResampler` uses a windowed-sinc filter (rubato) and removes the audio
   above the lower Nyquist frequency. Before, it interpolated linearly: from
   48 kHz to 16 kHz, a 12 kHz tone came out at 4 kHz at full level.
-  `write_pcm` runs the filter on a blocking thread, so a long frame does not
-  stop the runtime or the pacer.
 - `LocalAudioTrack::flush` also drops the audio in the resampler and the audio
   of a `write_pcm` that started before the flush. It does not wait for a
   `write_pcm` in progress.
