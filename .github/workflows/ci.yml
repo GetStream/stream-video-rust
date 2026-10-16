@@ -45,9 +45,15 @@ jobs:
           command: check licenses bans sources
 
   test:
-    name: Test
-    runs-on: ubuntu-latest
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: Test, os: ubuntu-latest }
+          - { name: Test (macOS), os: macos-latest }
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/setup-rust
