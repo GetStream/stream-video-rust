@@ -22,7 +22,7 @@
 
 use std::mem::MaybeUninit;
 use std::os::raw::{c_int, c_uint, c_ulong, c_void};
-use std::ptr;
+use std::ptr::{self, NonNull};
 
 use super::vpx_sys::vp8e_enc_control_id::{
     VP8E_SET_CPUUSED, VP9E_GET_SVC_LAYER_ID, VP9E_REGISTER_CX_CALLBACK, VP9E_SET_ROW_MT,
@@ -113,7 +113,9 @@ pub(crate) struct VpxSvcEncoder {
     width: u32,
     height: u32,
     mode: Vp9SvcMode,
-    callback: Box<SvcCallbackBuffer>,
+    /// From `Box::leak`, freed in `Drop` after `vpx_codec_destroy`. libvpx
+    /// holds the same pointer as `user_priv`, so every access goes through it.
+    callback: NonNull<SvcCallbackBuffer>,
 }
 
 // SAFETY: `vpx_codec_ctx_t` holds raw pointers into libvpx internal state, which
@@ -133,10 +135,10 @@ unsafe extern "C" fn collect_svc_packet(pkt: *mut vpx_codec_cx_pkt_t, user_data:
     if pkt.is_null() || user_data.is_null() {
         return;
     }
-    // SAFETY: `user_data` is the stable pointer to this encoder's boxed
-    // `SvcCallbackBuffer`, registered during construction and kept alive until
-    // after `vpx_codec_destroy`. libvpx invokes this callback synchronously and
-    // never concurrently for a single encoder context.
+    // SAFETY: `user_data` is this encoder's `callback` pointer, registered
+    // during construction and freed only after `vpx_codec_destroy`. libvpx
+    // invokes this callback synchronously inside `vpx_codec_encode`, when no
+    // Rust reference to the buffer exists, and never concurrently.
     let callback = unsafe { &mut *user_data.cast::<SvcCallbackBuffer>() };
     // SAFETY: libvpx supplies a valid packet pointer for the duration of this
     // callback. Reading the frame union member is valid only for frame packets.
@@ -384,9 +386,10 @@ impl VpxSvcEncoder {
         // SAFETY: the libvpx interface pointer is static.
         // `vpx_codec_enc_config_default` fills `cfg` before it is read, and
         // `ctx` starts zeroed because `vpx_codec_enc_init_ver` does not write
-        // every field (`err_detail`). The callback's `user_priv` points into a Box whose allocation remains
-        // stable until after this context is destroyed. Every C call is
-        // synchronous and all pointer arguments remain live for its duration.
+        // every field (`err_detail`). The callback's `user_priv` is the
+        // `callback` pointer, which stays valid until `Drop` frees it after
+        // this context is destroyed. Every C call is synchronous and all
+        // pointer arguments remain live for its duration.
         unsafe {
             let iface = vpx_codec_vp9_cx();
             if iface.is_null() {
@@ -476,7 +479,7 @@ impl VpxSvcEncoder {
                 width,
                 height,
                 mode,
-                callback,
+                callback: NonNull::from(Box::leak(callback)),
             };
             check(
                 vpx_codec_control_(&mut encoder.ctx, VP8E_SET_CPUUSED as c_int, 8 as c_int),
@@ -522,7 +525,7 @@ impl VpxSvcEncoder {
             )?;
             let mut pair = vpx_codec_enc_output_cx_cb_pair {
                 output_cx_pkt: Some(collect_svc_packet),
-                user_priv: (&mut *encoder.callback as *mut SvcCallbackBuffer).cast::<c_void>(),
+                user_priv: encoder.callback.as_ptr().cast::<c_void>(),
             };
             check(
                 vpx_codec_control_(
@@ -566,9 +569,13 @@ impl VpxSvcEncoder {
                 self.height
             )));
         }
-        self.callback.frames.clear();
-        self.callback.force_key = force_key;
-        self.callback.failed = false;
+        // SAFETY: `callback` is valid until `Drop`, and `&mut self` makes this
+        // the only access. The reference ends before `vpx_codec_encode`, where
+        // libvpx writes through its copy of the pointer.
+        let callback = unsafe { self.callback.as_mut() };
+        callback.frames.clear();
+        callback.force_key = force_key;
+        callback.failed = false;
         let flags = if force_key {
             VPX_EFLAG_FORCE_KF as vpx_enc_frame_flags_t
         } else {
@@ -606,12 +613,14 @@ impl VpxSvcEncoder {
                 "SVC encode",
             )?;
         }
-        if self.callback.failed {
+        // SAFETY: as above; `vpx_codec_encode` has returned.
+        let callback = unsafe { self.callback.as_mut() };
+        if callback.failed {
             return Err(RtcError::Media(
                 "failed to copy libvpx SVC callback output".to_owned(),
             ));
         }
-        let mut frames = std::mem::take(&mut self.callback.frames);
+        let mut frames = std::mem::take(&mut callback.frames);
         let mut layer_id = vpx_svc_layer_id_t {
             spatial_layer_id: 0,
             temporal_layer_id: 0,
@@ -661,10 +670,11 @@ impl Drop for VpxEncoder {
 impl Drop for VpxSvcEncoder {
     fn drop(&mut self) {
         // SAFETY: `ctx` was initialized successfully before `Self` was built and
-        // is destroyed exactly once. Destruction also unregisters the callback
-        // before its boxed user storage is dropped.
+        // is destroyed exactly once. After the destroy, libvpx holds no copy of
+        // `callback`, which came from `Box::leak` and is freed only here.
         unsafe {
             let _ = vpx_codec_destroy(&mut self.ctx);
+            drop(Box::from_raw(self.callback.as_ptr()));
         }
     }
 }
