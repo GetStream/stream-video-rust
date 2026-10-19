@@ -7,14 +7,13 @@
 //! cannot set `g_lag_in_frames = 0` (VP9 otherwise buffers frames and emits
 //! nothing per call) or force keyframes (the backend publisher can't answer a
 //! subscriber's PLI, so a static image would only ever produce one keyframe
-//! that late subscribers miss). This module binds `libvpx` directly (via
-//! `env-libvpx-sys`, exposed as `vpx_sys`) with the correct realtime config.
+//! that late subscribers miss). This module binds `libvpx` directly (via the
+//! bindings in `vpx_sys`) with the correct realtime config.
 //!
 //! [`RemoteTrack::next_video_frame`](crate::rtc::RemoteTrack::next_video_frame)
 //! needs raw frames, not RTP: an agent that wants to *see* the call has to turn
 //! reassembled VP8/VP9 samples into pixels. The decoder symbols come from the
-//! same `env-libvpx-sys` bindings, so inbound video adds no new native
-//! dependency.
+//! same `vpx_sys` bindings, so inbound video adds no new native dependency.
 //!
 //! The libvpx C API is inherently unsafe; every FFI call is wrapped here and the
 //! module surface is safe. libvpx codec contexts are single-threaded but not
@@ -25,18 +24,18 @@ use std::mem::MaybeUninit;
 use std::os::raw::{c_int, c_uint, c_ulong, c_void};
 use std::ptr;
 
-use vpx_sys::vp8e_enc_control_id::{
+use super::vpx_sys::vp8e_enc_control_id::{
     VP8E_SET_CPUUSED, VP9E_GET_SVC_LAYER_ID, VP9E_REGISTER_CX_CALLBACK, VP9E_SET_ROW_MT,
     VP9E_SET_SVC, VP9E_SET_SVC_INTER_LAYER_PRED, VP9E_SET_SVC_PARAMETERS,
 };
-use vpx_sys::vp9e_temporal_layering_mode::{
+use super::vpx_sys::vp9e_temporal_layering_mode::{
     VP9E_TEMPORAL_LAYERING_MODE_0101, VP9E_TEMPORAL_LAYERING_MODE_0212,
     VP9E_TEMPORAL_LAYERING_MODE_NOLAYERING,
 };
-use vpx_sys::vpx_codec_cx_pkt_kind::VPX_CODEC_CX_FRAME_PKT;
-use vpx_sys::vpx_img_fmt::VPX_IMG_FMT_I420;
-use vpx_sys::vpx_rc_mode::VPX_CBR;
-use vpx_sys::*;
+use super::vpx_sys::vpx_codec_cx_pkt_kind::VPX_CODEC_CX_FRAME_PKT;
+use super::vpx_sys::vpx_img_fmt::VPX_IMG_FMT_I420;
+use super::vpx_sys::vpx_rc_mode::VPX_CBR;
+use super::vpx_sys::*;
 
 use crate::rtc::error::{Result, RtcError};
 use crate::rtc::video_frame::{VideoFrame, i420_len};
@@ -44,6 +43,10 @@ use crate::rtc::video_frame::{VideoFrame, i420_len};
 /// Decoder worker threads. Two is enough to keep up with the 360p–720p an agent
 /// subscribes to without competing with the rest of the runtime for cores.
 const DECODE_THREADS: c_uint = 2;
+
+/// The largest frame side a decoder accepts. libvpx applies the same limit
+/// (`--size-limit` in `build.rs`) to VP9 but not to the VP8 decoder.
+const MAX_DECODE_SIDE: c_uint = 4_096;
 
 /// Which VPx codec a [`VpxEncoder`] produces.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -665,6 +668,7 @@ impl Drop for VpxSvcEncoder {
 /// A libvpx VP8/VP9 decoder producing packed I420 [`VideoFrame`]s.
 pub(crate) struct VpxDecoder {
     ctx: vpx_codec_ctx_t,
+    codec: VpxCodec,
 }
 
 // SAFETY: `vpx_codec_ctx_t` holds raw pointers into libvpx internal state, which
@@ -712,6 +716,7 @@ impl VpxDecoder {
             )?;
             Ok(Self {
                 ctx: ctx.assume_init(),
+                codec,
             })
         }
     }
@@ -725,6 +730,34 @@ impl VpxDecoder {
     pub(crate) fn decode(&mut self, data: &[u8], rtp_timestamp: u32) -> Result<Vec<VideoFrame>> {
         if data.is_empty() {
             return Ok(Vec::new());
+        }
+        // A VP8 frame changes its size only on a keyframe.
+        if self.codec == VpxCodec::Vp8 {
+            let mut info = vpx_codec_stream_info_t {
+                sz: std::mem::size_of::<vpx_codec_stream_info_t>() as c_uint,
+                w: 0,
+                h: 0,
+                is_kf: 0,
+            };
+            // SAFETY: the interface is a static libvpx pointer, libvpx only
+            // reads `data` during the call, and `info.sz` is the size of `info`.
+            let peeked = unsafe {
+                vpx_codec_peek_stream_info(
+                    vpx_codec_vp8_dx(),
+                    data.as_ptr(),
+                    data.len() as c_uint,
+                    &mut info,
+                )
+            };
+            if peeked == vpx_codec_err_t::VPX_CODEC_OK
+                && info.is_kf != 0
+                && (info.w > MAX_DECODE_SIDE || info.h > MAX_DECODE_SIDE)
+            {
+                return Err(RtcError::Media(format!(
+                    "VP8 keyframe of {}x{} is larger than {MAX_DECODE_SIDE}x{MAX_DECODE_SIDE}",
+                    info.w, info.h
+                )));
+            }
         }
 
         // SAFETY: `data` is a valid slice libvpx only reads for the duration of
@@ -1108,5 +1141,31 @@ mod tests {
     fn garbage_input_is_an_error_not_a_panic() {
         let mut dec = VpxDecoder::new(VpxCodec::Vp9).expect("decoder");
         assert!(dec.decode(&[0xff; 32], 0).is_err());
+    }
+
+    /// libvpx is built with `--size-limit=4096x4096`, which also limits the
+    /// VP9 encoder.
+    #[test]
+    fn a_vp9_frame_wider_than_4096_is_an_encode_error() {
+        let mut enc = VpxEncoder::new(VpxCodec::Vp9, 4_112, 16, 1_000).expect("encoder");
+
+        assert!(enc.encode(&ramp_i420(4_112, 16), 0, 33, true).is_err());
+    }
+
+    /// The libvpx size limit does not cover the VP8 decoder, so `decode`
+    /// rejects a larger VP8 keyframe itself.
+    #[test]
+    fn vp8_decoder_rejects_a_keyframe_wider_than_4096() {
+        let mut enc = VpxEncoder::new(VpxCodec::Vp8, 4_112, 16, 1_000).expect("encoder");
+        let mut dec = VpxDecoder::new(VpxCodec::Vp8).expect("decoder");
+        let packets = enc
+            .encode(&ramp_i420(4_112, 16), 0, 33, true)
+            .expect("encode");
+
+        assert!(
+            packets
+                .iter()
+                .any(|packet| dec.decode(&packet.data, 0).is_err())
+        );
     }
 }

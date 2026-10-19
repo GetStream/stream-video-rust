@@ -16,6 +16,7 @@ use getstream::rtc::{PcmFrame, StreamResampler};
 #[path = "support/rtc_sources.rs"]
 mod rtc;
 
+use rtc::codecs::opus;
 use rtc::codecs::rtp_vpx::VpxRtpPacketizer;
 use rtc::codecs::vpx::{VpxCodec, VpxDecoder, VpxEncoder};
 

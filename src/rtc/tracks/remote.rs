@@ -35,6 +35,7 @@ use webrtc::rtp::packetizer::Depacketizer;
 use webrtc::track::track_remote::TrackRemote;
 
 use super::local::RtpPacket;
+use crate::rtc::codecs::opus;
 use crate::rtc::codecs::vpx::{VpxCodec, VpxDecoder};
 use crate::rtc::error::{Result, RtcError};
 use crate::rtc::pcm::{FRAME_SAMPLES_20MS, OPUS_SAMPLE_RATE, PcmFrame};

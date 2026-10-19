@@ -10,6 +10,7 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
+use super::codecs::opus;
 use super::proto::models::{self, ErrorCode, WebsocketReconnectStrategy};
 
 /// Result alias for RTC operations.

@@ -1,6 +1,9 @@
 # Rust build artifacts
 /target
 
+# Prebuilt codec archives: CI adds them to the published package only
+/native/
+
 # Environment / secrets — never commit the real .env (see .env.example, which IS tracked)
 .env
 .env.local
