@@ -209,6 +209,9 @@ on `Call` (`get_call_participant_session_metrics`,
   libvpx enum (for example -1 from the VP8 decoder) was read as a Rust enum, and
   the VP9 SVC callback used a buffer pointer that the Rust aliasing rules made
   invalid.
+- A remote video stream can no longer fill memory with a burst of frames. The
+  decoded frames that wait for `next_video_frame` hold at most 64 MiB: older
+  frames over this budget are dropped, and the newest frame always stays.
 - After a join or a reconnect, `sfu_events()` gives `ParticipantJoined`,
   `ParticipantUpdated` and `ParticipantLeft` only for the participants that
   changed since the previous join response. Before, each join response sent
