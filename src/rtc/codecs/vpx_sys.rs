@@ -171,20 +171,21 @@ unsafe extern "C" {
 unsafe extern "C" {
     pub fn vpx_img_free(img: *mut vpx_image_t);
 }
-#[repr(u32)]
-#[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
-pub enum vpx_codec_err_t {
-    VPX_CODEC_OK = 0,
-    VPX_CODEC_ERROR = 1,
-    VPX_CODEC_MEM_ERROR = 2,
-    VPX_CODEC_ABI_MISMATCH = 3,
-    VPX_CODEC_INCAPABLE = 4,
-    VPX_CODEC_UNSUP_BITSTREAM = 5,
-    VPX_CODEC_UNSUP_FEATURE = 6,
-    VPX_CODEC_CORRUPT_FRAME = 7,
-    VPX_CODEC_INVALID_PARAM = 8,
-    VPX_CODEC_LIST_END = 9,
+impl vpx_codec_err_t {
+    pub const VPX_CODEC_OK: vpx_codec_err_t = vpx_codec_err_t(0);
+    pub const VPX_CODEC_ERROR: vpx_codec_err_t = vpx_codec_err_t(1);
+    pub const VPX_CODEC_MEM_ERROR: vpx_codec_err_t = vpx_codec_err_t(2);
+    pub const VPX_CODEC_ABI_MISMATCH: vpx_codec_err_t = vpx_codec_err_t(3);
+    pub const VPX_CODEC_INCAPABLE: vpx_codec_err_t = vpx_codec_err_t(4);
+    pub const VPX_CODEC_UNSUP_BITSTREAM: vpx_codec_err_t = vpx_codec_err_t(5);
+    pub const VPX_CODEC_UNSUP_FEATURE: vpx_codec_err_t = vpx_codec_err_t(6);
+    pub const VPX_CODEC_CORRUPT_FRAME: vpx_codec_err_t = vpx_codec_err_t(7);
+    pub const VPX_CODEC_INVALID_PARAM: vpx_codec_err_t = vpx_codec_err_t(8);
+    pub const VPX_CODEC_LIST_END: vpx_codec_err_t = vpx_codec_err_t(9);
 }
+#[repr(transparent)]
+#[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
+pub struct vpx_codec_err_t(pub ::std::os::raw::c_uint);
 pub type vpx_codec_caps_t = ::std::os::raw::c_long;
 pub type vpx_codec_flags_t = ::std::os::raw::c_long;
 #[repr(C)]

@@ -186,13 +186,15 @@ unsafe extern "C" fn collect_svc_packet(pkt: *mut vpx_codec_cx_pkt_t, user_data:
     });
 }
 
-/// Turn a libvpx `vpx_codec_err_t` into a `Result`. The enum is `repr(i32)`, so
-/// a non-zero discriminant is an error (`VPX_CODEC_OK == 0`).
+/// Turn a libvpx `vpx_codec_err_t` into a `Result`. libvpx can return a value
+/// outside its enum (`vp8_decode` returns -1), so the bindings keep the C
+/// integer, and every value other than `VPX_CODEC_OK` is an error.
 fn check(res: vpx_codec_err_t, what: &str) -> Result<()> {
-    let code: i32 = res as i32;
-    if code == 0 {
+    if res == vpx_codec_err_t::VPX_CODEC_OK {
         Ok(())
     } else {
+        // The C value -1 shows as -1.
+        let code = res.0 as i32;
         Err(RtcError::Media(format!(
             "libvpx {what} failed (code {code})"
         )))
@@ -1137,6 +1139,12 @@ mod tests {
     fn empty_input_yields_no_frames() {
         let mut dec = VpxDecoder::new(VpxCodec::Vp9).expect("decoder");
         assert!(dec.decode(&[], 0).expect("decode empty").is_empty());
+    }
+
+    /// libvpx can return a code outside its enum: `vp8_decode` returns -1.
+    #[test]
+    fn an_unknown_libvpx_code_is_an_error() {
+        assert!(check(vpx_codec_err_t(u32::MAX), "decode").is_err());
     }
 
     #[test]
