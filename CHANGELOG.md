@@ -204,6 +204,11 @@ on `Call` (`get_call_participant_session_metrics`,
 
 ## Fixes
 
+- The libvpx wrappers no longer have undefined behavior in 3 cases: an encoder
+  read an uninitialized field of its libvpx context, an error code outside the
+  libvpx enum (for example -1 from the VP8 decoder) was read as a Rust enum, and
+  the VP9 SVC callback used a buffer pointer that the Rust aliasing rules made
+  invalid.
 - After a join or a reconnect, `sfu_events()` gives `ParticipantJoined`,
   `ParticipantUpdated` and `ParticipantLeft` only for the participants that
   changed since the previous join response. Before, each join response sent
