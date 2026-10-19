@@ -64,19 +64,31 @@ are exempt from compatibility guarantees.
 
 ## Requirements
 
-The WebRTC media stack is part of every build. Install Rust 1.88 or newer, a C
-compiler, CMake, `pkg-config`, and `libvpx` before building:
+The WebRTC media stack is part of every build. Install Rust 1.88 or newer and a
+C compiler:
 
 ```bash
 # macOS
-brew install libvpx cmake pkg-config
+xcode-select --install
 
 # Debian / Ubuntu
-sudo apt install libvpx-dev cmake pkg-config build-essential
+sudo apt install build-essential
+
+# Fedora / RHEL
+sudo dnf install gcc
+
+# Alpine
+apk add gcc musl-dev
 ```
 
-`protoc`, a system libopus package, and external media programs such as
-`ffmpeg` are not required.
+The crate links its own static libvpx 1.17.0 and libopus 1.6.1. A system codec
+package, CMake, `pkg-config`, `protoc`, and external media programs such as
+`ffmpeg` are not required. The supported targets are:
+
+- `x86_64-unknown-linux-gnu` and `aarch64-unknown-linux-gnu` (glibc 2.28 or
+  newer)
+- `x86_64-unknown-linux-musl` and `aarch64-unknown-linux-musl`
+- `aarch64-apple-darwin` (macOS 11 or newer)
 
 ## Installation
 
