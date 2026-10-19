@@ -55,7 +55,7 @@ fn link_codecs() {
     let prebuilt = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("native")
         .join(&target);
-    let dir = if prebuilt.join("libvpx.a").is_file() {
+    let dir = if prebuilt.join("libvpx.a").is_file() && prebuilt.join("libopus.a").is_file() {
         prebuilt
     } else {
         build_codecs(&target)
