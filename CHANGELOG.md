@@ -105,6 +105,18 @@ gets `RtcError::IllegalState`. `push` and `flush` return
 `RtcResult<PcmFrame>` with the same channels as the input. The resampler no
 longer downmixes to mono.
 
+### The crate links its own libvpx and libopus
+
+The package carries prebuilt static libvpx 1.17.0 and libopus 1.6.1, and the
+build links them. It needs only Rust and a C compiler: a system libvpx, CMake,
+and `pkg-config` are not used, and a program has no codec library dependency at
+run time. The prebuilt targets are `x86_64` and `aarch64` Linux with glibc 2.28
+or newer or with musl, and `aarch64-apple-darwin` (macOS 11 or newer). On
+another target, the build stops with an error.
+
+A frame side is limited to 4096 pixels: a VP9 track cannot publish a larger
+frame, and the VP8 and VP9 decoders return an error for a larger remote frame.
+
 ## New Features
 
 ### The pacer plays the end of the PCM
