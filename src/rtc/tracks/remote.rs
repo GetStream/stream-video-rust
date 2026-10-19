@@ -46,6 +46,10 @@ use crate::rtc::video_frame::VideoFrame;
 /// to be filled (by NACK/RTX or a reordered arrival) before giving up on a
 /// frame. ~1 s of 30 fps video fragmented at MTU.
 const VIDEO_MAX_LATE: u16 = 200;
+/// The most decoded video, in bytes, that waits for the caller. A burst of up to
+/// [`VIDEO_MAX_LATE`] samples can decode to as many frames, so older frames over
+/// this budget are dropped. The newest frame always stays.
+const VIDEO_MAX_READY_BYTES: usize = 64 << 20;
 /// Longest run of missing audio packets this track fills in. A longer gap counts
 /// as a break in the stream and is not filled.
 const AUDIO_MAX_FILLED_PACKETS: u16 = 10;
@@ -765,6 +769,7 @@ impl VideoDecode {
                             self.last_resolution = Some(resolution);
                         }
                         self.ready.push_back(frame);
+                        self.trim_ready();
                     }
                 }
                 Err(e) => {
@@ -775,6 +780,17 @@ impl VideoDecode {
             }
         }
         needs_keyframe || self.stall_timed_out(now)
+    }
+
+    /// Drops the oldest decoded frames while `ready` holds more than
+    /// [`VIDEO_MAX_READY_BYTES`], but never the newest frame.
+    fn trim_ready(&mut self) {
+        let mut bytes: usize = self.ready.iter().map(|frame| frame.data.len()).sum();
+        while bytes > VIDEO_MAX_READY_BYTES && self.ready.len() > 1 {
+            if let Some(oldest) = self.ready.pop_front() {
+                bytes -= oldest.data.len();
+            }
+        }
     }
 
     /// Whether a [`VIDEO_STALL_TIMEOUT`] without a decoded frame ended at `now`.
@@ -947,6 +963,37 @@ mod tests {
         // The last frame completes only when a packet of a later frame arrives.
         assert!(pictures > 3, "the encoder must emit inter frames");
         assert_eq!(state.ready.len(), usize::from(pictures) - 1);
+    }
+
+    #[test]
+    fn a_burst_of_decoded_frames_keeps_the_newest_within_the_ready_budget() {
+        let (width, height) = (1920, 1080);
+        let mut encoder =
+            VpxEncoder::new(VpxCodec::Vp9, width, height, 2_000).expect("vp9 encoder");
+        let image = vec![128u8; (width * height * 3 / 2) as usize];
+        let keyframe = encoder.encode(&image, 0, 33, true).expect("encode");
+        let state = vp9_decode();
+        let mut state = state.lock().expect("video decode state");
+        // After the keyframe, each one-byte VP9 frame (show_existing_frame)
+        // shows it again: 41 full pictures from a few KB.
+        let samples = std::iter::once(Bytes::from(keyframe[0].data.clone()))
+            .chain((0..40).map(|_| Bytes::from_static(&[0x88])))
+            .enumerate()
+            .map(|(index, data)| webrtc::media::Sample {
+                data,
+                packet_timestamp: index as u32,
+                ..Default::default()
+            })
+            .collect();
+
+        state.decode_samples(samples, Instant::now());
+
+        let kept: usize = state.ready.iter().map(|frame| frame.data.len()).sum();
+        assert!(kept <= VIDEO_MAX_READY_BYTES, "{kept} bytes kept");
+        assert_eq!(
+            state.ready.back().map(|frame| frame.rtp_timestamp),
+            Some(40)
+        );
     }
 
     fn vp9_decode() -> Arc<StdMutex<VideoDecode>> {
