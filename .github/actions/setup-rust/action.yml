@@ -1,5 +1,5 @@
 name: Set up Rust
-description: Install the selected Rust toolchain and native codec dependencies
+description: Install the selected Rust toolchain and the codec build tools
 
 inputs:
   toolchain:
@@ -13,21 +13,12 @@ inputs:
 runs:
   using: composite
   steps:
-    - name: Install Linux dependencies
-      if: runner.os == 'Linux'
+    # A git checkout builds libvpx in build.rs, which needs nasm on x86_64. The
+    # runner images already have a C compiler, make and perl.
+    - name: Install nasm
+      if: runner.os == 'Linux' && runner.arch == 'X64'
       shell: bash
-      run: |
-        sudo apt-get update
-        sudo apt-get install --yes --no-install-recommends \
-          build-essential clang cmake libvpx-dev pkg-config
-
-    # `libvpx` is linked from the system (env-libvpx-sys + pkg-config); cmake and
-    # a C compiler build the vendored libopus. The macOS images already ship
-    # clang and pkg-config.
-    - name: Install macOS dependencies
-      if: runner.os == 'macOS'
-      shell: bash
-      run: brew install libvpx cmake pkg-config
+      run: sudo apt-get update && sudo apt-get install --yes --no-install-recommends nasm
 
     - name: Install Rust toolchain
       uses: actions-rust-lang/setup-rust-toolchain@v1

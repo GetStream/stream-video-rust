@@ -67,6 +67,55 @@ jobs:
       - run: cargo test --locked --no-run
       - run: cargo build --locked --examples
 
+  codecs:
+    uses: ./.github/workflows/codecs.yml
+
+  # The unit tests of the package that users download, with the prebuilt codec
+  # archives, on Linux distributions that have only Rust and a C compiler: the
+  # package needs no other system package and links no codec library at run
+  # time.
+  platforms:
+    name: Platform (${{ matrix.image }}, ${{ matrix.arch }})
+    needs: codecs
+    runs-on: ${{ matrix.arch == 'aarch64' && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x86_64]
+        image:
+          - debian:11
+          - debian:12
+          - ubuntu:22.04
+          - ubuntu:24.04
+          - almalinux:8
+          - almalinux:9
+          - fedora:latest
+          - alpine:latest
+        include:
+          - { arch: aarch64, image: "debian:12" }
+          - { arch: aarch64, image: "alpine:latest" }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-rust
+        with:
+          toolchain: stable
+      - uses: actions/download-artifact@v4
+        with:
+          path: native
+      # `native/` is ignored by git, so its files count as uncommitted changes.
+      - name: Package
+        run: |
+          cargo package --locked --no-verify --allow-dirty
+          mkdir package
+          tar xzf target/package/getstream-*.crate -C package --strip-components=1
+      # `docker run` instead of a job container: JavaScript actions cannot run
+      # in an Alpine (musl) container.
+      - name: Test
+        run: >
+          docker run --rm -v "$PWD/package:/w" -v "$PWD/.github/scripts:/scripts:ro" -w /w
+          "${{ matrix.image }}" sh /scripts/test-package.sh
+
   msrv:
     name: MSRV
     runs-on: ubuntu-latest
@@ -78,7 +127,8 @@ jobs:
           toolchain: "1.88.0"
       - run: cargo check --locked --all-targets
 
-  # The crate's `unsafe` is all libvpx FFI, which Miri refuses to execute.
+  # The crate's `unsafe` is all libvpx and libopus FFI, which Miri refuses to
+  # execute.
   # Scoped to the codec tests: the other C dependencies hold one-time
   # allocations that LeakSanitizer reports as leaks.
   sanitizers:
@@ -99,6 +149,6 @@ jobs:
           cargo test --locked --lib
           -Zbuild-std
           --target x86_64-unknown-linux-gnu
-          rtc::codecs::vpx
+          rtc::codecs
         env:
           RUSTFLAGS: -Zsanitizer=${{ matrix.sanitizer }}
