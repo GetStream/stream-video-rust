@@ -114,6 +114,10 @@ run time. The prebuilt targets are `x86_64` and `aarch64` Linux with glibc 2.28
 or newer or with musl, and `aarch64-apple-darwin` (macOS 11 or newer). On
 another target, the build stops with an error.
 
+When the archives for the target are missing or incomplete, for example in a
+git checkout, the build downloads the pinned sources, checks their SHA-256, and
+builds them. This needs network access, and `nasm` on `x86_64`.
+
 A frame side is limited to 4096 pixels: a VP9 track cannot publish a larger
 frame, and the VP8 and VP9 decoders return an error for a larger remote frame.
 
