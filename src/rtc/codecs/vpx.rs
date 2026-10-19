@@ -209,11 +209,12 @@ impl VpxEncoder {
             )));
         }
 
-        // SAFETY: `iface` is a static libvpx interface pointer. `cfg` and `ctx`
-        // are left uninitialized and populated by `vpx_codec_enc_config_default`
-        // / `vpx_codec_enc_init_ver` before `assume_init` reads them (the config
-        // struct holds niche enums like `vpx_bit_depth`, so it must never be
-        // constructed by zeroing). All pointers are valid for each call's scope.
+        // SAFETY: `iface` is a static libvpx interface pointer.
+        // `vpx_codec_enc_config_default` fills `cfg` before `assume_init` reads
+        // it (the config struct holds niche enums like `vpx_bit_depth`, so it
+        // must never be constructed by zeroing). `ctx` starts zeroed because
+        // `vpx_codec_enc_init_ver` does not write every field (`err_detail`).
+        // All pointers are valid for each call's scope.
         unsafe {
             let iface = match codec {
                 VpxCodec::Vp8 => vpx_codec_vp8_cx(),
@@ -243,7 +244,7 @@ impl VpxEncoder {
             cfg.g_threads = 4;
             cfg.g_error_resilient = VPX_ERROR_RESILIENT_DEFAULT;
 
-            let mut ctx = MaybeUninit::<vpx_codec_ctx_t>::uninit();
+            let mut ctx = MaybeUninit::<vpx_codec_ctx_t>::zeroed();
             check(
                 vpx_codec_enc_init_ver(
                     ctx.as_mut_ptr(),
@@ -378,9 +379,10 @@ impl VpxSvcEncoder {
             failed: false,
         });
 
-        // SAFETY: the libvpx interface pointer is static. `cfg` and `ctx` are
-        // initialized by their respective C constructors before being read.
-        // The callback's `user_priv` points into a Box whose allocation remains
+        // SAFETY: the libvpx interface pointer is static.
+        // `vpx_codec_enc_config_default` fills `cfg` before it is read, and
+        // `ctx` starts zeroed because `vpx_codec_enc_init_ver` does not write
+        // every field (`err_detail`). The callback's `user_priv` points into a Box whose allocation remains
         // stable until after this context is destroyed. Every C call is
         // synchronous and all pointer arguments remain live for its duration.
         unsafe {
@@ -453,7 +455,7 @@ impl VpxSvcEncoder {
                 }
             }
 
-            let mut ctx = MaybeUninit::<vpx_codec_ctx_t>::uninit();
+            let mut ctx = MaybeUninit::<vpx_codec_ctx_t>::zeroed();
             check(
                 vpx_codec_enc_init_ver(
                     ctx.as_mut_ptr(),
