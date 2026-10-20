@@ -224,9 +224,10 @@ impl RtcCore {
     pub async fn stop_publish(self: &Arc<Self>, track: LocalTrack) -> Result<()> {
         let mut media = self.media.lock().await;
         let track_id = track.track_id();
-        if media.position(&track_id).is_none() {
+        let Some(position) = media.position(&track_id) else {
             return Ok(());
-        }
+        };
+        let track_type = media.publications[position].track.track_type();
         let Some((_publisher, signal, session_id, _publish_options)) =
             self.publisher_handles().await
         else {
@@ -242,7 +243,6 @@ impl RtcCore {
         media.set_status(&track_id, PublicationStatus::PendingStopMute);
         track.stop();
 
-        let track_type = track.track_type();
         let muted = !media
             .active_tracks()
             .iter()
