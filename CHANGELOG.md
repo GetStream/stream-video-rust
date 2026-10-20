@@ -1,3 +1,13 @@
+# Unreleased
+
+## Fixes
+
+- `stop_publish` uses the track type of the publication, not the track type of
+  its argument. Before, a screen share stopped with `LocalTrack::from(track)`
+  sent a mute for `VIDEO`, and the screen share stayed published for the other
+  participants. Screen-share audio stopped as `LocalTrack::Audio` had the same
+  problem.
+
 # v0.1.0
 
 First release without a pre-release suffix. The code is the same as in
