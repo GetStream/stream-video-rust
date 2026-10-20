@@ -1,6 +1,6 @@
 [package]
 name = "getstream"
-version = "0.1.0-preview.3"
+version = "0.1.0"
 edition = "2024"
 rust-version = "1.88"
 # Cargo then rejects a second crate that links libvpx: its bindings would use
