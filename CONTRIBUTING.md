@@ -7,16 +7,22 @@ scope.
 
 ## Local setup
 
-Use Rust 1.88 or newer. The media stack also needs a C compiler, CMake,
-`pkg-config`, and libvpx:
+Use Rust 1.88 or newer. A git checkout has no prebuilt codec archives, so the
+first build downloads the pinned libvpx and libopus sources and builds them
+with `configure` and `make`. This needs network access, a C compiler, `make`,
+`perl`, and `nasm` on x86_64:
 
 ```bash
-# macOS
-brew install libvpx cmake pkg-config
+# macOS (arm64 needs no nasm)
+xcode-select --install
 
 # Debian / Ubuntu
-sudo apt install libvpx-dev cmake pkg-config build-essential
+sudo apt install build-essential perl nasm
 ```
+
+The sources and the build stay in Cargo's `OUT_DIR`, so a later build reuses
+them without network access. Each `OUT_DIR` has its own copy: `cargo build`,
+`cargo test` and the editor's `cargo check` can each build the codecs once.
 
 Clone the repository, then build all targets:
 
@@ -90,6 +96,25 @@ cargo bench --bench timer_drift
 
 Use benchmark results to evaluate a measured media-path change; do not treat a
 single machine's timing as a portable SDK guarantee.
+
+## Codec libraries
+
+`build.rs` pins the libvpx and libopus sources (`LIBVPX` and `OPUS`: URL and
+SHA-256). The published package carries prebuilt archives in `native/<target>`,
+and `build.rs` links them when they are present. Git ignores `native/`: the
+Publish workflow fills it from the Codecs workflow, which builds each target
+with `build.rs` (glibc in manylinux_2_28, musl in Alpine, macOS on a macOS
+runner). To update a codec:
+
+1. Change the `LIBVPX` or `OPUS` source in `build.rs`. For libvpx, take the
+   SHA-256 of the GitHub tag archive and check its commit with
+   `gzip -dc <archive> | git get-tar-commit-id`. For opus, use the SHA-256 in
+   `downloads.xiph.org/releases/opus/SHA256SUMS.txt`.
+2. For libvpx, regenerate `src/rtc/codecs/vpx_sys.rs` with the bindgen command
+   in `src/rtc/codecs/mod.rs`.
+3. Run the Codecs workflow, put its artifacts in `native/`, run
+   `cargo package --allow-dirty`, and check that the compressed size stays below
+   the crates.io limit of 10 MB. The five targets use about 7 MB.
 
 ## Publishing
 

@@ -56,6 +56,7 @@ use webrtc::track::track_local::TrackLocalWriter;
 use webrtc::track::track_local::track_local_static_rtp::TrackLocalStaticRTP;
 
 use super::layers::{PlannedVideoLayer, simulcast_layers, single_layer};
+use crate::rtc::codecs::opus;
 use crate::rtc::codecs::rtp_vpx::VpxRtpPacketizer;
 use crate::rtc::codecs::vpx::{Vp9SvcMode, VpxCodec, VpxEncoder, VpxSvcEncoder};
 use crate::rtc::error::{Result, RtcError};

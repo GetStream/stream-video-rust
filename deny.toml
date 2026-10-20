@@ -23,10 +23,6 @@ allow = [
     "ISC",
     "Zlib",
     "Unicode-3.0",
-    # `env-libvpx-sys` (our libvpx binding) is MPL-2.0: weak, file-level copyleft
-    # that applies only to that crate's own source, never to code that merely
-    # depends on it.
-    "MPL-2.0",
     # The Mozilla CA root bundle shipped by `webpki-roots` is data under the
     # Community Data License Agreement – Permissive 2.0.
     "CDLA-Permissive-2.0",

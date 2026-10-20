@@ -2,6 +2,7 @@
 
 use super::*;
 use crate::client::ClientConfig;
+use crate::rtc::codecs::opus;
 use crate::rtc::stats::tests::run_then_delete;
 use crate::rtc::{
     ClientPublishOptions, LocalAudioTrack, LocalVideoTrack, PcmFrame, PreferredVideoCodec,

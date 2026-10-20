@@ -2,6 +2,11 @@
 
 use std::time::Duration;
 
+#[path = "support/rtc_sources.rs"]
+mod rtc;
+
+use rtc::codecs::opus;
+
 const PERIOD: Duration = Duration::from_millis(20);
 const TICKS: usize = 500;
 

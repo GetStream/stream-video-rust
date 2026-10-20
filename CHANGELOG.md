@@ -105,6 +105,22 @@ gets `RtcError::IllegalState`. `push` and `flush` return
 `RtcResult<PcmFrame>` with the same channels as the input. The resampler no
 longer downmixes to mono.
 
+### The crate links its own libvpx and libopus
+
+The package carries prebuilt static libvpx 1.17.0 and libopus 1.6.1, and the
+build links them. It needs only Rust and a C compiler: a system libvpx, CMake,
+and `pkg-config` are not used, and a program has no codec library dependency at
+run time. The prebuilt targets are `x86_64` and `aarch64` Linux with glibc 2.28
+or newer or with musl, and `aarch64-apple-darwin` (macOS 11 or newer). On
+another target, the build stops with an error.
+
+When the archives for the target are missing or incomplete, for example in a
+git checkout, the build downloads the pinned sources, checks their SHA-256, and
+builds them. This needs network access, and `nasm` on `x86_64`.
+
+A frame side is limited to 4096 pixels: a VP9 track cannot publish a larger
+frame, and the VP8 and VP9 decoders return an error for a larger remote frame.
+
 ## New Features
 
 ### The pacer plays the end of the PCM
@@ -192,6 +208,14 @@ on `Call` (`get_call_participant_session_metrics`,
 
 ## Fixes
 
+- The libvpx wrappers no longer have undefined behavior in 3 cases: an encoder
+  read an uninitialized field of its libvpx context, an error code outside the
+  libvpx enum (for example -1 from the VP8 decoder) was read as a Rust enum, and
+  the VP9 SVC callback used a buffer pointer that the Rust aliasing rules made
+  invalid.
+- A remote video stream can no longer fill memory with a burst of frames. The
+  decoded frames that wait for `next_video_frame` hold at most 64 MiB: older
+  frames over this budget are dropped, and the newest frame always stays.
 - After a join or a reconnect, `sfu_events()` gives `ParticipantJoined`,
   `ParticipantUpdated` and `ParticipantLeft` only for the participants that
   changed since the previous join response. Before, each join response sent

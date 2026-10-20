@@ -7,14 +7,13 @@
 //! cannot set `g_lag_in_frames = 0` (VP9 otherwise buffers frames and emits
 //! nothing per call) or force keyframes (the backend publisher can't answer a
 //! subscriber's PLI, so a static image would only ever produce one keyframe
-//! that late subscribers miss). This module binds `libvpx` directly (via
-//! `env-libvpx-sys`, exposed as `vpx_sys`) with the correct realtime config.
+//! that late subscribers miss). This module binds `libvpx` directly (via the
+//! bindings in `vpx_sys`) with the correct realtime config.
 //!
 //! [`RemoteTrack::next_video_frame`](crate::rtc::RemoteTrack::next_video_frame)
 //! needs raw frames, not RTP: an agent that wants to *see* the call has to turn
 //! reassembled VP8/VP9 samples into pixels. The decoder symbols come from the
-//! same `env-libvpx-sys` bindings, so inbound video adds no new native
-//! dependency.
+//! same `vpx_sys` bindings, so inbound video adds no new native dependency.
 //!
 //! The libvpx C API is inherently unsafe; every FFI call is wrapped here and the
 //! module surface is safe. libvpx codec contexts are single-threaded but not
@@ -23,20 +22,20 @@
 
 use std::mem::MaybeUninit;
 use std::os::raw::{c_int, c_uint, c_ulong, c_void};
-use std::ptr;
+use std::ptr::{self, NonNull};
 
-use vpx_sys::vp8e_enc_control_id::{
+use super::vpx_sys::vp8e_enc_control_id::{
     VP8E_SET_CPUUSED, VP9E_GET_SVC_LAYER_ID, VP9E_REGISTER_CX_CALLBACK, VP9E_SET_ROW_MT,
     VP9E_SET_SVC, VP9E_SET_SVC_INTER_LAYER_PRED, VP9E_SET_SVC_PARAMETERS,
 };
-use vpx_sys::vp9e_temporal_layering_mode::{
+use super::vpx_sys::vp9e_temporal_layering_mode::{
     VP9E_TEMPORAL_LAYERING_MODE_0101, VP9E_TEMPORAL_LAYERING_MODE_0212,
     VP9E_TEMPORAL_LAYERING_MODE_NOLAYERING,
 };
-use vpx_sys::vpx_codec_cx_pkt_kind::VPX_CODEC_CX_FRAME_PKT;
-use vpx_sys::vpx_img_fmt::VPX_IMG_FMT_I420;
-use vpx_sys::vpx_rc_mode::VPX_CBR;
-use vpx_sys::*;
+use super::vpx_sys::vpx_codec_cx_pkt_kind::VPX_CODEC_CX_FRAME_PKT;
+use super::vpx_sys::vpx_img_fmt::VPX_IMG_FMT_I420;
+use super::vpx_sys::vpx_rc_mode::VPX_CBR;
+use super::vpx_sys::*;
 
 use crate::rtc::error::{Result, RtcError};
 use crate::rtc::video_frame::{VideoFrame, i420_len};
@@ -44,6 +43,10 @@ use crate::rtc::video_frame::{VideoFrame, i420_len};
 /// Decoder worker threads. Two is enough to keep up with the 360p–720p an agent
 /// subscribes to without competing with the rest of the runtime for cores.
 const DECODE_THREADS: c_uint = 2;
+
+/// The largest frame side a decoder accepts. libvpx applies the same limit
+/// (`--size-limit` in `build.rs`) to VP9 but not to the VP8 decoder.
+const MAX_DECODE_SIDE: c_uint = 4_096;
 
 /// Which VPx codec a [`VpxEncoder`] produces.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -110,7 +113,9 @@ pub(crate) struct VpxSvcEncoder {
     width: u32,
     height: u32,
     mode: Vp9SvcMode,
-    callback: Box<SvcCallbackBuffer>,
+    /// From `Box::leak`, freed in `Drop` after `vpx_codec_destroy`. libvpx
+    /// holds the same pointer as `user_priv`, so every access goes through it.
+    callback: NonNull<SvcCallbackBuffer>,
 }
 
 // SAFETY: `vpx_codec_ctx_t` holds raw pointers into libvpx internal state, which
@@ -130,10 +135,10 @@ unsafe extern "C" fn collect_svc_packet(pkt: *mut vpx_codec_cx_pkt_t, user_data:
     if pkt.is_null() || user_data.is_null() {
         return;
     }
-    // SAFETY: `user_data` is the stable pointer to this encoder's boxed
-    // `SvcCallbackBuffer`, registered during construction and kept alive until
-    // after `vpx_codec_destroy`. libvpx invokes this callback synchronously and
-    // never concurrently for a single encoder context.
+    // SAFETY: `user_data` is this encoder's `callback` pointer, registered
+    // during construction and freed only after `vpx_codec_destroy`. libvpx
+    // invokes this callback synchronously inside `vpx_codec_encode`, when no
+    // Rust reference to the buffer exists, and never concurrently.
     let callback = unsafe { &mut *user_data.cast::<SvcCallbackBuffer>() };
     // SAFETY: libvpx supplies a valid packet pointer for the duration of this
     // callback. Reading the frame union member is valid only for frame packets.
@@ -183,13 +188,15 @@ unsafe extern "C" fn collect_svc_packet(pkt: *mut vpx_codec_cx_pkt_t, user_data:
     });
 }
 
-/// Turn a libvpx `vpx_codec_err_t` into a `Result`. The enum is `repr(i32)`, so
-/// a non-zero discriminant is an error (`VPX_CODEC_OK == 0`).
+/// Turn a libvpx `vpx_codec_err_t` into a `Result`. libvpx can return a value
+/// outside its enum (`vp8_decode` returns -1), so the bindings keep the C
+/// integer, and every value other than `VPX_CODEC_OK` is an error.
 fn check(res: vpx_codec_err_t, what: &str) -> Result<()> {
-    let code: i32 = res as i32;
-    if code == 0 {
+    if res == vpx_codec_err_t::VPX_CODEC_OK {
         Ok(())
     } else {
+        // The C value -1 shows as -1.
+        let code = res.0 as i32;
         Err(RtcError::Media(format!(
             "libvpx {what} failed (code {code})"
         )))
@@ -206,11 +213,12 @@ impl VpxEncoder {
             )));
         }
 
-        // SAFETY: `iface` is a static libvpx interface pointer. `cfg` and `ctx`
-        // are left uninitialized and populated by `vpx_codec_enc_config_default`
-        // / `vpx_codec_enc_init_ver` before `assume_init` reads them (the config
-        // struct holds niche enums like `vpx_bit_depth`, so it must never be
-        // constructed by zeroing). All pointers are valid for each call's scope.
+        // SAFETY: `iface` is a static libvpx interface pointer.
+        // `vpx_codec_enc_config_default` fills `cfg` before `assume_init` reads
+        // it (the config struct holds niche enums like `vpx_bit_depth`, so it
+        // must never be constructed by zeroing). `ctx` starts zeroed because
+        // `vpx_codec_enc_init_ver` does not write every field (`err_detail`).
+        // All pointers are valid for each call's scope.
         unsafe {
             let iface = match codec {
                 VpxCodec::Vp8 => vpx_codec_vp8_cx(),
@@ -240,7 +248,7 @@ impl VpxEncoder {
             cfg.g_threads = 4;
             cfg.g_error_resilient = VPX_ERROR_RESILIENT_DEFAULT;
 
-            let mut ctx = MaybeUninit::<vpx_codec_ctx_t>::uninit();
+            let mut ctx = MaybeUninit::<vpx_codec_ctx_t>::zeroed();
             check(
                 vpx_codec_enc_init_ver(
                     ctx.as_mut_ptr(),
@@ -375,11 +383,13 @@ impl VpxSvcEncoder {
             failed: false,
         });
 
-        // SAFETY: the libvpx interface pointer is static. `cfg` and `ctx` are
-        // initialized by their respective C constructors before being read.
-        // The callback's `user_priv` points into a Box whose allocation remains
-        // stable until after this context is destroyed. Every C call is
-        // synchronous and all pointer arguments remain live for its duration.
+        // SAFETY: the libvpx interface pointer is static.
+        // `vpx_codec_enc_config_default` fills `cfg` before it is read, and
+        // `ctx` starts zeroed because `vpx_codec_enc_init_ver` does not write
+        // every field (`err_detail`). The callback's `user_priv` is the
+        // `callback` pointer, which stays valid until `Drop` frees it after
+        // this context is destroyed. Every C call is synchronous and all
+        // pointer arguments remain live for its duration.
         unsafe {
             let iface = vpx_codec_vp9_cx();
             if iface.is_null() {
@@ -450,7 +460,7 @@ impl VpxSvcEncoder {
                 }
             }
 
-            let mut ctx = MaybeUninit::<vpx_codec_ctx_t>::uninit();
+            let mut ctx = MaybeUninit::<vpx_codec_ctx_t>::zeroed();
             check(
                 vpx_codec_enc_init_ver(
                     ctx.as_mut_ptr(),
@@ -469,7 +479,7 @@ impl VpxSvcEncoder {
                 width,
                 height,
                 mode,
-                callback,
+                callback: NonNull::from(Box::leak(callback)),
             };
             check(
                 vpx_codec_control_(&mut encoder.ctx, VP8E_SET_CPUUSED as c_int, 8 as c_int),
@@ -515,7 +525,7 @@ impl VpxSvcEncoder {
             )?;
             let mut pair = vpx_codec_enc_output_cx_cb_pair {
                 output_cx_pkt: Some(collect_svc_packet),
-                user_priv: (&mut *encoder.callback as *mut SvcCallbackBuffer).cast::<c_void>(),
+                user_priv: encoder.callback.as_ptr().cast::<c_void>(),
             };
             check(
                 vpx_codec_control_(
@@ -559,9 +569,13 @@ impl VpxSvcEncoder {
                 self.height
             )));
         }
-        self.callback.frames.clear();
-        self.callback.force_key = force_key;
-        self.callback.failed = false;
+        // SAFETY: `callback` is valid until `Drop`, and `&mut self` makes this
+        // the only access. The reference ends before `vpx_codec_encode`, where
+        // libvpx writes through its copy of the pointer.
+        let callback = unsafe { self.callback.as_mut() };
+        callback.frames.clear();
+        callback.force_key = force_key;
+        callback.failed = false;
         let flags = if force_key {
             VPX_EFLAG_FORCE_KF as vpx_enc_frame_flags_t
         } else {
@@ -599,12 +613,14 @@ impl VpxSvcEncoder {
                 "SVC encode",
             )?;
         }
-        if self.callback.failed {
+        // SAFETY: as above; `vpx_codec_encode` has returned.
+        let callback = unsafe { self.callback.as_mut() };
+        if callback.failed {
             return Err(RtcError::Media(
                 "failed to copy libvpx SVC callback output".to_owned(),
             ));
         }
-        let mut frames = std::mem::take(&mut self.callback.frames);
+        let mut frames = std::mem::take(&mut callback.frames);
         let mut layer_id = vpx_svc_layer_id_t {
             spatial_layer_id: 0,
             temporal_layer_id: 0,
@@ -654,10 +670,11 @@ impl Drop for VpxEncoder {
 impl Drop for VpxSvcEncoder {
     fn drop(&mut self) {
         // SAFETY: `ctx` was initialized successfully before `Self` was built and
-        // is destroyed exactly once. Destruction also unregisters the callback
-        // before its boxed user storage is dropped.
+        // is destroyed exactly once. After the destroy, libvpx holds no copy of
+        // `callback`, which came from `Box::leak` and is freed only here.
         unsafe {
             let _ = vpx_codec_destroy(&mut self.ctx);
+            drop(Box::from_raw(self.callback.as_ptr()));
         }
     }
 }
@@ -665,6 +682,7 @@ impl Drop for VpxSvcEncoder {
 /// A libvpx VP8/VP9 decoder producing packed I420 [`VideoFrame`]s.
 pub(crate) struct VpxDecoder {
     ctx: vpx_codec_ctx_t,
+    codec: VpxCodec,
 }
 
 // SAFETY: `vpx_codec_ctx_t` holds raw pointers into libvpx internal state, which
@@ -712,6 +730,7 @@ impl VpxDecoder {
             )?;
             Ok(Self {
                 ctx: ctx.assume_init(),
+                codec,
             })
         }
     }
@@ -725,6 +744,34 @@ impl VpxDecoder {
     pub(crate) fn decode(&mut self, data: &[u8], rtp_timestamp: u32) -> Result<Vec<VideoFrame>> {
         if data.is_empty() {
             return Ok(Vec::new());
+        }
+        // A VP8 frame changes its size only on a keyframe.
+        if self.codec == VpxCodec::Vp8 {
+            let mut info = vpx_codec_stream_info_t {
+                sz: std::mem::size_of::<vpx_codec_stream_info_t>() as c_uint,
+                w: 0,
+                h: 0,
+                is_kf: 0,
+            };
+            // SAFETY: the interface is a static libvpx pointer, libvpx only
+            // reads `data` during the call, and `info.sz` is the size of `info`.
+            let peeked = unsafe {
+                vpx_codec_peek_stream_info(
+                    vpx_codec_vp8_dx(),
+                    data.as_ptr(),
+                    data.len() as c_uint,
+                    &mut info,
+                )
+            };
+            if peeked == vpx_codec_err_t::VPX_CODEC_OK
+                && info.is_kf != 0
+                && (info.w > MAX_DECODE_SIDE || info.h > MAX_DECODE_SIDE)
+            {
+                return Err(RtcError::Media(format!(
+                    "VP8 keyframe of {}x{} is larger than {MAX_DECODE_SIDE}x{MAX_DECODE_SIDE}",
+                    info.w, info.h
+                )));
+            }
         }
 
         // SAFETY: `data` is a valid slice libvpx only reads for the duration of
@@ -1104,9 +1151,41 @@ mod tests {
         assert!(dec.decode(&[], 0).expect("decode empty").is_empty());
     }
 
+    /// libvpx can return a code outside its enum: `vp8_decode` returns -1.
+    #[test]
+    fn an_unknown_libvpx_code_is_an_error() {
+        assert!(check(vpx_codec_err_t(u32::MAX), "decode").is_err());
+    }
+
     #[test]
     fn garbage_input_is_an_error_not_a_panic() {
         let mut dec = VpxDecoder::new(VpxCodec::Vp9).expect("decoder");
         assert!(dec.decode(&[0xff; 32], 0).is_err());
+    }
+
+    /// libvpx is built with `--size-limit=4096x4096`, which also limits the
+    /// VP9 encoder.
+    #[test]
+    fn a_vp9_frame_wider_than_4096_is_an_encode_error() {
+        let mut enc = VpxEncoder::new(VpxCodec::Vp9, 4_112, 16, 1_000).expect("encoder");
+
+        assert!(enc.encode(&ramp_i420(4_112, 16), 0, 33, true).is_err());
+    }
+
+    /// The libvpx size limit does not cover the VP8 decoder, so `decode`
+    /// rejects a larger VP8 keyframe itself.
+    #[test]
+    fn vp8_decoder_rejects_a_keyframe_wider_than_4096() {
+        let mut enc = VpxEncoder::new(VpxCodec::Vp8, 4_112, 16, 1_000).expect("encoder");
+        let mut dec = VpxDecoder::new(VpxCodec::Vp8).expect("decoder");
+        let packets = enc
+            .encode(&ramp_i420(4_112, 16), 0, 33, true)
+            .expect("encode");
+
+        assert!(
+            packets
+                .iter()
+                .any(|packet| dec.decode(&packet.data, 0).is_err())
+        );
     }
 }
