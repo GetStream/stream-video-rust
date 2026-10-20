@@ -55,7 +55,7 @@ Rust crate, published as [`getstream`](https://crates.io/crates/getstream).
 | [`Call`](https://docs.rs/getstream/latest/getstream/struct.Call.html) / [`VideoClient`](https://docs.rs/getstream/latest/getstream/struct.VideoClient.html) | Video REST and `Call::join` |
 | [`rtc`](https://docs.rs/getstream/latest/getstream/rtc/index.html) | SFU participant, local/remote tracks, and PCM utilities |
 | [`models`](https://docs.rs/getstream/latest/getstream/models/index.html) | REST request and response types |
-| [`ClientConfig`](https://docs.rs/getstream/latest/getstream/struct.ClientConfig.html) | HTTP timeouts, retries, and payload limits |
+| [`ClientConfig`](https://docs.rs/getstream/latest/getstream/struct.ClientConfig.html) / [`NetworkLimits`](https://docs.rs/getstream/latest/getstream/struct.NetworkLimits.html) | HTTP timeouts, retries, and payload limits |
 | [`webhook`](https://docs.rs/getstream/latest/getstream/webhook/index.html) | Signature verification and typed events |
 
 The wire-level `rtc` transport modules (`proto`, `peer`, `sfu`, `tracer`,
@@ -90,10 +90,17 @@ package, CMake, `pkg-config`, `protoc`, and external media programs such as
 - `x86_64-unknown-linux-musl` and `aarch64-unknown-linux-musl`
 - `aarch64-apple-darwin` (macOS 11 or newer)
 
+A git checkout has no prebuilt codec archives. Its first build downloads the
+pinned libvpx and libopus sources and builds them. This needs network access,
+`make`, `perl`, and `nasm` on x86_64. See
+[CONTRIBUTING.md](https://github.com/GetStream/stream-video-rust/blob/main/CONTRIBUTING.md#local-setup)
+for the commands.
+
 ## Installation
 
 ```bash
-cargo add getstream@0.1.0-preview.2 tokio tracing
+cargo add getstream@0.1.0-preview.2 tracing
+cargo add tokio --features macros,rt-multi-thread,signal
 ```
 
 Or in `Cargo.toml`:
@@ -237,6 +244,13 @@ async fn transform_track(
 }
 
 async fn run_media_bridge(call: &Call) -> Result<(), Box<dyn std::error::Error>> {
+    // A track that arrives before `on_track` is not delivered.
+    let (track_tx, mut track_rx) = mpsc::channel(16);
+    call.on_track(move |track| {
+        if track_tx.try_send(track).is_err() {
+            tracing::warn!("dropping track event because the media queue is full");
+        }
+    });
     call.update_subscriptions(SubscriptionConfig::audio_video())
         .await?;
 
@@ -244,13 +258,6 @@ async fn run_media_bridge(call: &Call) -> Result<(), Box<dyn std::error::Error>>
     let outbound_video = LocalVideoTrack::vp9()?;
     call.publish_audio(outbound_audio.clone()).await?;
     call.publish_video(outbound_video.clone()).await?;
-
-    let (track_tx, mut track_rx) = mpsc::channel(16);
-    call.on_track(move |track| {
-        if track_tx.try_send(track).is_err() {
-            tracing::warn!("dropping track event because the media queue is full");
-        }
-    });
 
     let mut track_tasks = JoinSet::new();
     loop {
@@ -365,8 +372,9 @@ fn video_tracks() -> RtcResult<()> {
 }
 ```
 
-Feed raw I420 at the full resolution announced by the SFU publish option; a
-mismatch is rejected instead of advertising dimensions that are not sent.
+For a layered track, feed raw I420 at the full resolution announced by the SFU
+publish option; a mismatch is rejected instead of advertising dimensions that
+are not sent.
 Pre-encoded samples and forwarded RTP remain single-layer-only. Publish a
 screen-share track with `Call::publish_screen_share` and a camera track with
 `Call::publish_video`.
@@ -379,13 +387,14 @@ From the SDK checkout, create your local environment file and add credentials:
 cp .env.example .env
 ```
 
-| Variable | Required by | Purpose |
+| Variable | Used by | Purpose |
 | --- | --- | --- |
 | `STREAM_API_KEY` | Both examples | Public Stream application key |
 | `STREAM_API_SECRET` | Both examples | Server-only Stream application secret |
 | `OPENAI_API_KEY` | `gpt_realtime_bot` | Server-side OpenAI Realtime authentication |
-| `OPENAI_REALTIME_MODEL` | `gpt_realtime_bot` | Realtime model; defaults to `gpt-realtime` |
-| `EXAMPLE_BASE_URL` | `gpt_realtime_bot` only | Base URL used for its printed browser join link |
+| `OPENAI_REALTIME_MODEL` | `gpt_realtime_bot` | Optional. Realtime model; defaults to `gpt-realtime` |
+| `EXAMPLE_BASE_URL` | `gpt_realtime_bot` | Optional. Base URL of the printed browser join link; defaults to `https://getstream.io/video/demos` |
+| `EXAMPLE_CALL_TYPE`, `EXAMPLE_CALL_ID` | Both examples | Optional. The call to join; defaults to `default` and a new random ID |
 
 Join a call as a backend participant:
 
