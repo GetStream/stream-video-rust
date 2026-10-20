@@ -1122,7 +1122,7 @@ dependencies = [
 
 [[package]]
 name = "getstream"
-version = "0.1.0-preview.3"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
