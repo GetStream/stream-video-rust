@@ -1500,6 +1500,78 @@ async fn sole_video_can_be_stopped_and_published_again() {
     .await;
 }
 
+/// A screen share stops when the caller gives it to `stop_publish` as a video track
+///
+/// `LocalTrack::from` sets `TrackType::Video`. The stop uses the track type of
+/// the publication, so B gets the screen-share `TrackUnpublished`.
+#[tokio::test]
+async fn screen_share_stops_when_given_as_a_video_track() {
+    let Some(client) = common::client_or_skip() else {
+        return;
+    };
+    init_tracing();
+
+    let user_a = common::unique_id("a");
+    let user_b = common::unique_id("b");
+    let (admin, call_id) = setup_call(&client, &[&user_a, &user_b]).await;
+
+    common::run_then_delete(admin, Duration::from_secs(150), async move {
+        let call_a = client.video().call("default", &call_id);
+        let call_b = client.video().call("default", &call_id);
+
+        call_b
+            .join(JoinCallData::new(&user_b))
+            .await
+            .expect("B join");
+        let mut events_b = call_b.sfu_events();
+
+        call_a
+            .join(JoinCallData::new(&user_a))
+            .await
+            .expect("A join");
+        let screen_a = LocalVideoTrack::vp8().expect("vp8 track");
+        call_a
+            .publish_screen_share(screen_a.clone())
+            .await
+            .expect("A publish_screen_share");
+        let feeder = spawn_blue_video(screen_a.clone());
+        let screen_published = await_track_event(
+            &mut events_b,
+            &user_a,
+            TrackType::ScreenShare,
+            true,
+            Duration::from_secs(45),
+        )
+        .await;
+        assert!(
+            screen_published,
+            "B never received A's screen-share TrackPublished"
+        );
+
+        call_a
+            .stop_publish(LocalTrack::from(screen_a))
+            .await
+            .expect("A stop_publish");
+        feeder.abort();
+        let screen_unpublished = await_track_event(
+            &mut events_b,
+            &user_a,
+            TrackType::ScreenShare,
+            false,
+            Duration::from_secs(45),
+        )
+        .await;
+        assert!(
+            screen_unpublished,
+            "B never received A's screen-share TrackUnpublished after stop_publish"
+        );
+
+        call_a.leave().await.expect("A leave");
+        call_b.leave().await.expect("B leave");
+    })
+    .await;
+}
+
 /// An audio track that B drops while A is muted arrives again after the unmute
 ///
 /// The SFU sends the unmuted audio on the receiver that B already has, so
