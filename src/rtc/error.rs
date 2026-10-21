@@ -84,6 +84,11 @@ pub enum RtcError {
     #[error(transparent)]
     Timeout(#[from] SfuTimeoutError),
 
+    /// The SFU did not resume the session on a fast reconnect. The reconnect
+    /// continues with a rejoin.
+    #[error("fast reconnect rejected: {0}")]
+    FastReconnectRejected(String),
+
     /// SDP offer/answer negotiation failed. Counted toward the consecutive
     /// negotiation-failure cap.
     #[error(transparent)]

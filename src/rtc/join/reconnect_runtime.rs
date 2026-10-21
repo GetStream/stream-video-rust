@@ -350,15 +350,19 @@ impl RtcCore {
                     }
 
                     // Escalate FAST → REJOIN per JS.
-                    let (pub_healthy, sub_healthy) = self.pc_health().await;
-                    strategy = escalate_strategy(
-                        start.elapsed(),
-                        self.fast_reconnect_deadline().await,
-                        was_migrating,
-                        attempt,
-                        pub_healthy,
-                        sub_healthy,
-                    );
+                    strategy = if matches!(err, RtcError::FastReconnectRejected(_)) {
+                        ReconnectStrategy::Rejoin
+                    } else {
+                        let (pub_healthy, sub_healthy) = self.pc_health().await;
+                        escalate_strategy(
+                            start.elapsed(),
+                            self.fast_reconnect_deadline().await,
+                            was_migrating,
+                            attempt,
+                            pub_healthy,
+                            sub_healthy,
+                        )
+                    };
                     attempt = attempt.saturating_add(1);
                     was_migrating = strategy == ReconnectStrategy::Migrate;
                     self.set_state_if_current(
@@ -798,10 +802,19 @@ impl RtcCore {
         };
         mark_fast_reconnect(&mut join_request);
         next_sender.send_join(join_request).await?;
-        let join_response = await_join_response(&mut receiver, data.join_response_timeout).await?;
+        let join_response =
+            match await_join_response(&mut receiver, data.join_response_timeout).await {
+                Err(RtcError::Join(error))
+                    if error.code == models::ErrorCode::ParticipantNotFound as i32
+                        && !error.is_unrecoverable() =>
+                {
+                    return Err(RtcError::FastReconnectRejected(error.message));
+                }
+                result => result?,
+            };
         if !join_response.reconnected {
-            return Err(RtcError::Coordinator(
-                "SFU did not retain fast-reconnect state".to_owned(),
+            return Err(RtcError::FastReconnectRejected(
+                "the SFU did not resume the session".to_owned(),
             ));
         }
         if !self.apply_join_call_state_if_current(
