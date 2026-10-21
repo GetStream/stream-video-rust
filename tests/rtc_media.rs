@@ -139,15 +139,17 @@ fn spawn_blue_video_at(track: LocalVideoTrack, width: u32, height: u32) -> JoinH
     tokio::spawn(async move {
         let frame = solid_blue_i420(width, height);
         let mut interval = tokio::time::interval(Duration::from_millis(100));
+        let mut pts = Duration::ZERO;
         loop {
             interval.tick().await;
             if track
-                .write_i420(&frame, width, height, Duration::from_millis(100))
+                .write_i420_at(&frame, width, height, pts)
                 .await
                 .is_err()
             {
                 return;
             }
+            pts += Duration::from_millis(100);
         }
     })
 }

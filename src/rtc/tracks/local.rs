@@ -16,16 +16,21 @@
 //!   until the SFU publisher first connects and does not pause on a later
 //!   disconnect, so audio written during an outage is lost instead of delayed.
 //!   This is the PCM republish / TTS-bot path.
-//! - [`LocalAudioTrack::write_sample`] / [`LocalVideoTrack::write_sample`] —
-//!   already-encoded media (Opus/VP8/…) plus a frame duration; the SDK
-//!   packetizes and writes. The caller controls pacing.
+//! - [`LocalAudioTrack::write_sample`] / [`LocalVideoTrack::write_sample_at`] —
+//!   already-encoded media (Opus/VP8/…) plus a frame duration (audio) or a
+//!   `pts` (video); the SDK packetizes and writes. The caller controls pacing.
 //! - `write_rtp` — forward an inbound [`RtpPacket`]. The SDK allocates a fresh
 //!   SSRC (webrtc-rs binding) and **rewrites the sequence number**, dropping the
 //!   inbound header extensions; callers must not reuse inbound headers. The
 //!   timestamps keep the spacing of the inbound ones.
 //!
 //! The write paths of a track share one RTP timeline. A track that takes over
-//! the sender of a stopped track continues the timeline of that track.
+//! the sender of a stopped track continues the timeline of that track. Each
+//! video frame has its own time: the `pts` of [`LocalVideoTrack::write_i420_at`]
+//! and [`LocalVideoTrack::write_sample_at`] is on a clock of the caller, and
+//! `write_rtp` uses the inbound RTP timestamps. A video track takes frames or
+//! forwarded RTP, not both: a write on the other path returns
+//! [`RtcError::IllegalState`].
 //!
 //! Outbound audio packets carry the RFC 6464 `ssrc-audio-level` extension: the
 //! SFU marks a participant speaking only from that level, and remote UIs draw
@@ -94,6 +99,9 @@ const EXPECTED_PACKET_LOSS_PCT: u8 = 10;
 /// re-init the encoder on this interval so a new subscriber always gets a
 /// decodable keyframe quickly.
 const KEYFRAME_INTERVAL_MS: i64 = 1_000;
+/// The frame rate that sets the frame length for libvpx when the SFU sets no
+/// maximum frame rate.
+const DEFAULT_FRAMERATE: u32 = 30;
 
 /// Sentinel for "no audio level for this write". RFC 6464 levels occupy
 /// `0..=127`, so any value above that is free.
@@ -181,6 +189,8 @@ impl TrackCore {
                 seq: random_u32() as u16,
                 timestamp: None,
                 forward_offset: None,
+                forwarded_at: None,
+                clock_rate,
             }),
             stopped: AtomicBool::new(false),
             stopped_at: OnceLock::new(),
@@ -219,6 +229,18 @@ impl TrackCore {
     /// Packetize an encoded frame (`samples` at the codec clock rate) and write
     /// every resulting RTP packet to the bound senders.
     async fn write_encoded(&self, payload: &[u8], samples: u32) -> Result<()> {
+        let packets = self.packetize_encoded(payload, |rtp| rtp.advance(samples))?;
+        self.write_encoded_packets(&packets).await
+    }
+
+    /// Packetize an encoded frame. `timestamp` moves the RTP timeline past the
+    /// frame and returns its RTP timestamp, in the critical section that gives
+    /// its sequence numbers. A muted or paused track gives no packets.
+    fn packetize_encoded(
+        &self,
+        payload: &[u8],
+        timestamp: impl FnOnce(&mut RtpTimeline) -> u32,
+    ) -> Result<Vec<RtpPacket>> {
         if self.stopped.load(Ordering::SeqCst) {
             return Err(RtcError::IllegalState(
                 "write to a stopped track".to_owned(),
@@ -226,31 +248,30 @@ impl TrackCore {
         }
         if self.muted.load(Ordering::SeqCst) || self.quality_paused.load(Ordering::SeqCst) {
             // The RTP clock keeps time while no packet goes out.
-            self.rtp
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .advance(samples);
-            return Ok(());
+            timestamp(&mut self.rtp.lock().unwrap_or_else(|e| e.into_inner()));
+            return Ok(Vec::new());
         }
         let payload = Bytes::copy_from_slice(payload);
-        let packets = {
-            let mut p = self.packetizer.lock().unwrap_or_else(|e| e.into_inner());
-            let mut packets = p
-                .packetize(&payload, samples)
-                .map_err(|e| RtcError::Media(format!("packetize: {e}")))?;
-            let mut rtp = self.rtp.lock().unwrap_or_else(|e| e.into_inner());
-            let timestamp = rtp.advance(samples);
-            for pkt in &mut packets {
-                pkt.header.sequence_number = rtp.next_seq();
-                pkt.header.timestamp = timestamp;
-            }
-            packets
-        };
+        let mut p = self.packetizer.lock().unwrap_or_else(|e| e.into_inner());
+        let mut packets = p
+            .packetize(&payload, 0)
+            .map_err(|e| RtcError::Media(format!("packetize: {e}")))?;
+        let mut rtp = self.rtp.lock().unwrap_or_else(|e| e.into_inner());
+        let timestamp = timestamp(&mut rtp);
+        for pkt in &mut packets {
+            pkt.header.sequence_number = rtp.next_seq();
+            pkt.header.timestamp = timestamp;
+        }
+        Ok(packets)
+    }
+
+    /// Write the RTP packets of an encoded frame to the bound senders.
+    async fn write_encoded_packets(&self, packets: &[RtpPacket]) -> Result<()> {
         // `write_rtp_with_extensions` resolves each URI to the id negotiated for
         // the binding, so extension ids are never ours to manage. An empty slice
         // is exactly `write_rtp`.
         let level = self.audio_level_extension();
-        for pkt in &packets {
+        for pkt in packets {
             // Ok(0) before the track binds (pre-ICE) is fine; a real transport
             // error propagates so publish failures are visible.
             self.track
@@ -320,7 +341,8 @@ impl TrackCore {
 
     /// Continue the RTP timeline and the payloader state of `previous`, whose
     /// sender this track takes over. The timestamps also count the time since
-    /// `previous` stopped.
+    /// `previous` stopped, or after a forwarded packet, the time from that
+    /// packet to the first write of this track.
     fn continue_rtp_from(&self, previous: &TrackCore) {
         let stopped_for = previous
             .stopped_at
@@ -334,9 +356,11 @@ impl TrackCore {
         *self.packetizer.lock().unwrap_or_else(|e| e.into_inner()) = packetizer;
         let samples = (stopped_for.as_secs_f64() * f64::from(self.clock_rate)) as u32;
         let mut rtp = *previous.rtp.lock().unwrap_or_else(|e| e.into_inner());
-        rtp.timestamp = rtp
-            .timestamp
-            .map(|timestamp| timestamp.wrapping_add(samples));
+        if rtp.forwarded_at.is_none() {
+            rtp.timestamp = rtp
+                .timestamp
+                .map(|timestamp| timestamp.wrapping_add(samples));
+        }
         rtp.forward_offset = None;
         *self.rtp.lock().unwrap_or_else(|e| e.into_inner()) = rtp;
     }
@@ -381,11 +405,16 @@ impl TrackCore {
 struct RtpTimeline {
     /// The last sequence number.
     seq: u16,
-    /// The timestamp of the next frame, or of the last forwarded packet.
-    /// `None` until the first write.
+    /// The timestamp of the next frame, or of the last forwarded packet or
+    /// video frame. `None` until the first write.
     timestamp: Option<u32>,
-    /// Added to the timestamps of forwarded packets. Set by the first one.
+    /// Added to the timestamps of forwarded packets and video frames. Set by
+    /// the first one.
     forward_offset: Option<u32>,
+    /// The time of the last forwarded packet or video frame. `None` when
+    /// `timestamp` is the timestamp of the next frame.
+    forwarded_at: Option<Instant>,
+    clock_rate: u32,
 }
 
 impl RtpTimeline {
@@ -394,22 +423,45 @@ impl RtpTimeline {
         self.seq
     }
 
+    /// The timestamp of the next frame. After a forwarded packet, it is the
+    /// timestamp of that packet plus the time since that packet.
+    fn next_timestamp(&self) -> Option<u32> {
+        let elapsed = self.forwarded_at.map_or(Duration::ZERO, |at| at.elapsed());
+        let samples = (elapsed.as_secs_f64() * f64::from(self.clock_rate)) as u32;
+        self.timestamp
+            .map(|timestamp| timestamp.wrapping_add(samples))
+    }
+
     /// Return the timestamp of a frame of `samples`, and move past it.
     fn advance(&mut self, samples: u32) -> u32 {
-        let timestamp = self.timestamp.unwrap_or_else(random_u32);
+        let timestamp = self.next_timestamp().unwrap_or_else(random_u32);
         self.timestamp = Some(timestamp.wrapping_add(samples));
+        self.forwarded_at = None;
         timestamp
+    }
+
+    /// Return the timestamp of a video frame whose `pts` on a clock of the
+    /// caller is `source` ticks. The first frame gets the timestamp of the
+    /// next frame.
+    fn capture(&mut self, source: u32) -> u32 {
+        self.timestamp.get_or_insert_with(random_u32);
+        self.forward(source)
     }
 
     /// Return the timestamp of a forwarded packet with the inbound timestamp
     /// `source`. The first forwarded packet gets the timestamp of the next
     /// frame, or keeps `source` when there was no earlier write.
     fn forward(&mut self, source: u32) -> u32 {
-        let offset = *self
-            .forward_offset
-            .get_or_insert_with(|| self.timestamp.map_or(0, |next| next.wrapping_sub(source)));
+        let offset = match self.forward_offset {
+            Some(offset) => offset,
+            None => self
+                .next_timestamp()
+                .map_or(0, |next| next.wrapping_sub(source)),
+        };
+        self.forward_offset = Some(offset);
         let timestamp = source.wrapping_add(offset);
         self.timestamp = Some(timestamp);
+        self.forwarded_at = Some(Instant::now());
         timestamp
     }
 }
@@ -866,7 +918,8 @@ impl LocalAudioTrack {
     /// Continue the RTP sequence numbers and timestamps of `previous`, whose
     /// sender this track takes over, for all write paths of the two tracks.
     /// The SFU drops a stream whose timestamps go back. The timestamps also
-    /// count the time since `previous` stopped.
+    /// count the time since `previous` stopped, or after a forwarded packet,
+    /// the time from that packet to the first write of this track.
     fn continue_rtp_from(&self, previous: &LocalAudioTrack) {
         self.inner.core.continue_rtp_from(&previous.inner.core);
     }
@@ -1029,25 +1082,54 @@ struct VideoEncoder {
     width: u32,
     height: u32,
     bitrate_kbps: u32,
-    /// `next_pts` of the last keyframe; drives periodic keyframe forcing.
+    /// Presentation time of the last keyframe; drives periodic keyframe forcing.
     last_key_pts: i64,
-    /// Presentation time of the last frame emitted for max-framerate control.
-    last_emit_pts: Option<i64>,
+    /// Presentation time in microseconds of the next frame slot for
+    /// max-framerate control.
+    next_emit_us: Option<i64>,
+    /// Presentation times of the frames that libvpx got in the last second,
+    /// at most 1 001.
+    recent_pts: VecDeque<i64>,
+    /// The pts of the next frame for libvpx.
+    vpx_pts: i64,
 }
 
-/// The presentation clock. The RTP timestamps of all encodings come from the
-/// RTP timeline of the first encoding.
+/// The presentation clock. It follows the RTP timeline of the first encoding,
+/// which gives the RTP timestamps of all encodings.
 struct VideoClock {
-    next_pts: i64,
+    /// The RTP ticks from the first frame of the timeline to the last frame,
+    /// without the 32-bit wrap.
+    ticks: i64,
+    /// The `pts` of the last frame of this track in RTP ticks.
+    last_ticks: Option<u128>,
 }
 
 impl VideoClock {
-    /// Return the presentation time of the next frame, and move the clock past
-    /// its duration.
-    fn advance(&mut self, dur_ms: i64) -> i64 {
-        let current = self.next_pts;
-        self.next_pts = self.next_pts.saturating_add(dur_ms);
-        current
+    /// Move the clock and `rtp` to a frame at `pts`. Return the presentation
+    /// time of the frame in microseconds and its RTP timestamp, or `None` for
+    /// a frame to drop: its `pts` is not after the previous one.
+    fn time_frame(&mut self, pts: Duration, rtp: &mut RtpTimeline) -> Option<(i64, u32)> {
+        let clock_rate = rtp.clock_rate;
+        // Rounded to the nearest tick: 1/30 s is 3 000 ticks at 90 kHz.
+        let ticks = (pts.as_nanos() * u128::from(clock_rate) + 500_000_000) / 1_000_000_000;
+        if let Some(last) = self.last_ticks.filter(|&last| ticks <= last) {
+            tracing::warn!(
+                ?pts,
+                last_ticks = ?last,
+                "stream.rtc.video_frame_pts_not_increasing"
+            );
+            return None;
+        }
+        self.last_ticks = Some(ticks);
+        let previous = rtp.timestamp;
+        // RTP timestamps wrap at 32 bits.
+        let timestamp = rtp.capture(ticks as u32);
+        let step = previous.map_or(0, |previous| timestamp.wrapping_sub(previous));
+        self.ticks = self.ticks.saturating_add(i64::from(step));
+        Some((
+            self.ticks.saturating_mul(1_000_000) / i64::from(clock_rate),
+            timestamp,
+        ))
     }
 }
 
@@ -1071,8 +1153,12 @@ struct VideoInner {
     codec_id: VpxCodec,
     /// Serializes frame work before it enters Tokio's blocking pool. The permit
     /// moves into the worker so cancellation cannot build an unbounded queue.
+    /// Frames, also those of a paused track, reach the RTP timeline in the
+    /// order of their permits.
     encode_gate: Arc<Semaphore>,
     clock: StdMutex<VideoClock>,
+    /// The write path of the first write.
+    write_path: OnceLock<VideoWritePath>,
     active_encoding_count: AtomicU8,
     layering: VideoLayering,
     planned_width: AtomicU32,
@@ -1081,6 +1167,29 @@ struct VideoInner {
     svc_temporal_layers: AtomicU8,
     svc_max_spatial_layers: AtomicU8,
     svc_max_temporal_layers: AtomicU8,
+}
+
+/// The source of the RTP timestamps of a video track: the `pts` of frames, or
+/// the timestamps of forwarded packets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VideoWritePath {
+    Frames,
+    Rtp,
+}
+
+impl VideoInner {
+    /// Move the presentation clock and the RTP timeline to a frame at `pts`.
+    /// Return the presentation time of the frame in microseconds and its RTP
+    /// timestamp, or `None` for a frame to drop.
+    fn time_frame(&self, pts: Duration) -> Option<(i64, u32)> {
+        let mut clock = self.clock.lock().unwrap_or_else(|e| e.into_inner());
+        let mut rtp = self.encodings[0]
+            .core
+            .rtp
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        clock.time_frame(pts, &mut rtp)
+    }
 }
 
 /// Controls whether a local video track uses one encoding or lets the SFU
@@ -1144,9 +1253,9 @@ impl LocalVideoTrackConfig {
 
 /// An outbound video track (VP8 or VP9).
 ///
-/// Feed raw frames via [`write_i420`](Self::write_i420) (the SDK encodes to the
-/// track's codec and packetizes), publish pre-encoded frames via
-/// [`write_sample`](Self::write_sample), or forward inbound RTP via
+/// Feed raw frames via [`write_i420_at`](Self::write_i420_at) (the SDK encodes to
+/// the track's codec and packetizes), publish pre-encoded frames via
+/// [`write_sample_at`](Self::write_sample_at), or forward inbound RTP via
 /// [`write_rtp`](Self::write_rtp). `Clone` shares the track.
 #[derive(Clone)]
 pub struct LocalVideoTrack {
@@ -1205,7 +1314,7 @@ impl LocalVideoTrack {
     /// Build a VP9 camera track configured for server-managed one-SSRC SVC.
     ///
     /// The SFU publish option determines the logical spatial and temporal layer
-    /// counts (up to `L3T3_KEY`). Only raw [`write_i420`](Self::write_i420)
+    /// counts (up to `L3T3_KEY`). Only raw [`write_i420_at`](Self::write_i420_at)
     /// input is accepted for this layered track.
     pub fn vp9_svc() -> Result<Self> {
         Self::vp9_with_config(LocalVideoTrackConfig::default().server_managed())
@@ -1252,7 +1361,11 @@ impl LocalVideoTrack {
                 encodings,
                 codec_id,
                 encode_gate: Arc::new(Semaphore::new(1)),
-                clock: StdMutex::new(VideoClock { next_pts: 0 }),
+                clock: StdMutex::new(VideoClock {
+                    ticks: 0,
+                    last_ticks: None,
+                }),
+                write_path: OnceLock::new(),
                 active_encoding_count: AtomicU8::new(1),
                 layering: config.layering,
                 planned_width: AtomicU32::new(0),
@@ -1269,25 +1382,35 @@ impl LocalVideoTrack {
     ///
     /// `data` is the packed I420 buffer (`width*height` luma bytes, then two
     /// `width/2*height/2` chroma planes; `len >= width*height*3/2`). `width` and
-    /// `height` must be even. `duration` is the frame's on-wire duration and
-    /// advances the RTP timestamp. The SDK encodes to the track's codec, forcing
-    /// a periodic keyframe (see `KEYFRAME_INTERVAL_MS`) so late
-    /// subscribers can decode, then packetizes and writes RTP.
-    pub async fn write_i420(
+    /// `height` must be even. `pts` is the time of the frame on a clock of the
+    /// caller, for example the capture time of a camera frame. A source at a
+    /// fixed rate can give the frame number times the frame interval. The RTP
+    /// timestamps keep the spacing of the `pts` values, and the first frame
+    /// continues the RTP timeline of the track. A frame whose `pts` is not
+    /// after the previous one is dropped, as in libwebrtc. The SDK encodes to
+    /// the track's codec, forcing a periodic keyframe (see
+    /// `KEYFRAME_INTERVAL_MS`) so late subscribers can decode, then packetizes
+    /// and writes RTP.
+    pub async fn write_i420_at(
         &self,
         data: &[u8],
         width: u32,
         height: u32,
-        duration: Duration,
+        pts: Duration,
     ) -> Result<()> {
         if self.inner.encodings[0].core.stopped.load(Ordering::SeqCst) {
             return Err(RtcError::IllegalState(
                 "write to a stopped track".to_owned(),
             ));
         }
-        let dur_ms = i64::try_from(duration.as_millis().max(1)).unwrap_or(i64::MAX);
-        let samples =
-            (duration.as_secs_f64() * f64::from(self.inner.encodings[0].core.clock_rate)) as u32;
+        self.ensure_write_path(VideoWritePath::Frames)?;
+        let permit = self
+            .inner
+            .encode_gate
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| RtcError::IllegalState("video encoder stopped".to_owned()))?;
         if self
             .inner
             .encodings
@@ -1298,17 +1421,7 @@ impl LocalVideoTrack {
             .all(|encoding| encoding.core.is_output_paused())
         {
             // The RTP clock keeps time while no frame goes out.
-            self.inner
-                .clock
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .advance(dur_ms);
-            self.inner.encodings[0]
-                .core
-                .rtp
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .advance(samples);
+            self.inner.time_frame(pts);
             return Ok(());
         }
         if width == 0 || height == 0 || !width.is_multiple_of(2) || !height.is_multiple_of(2) {
@@ -1364,18 +1477,11 @@ impl LocalVideoTrack {
             )));
         }
 
-        let permit = self
-            .inner
-            .encode_gate
-            .clone()
-            .acquire_owned()
-            .await
-            .map_err(|_| RtcError::IllegalState("video encoder stopped".to_owned()))?;
         let inner = self.inner.clone();
         let frame = data[..expected].to_vec();
         let encoded_layers = tokio::task::spawn_blocking(move || {
             let _permit = permit;
-            encode_i420_layers(&inner, &frame, width, height, dur_ms, samples)
+            encode_i420_layers(&inner, &frame, width, height, pts)
         })
         .await
         .map_err(|error| RtcError::Media(format!("video encode worker failed: {error}")))??;
@@ -1388,24 +1494,43 @@ impl LocalVideoTrack {
         Ok(())
     }
 
-    /// Write an already-encoded video frame of `duration`.
-    pub async fn write_sample(&self, data: &[u8], duration: Duration) -> Result<()> {
+    /// Write an already-encoded video frame with the presentation time `pts`.
+    /// `pts` is as for [`write_i420_at`](Self::write_i420_at), but a frame
+    /// whose `pts` is not after the previous one is not dropped: it is a
+    /// reference for the next frames, so it gets the RTP timestamp of the
+    /// previous frame.
+    pub async fn write_sample_at(&self, data: &[u8], pts: Duration) -> Result<()> {
         self.ensure_single_layer_input("encoded samples")?;
-        let samples =
-            (duration.as_secs_f64() * f64::from(self.inner.encodings[0].core.clock_rate)) as u32;
-        self.inner.encodings[0]
-            .core
-            .write_encoded(data, samples)
-            .await
+        self.ensure_write_path(VideoWritePath::Frames)?;
+        let core = &self.inner.encodings[0].core;
+        let packets = {
+            // The permit orders the frame with the other writes of the track.
+            let _permit = self
+                .inner
+                .encode_gate
+                .acquire()
+                .await
+                .map_err(|_| RtcError::IllegalState("video encoder stopped".to_owned()))?;
+            let timed = self.inner.time_frame(pts);
+            // An encoded frame is a reference for the next frames, so a frame
+            // whose `pts` is not after the previous one keeps the timestamp of
+            // the previous frame.
+            core.packetize_encoded(data, |rtp| match timed {
+                Some((_, timestamp)) => timestamp,
+                None => rtp.timestamp.unwrap_or_else(random_u32),
+            })?
+        };
+        core.write_encoded_packets(&packets).await
     }
 
     /// Forward an inbound RTP packet (same-codec republish). The SDK rewrites the
     /// SSRC and sequence number and drops inbound extensions. The timestamps
     /// keep the spacing of the inbound ones. On a sender that this track took
-    /// over, or after another write path, they continue the RTP timeline of
-    /// the earlier packets.
+    /// over, they continue the RTP timeline of the earlier packets. After a
+    /// frame write, this method returns [`RtcError::IllegalState`].
     pub async fn write_rtp(&self, packet: RtpPacket) -> Result<()> {
         self.ensure_single_layer_input("RTP forwarding")?;
+        self.ensure_write_path(VideoWritePath::Rtp)?;
         self.inner.encodings[0].core.forward_rtp(&packet).await
     }
 
@@ -1419,24 +1544,20 @@ impl LocalVideoTrack {
     /// `previous`, whose sender this track takes over, for all write paths of
     /// the two tracks. The encoder state moves here, so the VP9 picture ids
     /// continue. The SFU drops a stream whose timestamps go back. The
-    /// timestamps also count the time since `previous` stopped.
+    /// timestamps also count the time from the last frame of `previous` to the
+    /// first frame of this track.
     fn continue_rtp_from(&self, previous: &LocalVideoTrack) {
-        let stopped_for = previous.inner.encodings[0]
-            .core
-            .stopped_at
-            .get()
-            .map_or(Duration::ZERO, Instant::elapsed);
-        let next_pts = previous
+        let ticks = previous
             .inner
             .clock
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .next_pts;
-        {
-            let mut clock = self.inner.clock.lock().unwrap_or_else(|e| e.into_inner());
-            clock.next_pts = next_pts;
-            clock.advance(i64::try_from(stopped_for.as_millis()).unwrap_or(i64::MAX));
-        }
+            .ticks;
+        self.inner
+            .clock
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .ticks = ticks;
         let (current, previous) = (&self.inner.encodings[0], &previous.inner.encodings[0]);
         let state = previous
             .encoder
@@ -1478,6 +1599,18 @@ impl LocalVideoTrack {
     fn ensure_single_layer_input(&self, input: &'static str) -> Result<()> {
         if matches!(self.inner.layering, VideoLayering::ServerManaged { .. }) {
             return Err(RtcError::UnsupportedLayeredInput { input });
+        }
+        Ok(())
+    }
+
+    /// The first write fixes the write path of the track: the RTP timestamps
+    /// of the two paths come from different clocks.
+    fn ensure_write_path(&self, path: VideoWritePath) -> Result<()> {
+        let first = *self.inner.write_path.get_or_init(|| path);
+        if first != path {
+            return Err(RtcError::IllegalState(format!(
+                "a {path:?} write on a video track that takes {first:?}"
+            )));
         }
         Ok(())
     }
@@ -1814,20 +1947,11 @@ fn encode_i420_layers(
     data: &[u8],
     width: u32,
     height: u32,
-    dur_ms: i64,
-    samples: u32,
+    pts: Duration,
 ) -> Result<Vec<(usize, Vec<RtpPacket>)>> {
-    let pts = inner
-        .clock
-        .lock()
-        .unwrap_or_else(|error| error.into_inner())
-        .advance(dur_ms);
-    let timestamp = inner.encodings[0]
-        .core
-        .rtp
-        .lock()
-        .unwrap_or_else(|error| error.into_inner())
-        .advance(samples);
+    let Some((pts_us, timestamp)) = inner.time_frame(pts) else {
+        return Ok(Vec::new());
+    };
     let count = usize::from(inner.active_encoding_count.load(Ordering::SeqCst));
     let mut output = Vec::with_capacity(count);
     for (index, encoding) in inner.encodings.iter().take(count).enumerate() {
@@ -1850,8 +1974,7 @@ fn encode_i420_layers(
             layer_data,
             layer_width,
             layer_height,
-            pts,
-            dur_ms,
+            pts_us,
             timestamp,
             if matches!(inner.codec_id, VpxCodec::Vp9)
                 && matches!(inner.layering, VideoLayering::ServerManaged { .. })
@@ -1876,11 +1999,11 @@ fn encode_layer_packets(
     data: &[u8],
     width: u32,
     height: u32,
-    pts: i64,
-    dur_ms: i64,
+    pts_us: i64,
     timestamp: u32,
     svc_mode: Option<Vp9SvcMode>,
 ) -> Result<Vec<RtpPacket>> {
+    let pts = pts_us / 1_000;
     let mut guard = encoding.encoder.lock().unwrap_or_else(|e| e.into_inner());
     let bitrate_kbps = encoding.target_bitrate_kbps.load(Ordering::SeqCst);
     let needs_new = match guard.as_ref() {
@@ -1925,28 +2048,62 @@ fn encode_layer_packets(
             bitrate_kbps,
             // Force a keyframe on the first frame after (re)init.
             last_key_pts: pts - KEYFRAME_INTERVAL_MS,
-            last_emit_pts: None,
+            next_emit_us: None,
+            recent_pts: VecDeque::new(),
+            vpx_pts: 0,
         });
     }
     let Some(state) = guard.as_mut() else {
         return Err(RtcError::Media("video encoder unavailable".to_owned()));
     };
     let max_framerate = encoding.max_framerate.load(Ordering::SeqCst);
-    if let Some(interval_ms) = 1_000_u32.checked_div(max_framerate) {
-        let interval_ms = i64::from(interval_ms.max(1));
-        if state
-            .last_emit_pts
-            .is_some_and(|last| pts.saturating_sub(last) < interval_ms)
-        {
-            return Ok(Vec::new());
+    if let Some(interval_us) = 1_000_000_i64.checked_div(i64::from(max_framerate)) {
+        // As libwebrtc `FramerateController`: the slots are one interval
+        // apart, so capture jitter does not drop frames.
+        match state.next_emit_us {
+            Some(next) if (next - pts_us).abs() < 2 * interval_us => {
+                if next > pts_us {
+                    return Ok(Vec::new());
+                }
+                state.next_emit_us = Some(next + interval_us);
+            }
+            _ => state.next_emit_us = Some(pts_us + interval_us / 2),
         }
     }
-    state.last_emit_pts = Some(pts);
     let force_key = encoding.force_keyframe.swap(false, Ordering::SeqCst)
         || (pts - state.last_key_pts) >= KEYFRAME_INTERVAL_MS;
     if force_key {
         state.last_key_pts = pts;
     }
+    // As in libwebrtc, libvpx gets frames one frame length apart. The length
+    // is the mean frame interval of the last second, else the frame interval
+    // of the maximum frame rate.
+    while state
+        .recent_pts
+        .front()
+        .is_some_and(|&first| pts - first > 1_000)
+    {
+        state.recent_pts.pop_front();
+    }
+    state.recent_pts.push_back(pts);
+    // `frame_ms` is at least 1 ms, so the frames before the last 1 000
+    // intervals cannot change it.
+    if state.recent_pts.len() > 1_001 {
+        state.recent_pts.pop_front();
+    }
+    let frame_ms = match state.recent_pts.front() {
+        Some(&first) if state.recent_pts.len() > 1 => {
+            (pts - first) / (state.recent_pts.len() as i64 - 1)
+        }
+        _ => i64::from(
+            1_000_u32
+                .checked_div(max_framerate)
+                .unwrap_or(1_000 / DEFAULT_FRAMERATE),
+        ),
+    }
+    .max(1);
+    let vpx_pts = state.vpx_pts;
+    state.vpx_pts += frame_ms;
     let mut out = Vec::new();
     let w16 = width.min(u32::from(u16::MAX)) as u16;
     let h16 = height.min(u32::from(u16::MAX)) as u16;
@@ -1955,7 +2112,7 @@ fn encode_layer_packets(
             encoder,
             packetizer,
         } => {
-            let frames = encoder.encode(data, pts, dur_ms, force_key)?;
+            let frames = encoder.encode(data, vpx_pts, frame_ms, force_key)?;
             for frame in frames {
                 if frame.data.is_empty() {
                     continue;
@@ -1986,7 +2143,7 @@ fn encode_layer_packets(
             encoder,
             packetizer,
         } => {
-            let frames = encoder.encode(data, pts, dur_ms, force_key)?;
+            let frames = encoder.encode(data, vpx_pts, frame_ms, force_key)?;
             let encoded_bytes = frames.iter().map(|frame| frame.data.len()).sum::<usize>();
             tracing::trace!(
                 bytes = encoded_bytes,
@@ -3008,11 +3165,11 @@ mod tests {
             .expect("add track");
         let (receiver, mut remote_rx) = peer::connect_receiver(&sender, RTPCodecType::Video).await;
         let frame = vec![128_u8; 320 * 240 * 3 / 2];
-        let frame_time = Duration::from_millis(33);
+        let pts = |frame: u32| Duration::from_millis(33) * frame;
 
-        for _ in 0..3 {
+        for n in 0..3 {
             track
-                .write_i420(&frame, 320, 240, frame_time)
+                .write_i420_at(&frame, 320, 240, pts(n))
                 .await
                 .expect("frame");
         }
@@ -3027,15 +3184,15 @@ mod tests {
             before = Some(packet);
         }
         track.set_muted(true);
-        for _ in 0..10 {
+        for n in 3..13 {
             track
-                .write_i420(&frame, 320, 240, frame_time)
+                .write_i420_at(&frame, 320, 240, pts(n))
                 .await
                 .expect("muted frame");
         }
         track.set_muted(false);
         track
-            .write_i420(&frame, 320, 240, frame_time)
+            .write_i420_at(&frame, 320, 240, pts(13))
             .await
             .expect("frame");
         let (after, _) = tokio::time::timeout(Duration::from_secs(5), remote.read_rtp())
@@ -3048,6 +3205,243 @@ mod tests {
             after.header.timestamp.wrapping_sub(before.header.timestamp),
             11 * 2_970
         );
+        let _ = sender.close().await;
+        let _ = receiver.close().await;
+    }
+
+    #[tokio::test]
+    async fn write_i420_at_spaces_rtp_timestamps_by_pts() {
+        use webrtc::rtp_transceiver::rtp_codec::RTPCodecType;
+
+        let track = LocalVideoTrack::vp9().expect("vp9 track");
+        let sender = peer::new_peer_connection(&[]).await.expect("sender");
+        sender
+            .add_track(track.webrtc_track())
+            .await
+            .expect("add track");
+        let (receiver, mut remote_rx) = peer::connect_receiver(&sender, RTPCodecType::Video).await;
+        let frame = vec![128_u8; 320 * 240 * 3 / 2];
+
+        // 30 fps, a pause of one second, then 30 fps again.
+        for thirtieths in [0, 1, 2, 32, 33] {
+            track
+                .write_i420_at(&frame, 320, 240, Duration::from_secs(thirtieths) / 30)
+                .await
+                .expect("frame");
+        }
+        let remote = tokio::time::timeout(Duration::from_secs(5), remote_rx.recv())
+            .await
+            .expect("remote track")
+            .expect("remote track channel");
+        let mut timestamps = Vec::new();
+        while let Ok(Ok((packet, _))) =
+            tokio::time::timeout(Duration::from_millis(100), remote.read_rtp()).await
+        {
+            if timestamps.last() != Some(&packet.header.timestamp) {
+                timestamps.push(packet.header.timestamp);
+            }
+        }
+
+        let steps: Vec<u32> = timestamps
+            .windows(2)
+            .map(|pair| pair[1].wrapping_sub(pair[0]))
+            .collect();
+        assert_eq!(steps, [3_000, 3_000, 90_000, 3_000]);
+        let _ = sender.close().await;
+        let _ = receiver.close().await;
+    }
+
+    #[tokio::test]
+    async fn write_i420_at_drops_a_frame_whose_pts_does_not_increase() {
+        use webrtc::rtp_transceiver::rtp_codec::RTPCodecType;
+
+        let track = LocalVideoTrack::vp9().expect("vp9 track");
+        let sender = peer::new_peer_connection(&[]).await.expect("sender");
+        sender
+            .add_track(track.webrtc_track())
+            .await
+            .expect("add track");
+        let (receiver, mut remote_rx) = peer::connect_receiver(&sender, RTPCodecType::Video).await;
+        let frame = vec![128_u8; 320 * 240 * 3 / 2];
+
+        // The third frame is 5 µs after the second: less than one 90 kHz tick.
+        let thirtieth = Duration::from_secs(1) / 30;
+        for pts in [
+            Duration::ZERO,
+            thirtieth,
+            thirtieth + Duration::from_micros(5),
+            thirtieth * 2,
+        ] {
+            track
+                .write_i420_at(&frame, 320, 240, pts)
+                .await
+                .expect("frame");
+        }
+        let remote = tokio::time::timeout(Duration::from_secs(5), remote_rx.recv())
+            .await
+            .expect("remote track")
+            .expect("remote track channel");
+        let mut frames = 0;
+        while let Ok(Ok((packet, _))) =
+            tokio::time::timeout(Duration::from_millis(100), remote.read_rtp()).await
+        {
+            frames += usize::from(packet.header.marker);
+        }
+
+        assert_eq!(frames, 3);
+        let _ = sender.close().await;
+        let _ = receiver.close().await;
+    }
+
+    /// libvpx spends the bitrate of a source slower than 30 fps. Frames of
+    /// low-amplitude noise let the encoder use any number of bits.
+    #[test]
+    fn a_10_fps_source_gets_the_target_bitrate() {
+        let track = LocalVideoTrack::vp9().expect("vp9 track");
+        track.apply_layer_setting(&VideoLayerSetting {
+            active: true,
+            max_bitrate: 1_000_000,
+            ..Default::default()
+        });
+        let mut seed = 1_u32;
+        let mut bytes = 0;
+        for n in 0..50 {
+            let frame = (0..320 * 240 * 3 / 2)
+                .map(|_| {
+                    seed ^= seed << 13;
+                    seed ^= seed >> 17;
+                    seed ^= seed << 5;
+                    120 + (seed % 16) as u8
+                })
+                .collect::<Vec<_>>();
+            let layers = encode_i420_layers(
+                &track.inner,
+                &frame,
+                320,
+                240,
+                Duration::from_millis(100) * n,
+            )
+            .expect("frame");
+            bytes += layers[0]
+                .1
+                .iter()
+                .map(|packet| packet.payload.len())
+                .sum::<usize>();
+        }
+
+        // Five seconds of frames.
+        let kbps = bytes * 8 / 5 / 1_000;
+        assert!(
+            (700..=1_300).contains(&kbps),
+            "{kbps} kbps for a 1000 kbps target"
+        );
+    }
+
+    /// One second of frames at `max_framerate = 30`: capture jitter does not
+    /// drop frames, and a faster source is cut to 30 fps at even intervals.
+    #[tokio::test]
+    async fn max_framerate_keeps_one_frame_per_interval() {
+        use webrtc::rtp_transceiver::rtp_codec::RTPCodecType;
+
+        // 30 fps with up to 3 ms of capture jitter.
+        let jitter_ms = [0, -3, 3, -2, 2];
+        let jittery_30_fps = (0..30)
+            .map(|n: i64| {
+                Duration::from_millis((100 + n * 1_000 / 30 + jitter_ms[(n % 5) as usize]) as u64)
+            })
+            .collect::<Vec<_>>();
+        let steady_60_fps = (0..60)
+            .map(|n| Duration::from_millis(100) + Duration::from_secs(1) * n / 60)
+            .collect();
+        let mut kept = Vec::new();
+        for source in [jittery_30_fps, steady_60_fps] {
+            let track = LocalVideoTrack::vp9().expect("vp9 track");
+            track.apply_layer_setting(&VideoLayerSetting {
+                active: true,
+                max_framerate: 30,
+                ..Default::default()
+            });
+            let sender = peer::new_peer_connection(&[]).await.expect("sender");
+            sender
+                .add_track(track.webrtc_track())
+                .await
+                .expect("add track");
+            let (receiver, mut remote_rx) =
+                peer::connect_receiver(&sender, RTPCodecType::Video).await;
+            let frame = vec![128_u8; 320 * 240 * 3 / 2];
+
+            for pts in source {
+                track
+                    .write_i420_at(&frame, 320, 240, pts)
+                    .await
+                    .expect("frame");
+            }
+            let remote = tokio::time::timeout(Duration::from_secs(5), remote_rx.recv())
+                .await
+                .expect("remote track")
+                .expect("remote track channel");
+            let mut frame_timestamps = Vec::new();
+            while let Ok(Ok((packet, _))) =
+                tokio::time::timeout(Duration::from_millis(100), remote.read_rtp()).await
+            {
+                if packet.header.marker {
+                    frame_timestamps.push(packet.header.timestamp);
+                }
+            }
+            kept.push(frame_timestamps);
+            let _ = sender.close().await;
+            let _ = receiver.close().await;
+        }
+
+        assert_eq!(kept[0].len(), 30);
+        // As in libwebrtc `FramerateController`, the first slot is half an
+        // interval after the first frame, then the slots are 1/30 s apart.
+        let steps: Vec<u32> = kept[1]
+            .windows(2)
+            .map(|pair| pair[1].wrapping_sub(pair[0]))
+            .collect();
+        let mut expected = vec![1_500];
+        expected.extend([3_000; 29]);
+        assert_eq!(steps, expected);
+    }
+
+    #[tokio::test]
+    async fn write_sample_at_spaces_rtp_timestamps_by_pts() {
+        use webrtc::rtp_transceiver::rtp_codec::RTPCodecType;
+
+        let track = LocalVideoTrack::vp9().expect("vp9 track");
+        let sender = peer::new_peer_connection(&[]).await.expect("sender");
+        sender
+            .add_track(track.webrtc_track())
+            .await
+            .expect("add track");
+        let (receiver, mut remote_rx) = peer::connect_receiver(&sender, RTPCodecType::Video).await;
+
+        // 30 fps, a pause of one second, then 30 fps again.
+        for thirtieths in [0, 1, 2, 32, 33] {
+            track
+                .write_sample_at(&[0; 100], Duration::from_secs(thirtieths) / 30)
+                .await
+                .expect("frame");
+        }
+        let remote = tokio::time::timeout(Duration::from_secs(5), remote_rx.recv())
+            .await
+            .expect("remote track")
+            .expect("remote track channel");
+        let mut timestamps = Vec::new();
+        while let Ok(Ok((packet, _))) =
+            tokio::time::timeout(Duration::from_millis(100), remote.read_rtp()).await
+        {
+            if timestamps.last() != Some(&packet.header.timestamp) {
+                timestamps.push(packet.header.timestamp);
+            }
+        }
+
+        let steps: Vec<u32> = timestamps
+            .windows(2)
+            .map(|pair| pair[1].wrapping_sub(pair[0]))
+            .collect();
+        assert_eq!(steps, [3_000, 3_000, 90_000, 3_000]);
         let _ = sender.close().await;
         let _ = receiver.close().await;
     }
@@ -3456,11 +3850,85 @@ mod tests {
         assert_eq!(track.svc_mode(), Some((3, 3)));
     }
 
+    /// An encoded frame is a reference for the next frames, so a frame whose
+    /// `pts` does not increase goes out with the timestamp of the previous one.
+    #[tokio::test]
+    async fn write_sample_at_keeps_a_frame_whose_pts_does_not_increase() {
+        use webrtc::rtp_transceiver::rtp_codec::RTPCodecType;
+
+        let track = LocalVideoTrack::vp9().expect("vp9 track");
+        let sender = peer::new_peer_connection(&[]).await.expect("sender");
+        sender
+            .add_track(track.webrtc_track())
+            .await
+            .expect("add track");
+        let (receiver, mut remote_rx) = peer::connect_receiver(&sender, RTPCodecType::Video).await;
+
+        for thirtieths in [0, 1, 1, 2] {
+            track
+                .write_sample_at(&[0; 100], Duration::from_secs(thirtieths) / 30)
+                .await
+                .expect("frame");
+        }
+        let remote = tokio::time::timeout(Duration::from_secs(5), remote_rx.recv())
+            .await
+            .expect("remote track")
+            .expect("remote track channel");
+        let mut frame_timestamps = Vec::new();
+        while let Ok(Ok((packet, _))) =
+            tokio::time::timeout(Duration::from_millis(100), remote.read_rtp()).await
+        {
+            if packet.header.marker {
+                frame_timestamps.push(packet.header.timestamp);
+            }
+        }
+
+        let steps: Vec<u32> = frame_timestamps
+            .windows(2)
+            .map(|pair| pair[1].wrapping_sub(pair[0]))
+            .collect();
+        assert_eq!(steps, [3_000, 0, 3_000]);
+        let _ = sender.close().await;
+        let _ = receiver.close().await;
+    }
+
+    /// Frames get their RTP timestamps from the `pts` clock, and forwarded
+    /// packets from the inbound packets, so one track cannot take both.
+    #[tokio::test]
+    async fn a_video_track_rejects_a_second_write_path() {
+        let frame = vec![128_u8; 320 * 240 * 3 / 2];
+
+        let frames_first = LocalVideoTrack::vp9().expect("vp9 track");
+        frames_first
+            .write_i420_at(&frame, 320, 240, Duration::ZERO)
+            .await
+            .expect("frame");
+        let rtp = frames_first
+            .write_rtp(RtpPacket::default())
+            .await
+            .expect_err("RTP after frames");
+        assert!(matches!(rtp, RtcError::IllegalState(_)), "error was: {rtp}");
+
+        let rtp_first = LocalVideoTrack::vp9().expect("vp9 track");
+        rtp_first
+            .write_rtp(RtpPacket::default())
+            .await
+            .expect("packet");
+        let sample = rtp_first
+            .write_sample_at(&[1, 2, 3], Duration::ZERO)
+            .await
+            .expect_err("a sample after RTP");
+        assert!(
+            matches!(sample, RtcError::IllegalState(_)),
+            "error was: {sample}"
+        );
+    }
+
     #[tokio::test]
     async fn layered_track_rejects_preencoded_and_rtp_input() {
         let track = LocalVideoTrack::vp9_svc().expect("layered VP9");
         let sample = track
-            .write_sample(&[1, 2, 3], Duration::from_millis(33))
+            .write_sample_at(&[1, 2, 3], Duration::from_millis(33))
             .await
             .expect_err("encoded input cannot be split truthfully");
         assert!(matches!(sample, RtcError::UnsupportedLayeredInput { .. }));
@@ -3594,8 +4062,8 @@ mod tests {
             .expect("configure layers");
         let frame = vec![128; 320 * 240 * 3 / 2];
 
-        let first =
-            encode_i420_layers(&track.inner, &frame, 320, 240, 100, 9_000).expect("first picture");
+        let first = encode_i420_layers(&track.inner, &frame, 320, 240, Duration::ZERO)
+            .expect("first picture");
         let first_packets = &first[0].1;
         let first_last = first_packets.last().expect("first RTP packet");
         assert_eq!(
@@ -3613,7 +4081,7 @@ mod tests {
             scale_resolution_down_by: 1.0,
             ..Default::default()
         }]);
-        let second = encode_i420_layers(&track.inner, &frame, 320, 240, 100, 9_000)
+        let second = encode_i420_layers(&track.inner, &frame, 320, 240, Duration::from_millis(100))
             .expect("reconfigured picture");
         let second_first = second[0].1.first().expect("second RTP packet");
 
@@ -3645,11 +4113,12 @@ mod tests {
         ] {
             let small = vec![128; 320 * 240 * 3 / 2];
             let large = vec![128; 640 * 480 * 3 / 2];
-            let first = encode_i420_layers(&track.inner, &small, 320, 240, 100, 9_000)
+            let first = encode_i420_layers(&track.inner, &small, 320, 240, Duration::ZERO)
                 .expect("first frame");
             // A new size sets up the encoder again.
-            let second = encode_i420_layers(&track.inner, &large, 640, 480, 100, 9_000)
-                .expect("frame at the new size");
+            let second =
+                encode_i420_layers(&track.inner, &large, 640, 480, Duration::from_millis(100))
+                    .expect("frame at the new size");
 
             let first_id = picture_id(&first[0].1[0].payload, offset);
             let second_id = picture_id(&second[0].1[0].payload, offset);
@@ -3761,11 +4230,11 @@ mod tests {
         let mut buf = vec![41u8; (w * h) as usize];
         buf.extend(std::iter::repeat_n(240u8, ((w / 2) * (h / 2)) as usize));
         buf.extend(std::iter::repeat_n(110u8, ((w / 2) * (h / 2)) as usize));
-        for _ in 0..5 {
+        for frame in 0..5 {
             track
-                .write_i420(&buf, w, h, Duration::from_millis(100))
+                .write_i420_at(&buf, w, h, Duration::from_millis(100) * frame)
                 .await
-                .expect("write_i420 blue frame");
+                .expect("write_i420_at blue frame");
         }
     }
 
@@ -3773,13 +4242,13 @@ mod tests {
     async fn vp9_write_i420_rejects_unbounded_dimensions_before_copy() {
         let track = LocalVideoTrack::vp9().expect("VP9 track");
         let edge_error = track
-            .write_i420(&[], 4_096, 2_160, Duration::from_millis(100))
+            .write_i420_at(&[], 4_096, 2_160, Duration::from_millis(100))
             .await
             .expect_err("local encoders must reject dimensions above the finite cap");
         assert!(edge_error.to_string().contains("local encode limit"));
 
         let expected_bytes_error = track
-            .write_i420(&[], 3_840, 2_162, Duration::from_millis(100))
+            .write_i420_at(&[], 3_840, 2_162, Duration::from_millis(100))
             .await
             .expect_err("local encoders must reject oversized expected frame bytes");
         assert!(
@@ -3794,7 +4263,7 @@ mod tests {
         let track = LocalVideoTrack::vp9().expect("VP9 track");
         let backing = vec![128; MAX_LOCAL_VIDEO_I420_BYTES + 1];
         track
-            .write_i420(&backing, 320, 240, Duration::from_millis(100))
+            .write_i420_at(&backing, 320, 240, Duration::from_millis(100))
             .await
             .expect("only the dimension-derived frame prefix is copied");
     }

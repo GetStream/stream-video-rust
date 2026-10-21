@@ -1,6 +1,52 @@
 # Unreleased
 
+## Breaking Changes
+
+### Video frames carry their own time
+
+`LocalVideoTrack::write_i420_at` and `LocalVideoTrack::write_sample_at` replace
+`write_i420` and the video `write_sample`. They take the `pts` of a frame
+instead of its length. The new names make code that passes a length fail to
+compile. `LocalAudioTrack::write_sample` does not change. `pts` is the time of
+the frame on a clock of the caller, for example the capture time of a camera
+frame. The RTP timestamps keep the spacing of the `pts` values. Before, the
+length of a frame set the RTP timestamp of the next frame. A source with
+timestamps knows that length only when the next frame arrives, so a caller had
+to hold each frame for one frame interval, or send timestamps that were one
+frame late when the frame rate changed. A source at a fixed rate can give the
+frame number times the frame interval. `write_i420_at` drops a frame whose
+`pts` is not after the previous one, as in libwebrtc. `write_sample_at` does
+not drop such a frame, because an encoded frame is a reference for the next
+frames: the frame gets the RTP timestamp of the previous frame.
+
+A video track takes frames (`write_i420_at`, `write_sample_at`) or forwarded RTP
+(`write_rtp`), not both. A write on the other path returns
+`RtcError::IllegalState`. Before, the docs said that a second write path
+continued the RTP timeline. The RTP timestamps of the two paths come from
+different clocks, so they can go back at the change. To change the path, stop
+the track and publish a new one: it takes over the sender and continues the
+RTP timeline.
+
+`VideoFrame` adds `elapsed: Duration`: the time of the frame from the first
+frame of the remote track. It does not wrap like `rtp_timestamp`, so it can be
+the `pts` of `write_i420_at`. `elapsed` of each remote track starts at 0, so a
+caller that writes the frames of more than one remote track to one local track
+must add an offset to `elapsed` of each remote track. Code that builds
+`VideoFrame` with a struct literal must set `elapsed`.
+
+As in libwebrtc, libvpx gets frames one frame length apart, and the frame length
+is the mean frame interval of the last second. The maximum frame rate of an
+encoding drops frames by a schedule of slots one frame interval apart, as in
+libwebrtc, so capture jitter does not drop frames.
+
 ## Fixes
+
+- A track that takes over the sender of a stopped track counts the time from
+  the last video frame or forwarded RTP packet of the stopped track to its own
+  first write. Before, it counted the time from the stop, so its first frame
+  could get almost the same timestamp as the last frame of the stopped track.
+  After `write_rtp`, the next `write_pcm` or `write_sample` of an audio track
+  also counts the time since the last forwarded packet.
 
 - `stop_publish` uses the track type of the publication, not the track type of
   its argument. Before, a screen share stopped with `LocalTrack::from(track)`

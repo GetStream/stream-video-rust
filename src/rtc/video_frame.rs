@@ -2,7 +2,7 @@
 //! [`RemoteTrack::next_video_frame`](crate::rtc::RemoteTrack::next_video_frame).
 //!
 //! Frames are packed I420 (YUV 4:2:0 planar) — the same layout
-//! [`LocalVideoTrack::write_i420`](crate::rtc::LocalVideoTrack::write_i420)
+//! [`LocalVideoTrack::write_i420_at`](crate::rtc::LocalVideoTrack::write_i420_at)
 //! consumes, so a decode → transform → re-encode bridge needs no conversion in
 //! between.
 //!
@@ -10,6 +10,8 @@
 //! (JPEG/PNG) and resampling filters are an application concern and stay out of
 //! this crate. [`VideoFrame::to_rgb8`] and [`VideoFrame::downscale`] cover what a
 //! bot needs to hand a frame to a vision model or shrink it before re-encoding.
+
+use std::time::Duration;
 
 /// One decoded video frame in packed I420.
 ///
@@ -34,6 +36,13 @@ pub struct VideoFrame {
     /// The RTP timestamp (90 kHz video clock) of the sample this was decoded
     /// from. Use it to order or pace frames; it is not a wall clock.
     pub rtp_timestamp: u32,
+    /// The time of the frame from the first frame of the remote track, from
+    /// the RTP timestamps. It does not wrap like `rtp_timestamp`, so it can be
+    /// the `pts` of
+    /// [`LocalVideoTrack::write_i420_at`](crate::rtc::LocalVideoTrack::write_i420_at).
+    /// A late frame can have an `elapsed` that is not after the previous one,
+    /// and a frame before the first frame has the `elapsed` 0.
+    pub elapsed: Duration,
 }
 
 /// Chroma plane dimensions for a `width`x`height` I420 frame.
@@ -119,6 +128,7 @@ impl VideoFrame {
             height: dh,
             data,
             rtp_timestamp: self.rtp_timestamp,
+            elapsed: self.elapsed,
         }
     }
 
@@ -179,6 +189,7 @@ mod tests {
             height,
             data,
             rtp_timestamp: 900,
+            elapsed: Duration::ZERO,
         }
     }
 
