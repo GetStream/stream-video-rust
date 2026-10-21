@@ -626,7 +626,7 @@ mod tests {
         let frame = vec![128_u8; 320 * 240 * 3 / 2];
         let pts = |frame: u32| Duration::from_millis(33) * frame;
         first
-            .write_i420(&frame, 320, 240, pts(0))
+            .write_i420_at(&frame, 320, 240, pts(0))
             .await
             .expect("first frame");
         let remote = tokio::time::timeout(Duration::from_secs(5), remote_rx.recv())
@@ -635,13 +635,13 @@ mod tests {
             .expect("remote track channel");
         for n in 1..3 {
             first
-                .write_i420(&frame, 320, 240, pts(n))
+                .write_i420_at(&frame, 320, 240, pts(n))
                 .await
                 .expect("frame");
         }
         let before_last_frame = Instant::now();
         first
-            .write_i420(&frame, 320, 240, pts(3))
+            .write_i420_at(&frame, 320, 240, pts(3))
             .await
             .expect("last frame");
         let after_last_frame = Instant::now();
@@ -667,7 +667,7 @@ mod tests {
             .expect("the retired sender");
         let before_next_frame = Instant::now();
         second
-            .write_i420(&frame, 320, 240, pts(0))
+            .write_i420_at(&frame, 320, 240, pts(0))
             .await
             .expect("second track frame");
         let after_next_frame = Instant::now();
@@ -761,7 +761,7 @@ mod tests {
             .expect("the retired sender");
         let frame = vec![128_u8; 320 * 240 * 3 / 2];
         second
-            .write_i420(&frame, 320, 240, Duration::ZERO)
+            .write_i420_at(&frame, 320, 240, Duration::ZERO)
             .await
             .expect("second track frame");
         let (next, _) = tokio::time::timeout(Duration::from_secs(5), remote.read_rtp())
@@ -819,7 +819,7 @@ mod tests {
         let frame = vec![128_u8; 320 * 240 * 3 / 2];
         let pts = |frame: u32| Duration::from_millis(33) * frame;
         second
-            .write_i420(&frame, 320, 240, pts(0))
+            .write_i420_at(&frame, 320, 240, pts(0))
             .await
             .expect("first frame");
         let remote = tokio::time::timeout(Duration::from_secs(5), remote_rx.recv())
@@ -840,7 +840,7 @@ mod tests {
         // Ten frames are far below the periodic keyframe interval.
         for n in 1..=10 {
             second
-                .write_i420(&frame, 320, 240, pts(n))
+                .write_i420_at(&frame, 320, 240, pts(n))
                 .await
                 .expect("frame");
             while let Ok(Ok((packet, _))) =

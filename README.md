@@ -195,9 +195,13 @@ Remote tracks expose participant and codec metadata as well as decoded and raw
 media. The example below subscribes to audio and video, doubles PCM amplitude,
 downscales video to a 512-pixel longest edge, and republishes both streams. A
 bounded channel absorbs short track-event bursts, and a `JoinSet` owns every
-media task so shutdown can cancel and reap them.
+media task so shutdown can cancel and reap them. One local track carries the
+media of one source, so the example republishes only the camera and microphone
+of the first participant whose track arrives.
 
 ```rust,no_run
+use std::time::Instant;
+
 use getstream::rtc::proto::models::TrackType;
 use getstream::rtc::{
     LocalAudioTrack, LocalVideoTrack, RemoteTrack, RtcResult, SubscriptionConfig,
@@ -210,9 +214,10 @@ async fn transform_track(
     track: RemoteTrack,
     outbound_audio: LocalAudioTrack,
     outbound_video: LocalVideoTrack,
+    started: Instant,
 ) -> RtcResult<()> {
     match track.track_type() {
-        TrackType::Audio | TrackType::ScreenShareAudio => {
+        TrackType::Audio => {
             while let Some(mut frame) = track.next_pcm().await {
                 for sample in &mut frame.samples {
                     *sample = sample.saturating_mul(2);
@@ -220,15 +225,19 @@ async fn transform_track(
                 outbound_audio.write_pcm(frame).await?;
             }
         }
-        TrackType::Video | TrackType::ScreenShare => {
+        TrackType::Video => {
+            // `elapsed` of each remote track starts at 0. The offset keeps the
+            // frames of a restarted camera after the earlier frames.
+            let offset = started.elapsed();
             while let Some(frame) = track.next_video_frame().await {
                 let frame = frame.downscale_to_fit(512);
+                let pts = offset + frame.elapsed;
                 outbound_video
-                    .write_i420(&frame.data, frame.width, frame.height, frame.pts)
+                    .write_i420_at(&frame.data, frame.width, frame.height, pts)
                     .await?;
             }
         }
-        TrackType::Unspecified => {}
+        _ => {}
     }
     Ok(())
 }
@@ -249,13 +258,19 @@ async fn run_media_bridge(call: &Call) -> Result<(), Box<dyn std::error::Error>>
     call.publish_audio(outbound_audio.clone()).await?;
     call.publish_video(outbound_video.clone()).await?;
 
+    let started = Instant::now();
+    let mut source = None;
     let mut track_tasks = JoinSet::new();
     loop {
         tokio::select! {
             Some(track) = track_rx.recv() => {
+                let session_id = &track.participant().session_id;
+                if source.get_or_insert_with(|| session_id.clone()) != session_id {
+                    continue;
+                }
                 let outbound_audio = outbound_audio.clone();
                 let outbound_video = outbound_video.clone();
-                track_tasks.spawn(transform_track(track, outbound_audio, outbound_video));
+                track_tasks.spawn(transform_track(track, outbound_audio, outbound_video, started));
             }
             Some(result) = track_tasks.join_next(), if !track_tasks.is_empty() => {
                 result??;

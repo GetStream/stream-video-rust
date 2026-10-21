@@ -2,7 +2,7 @@
 //! [`RemoteTrack::next_video_frame`](crate::rtc::RemoteTrack::next_video_frame).
 //!
 //! Frames are packed I420 (YUV 4:2:0 planar) — the same layout
-//! [`LocalVideoTrack::write_i420`](crate::rtc::LocalVideoTrack::write_i420)
+//! [`LocalVideoTrack::write_i420_at`](crate::rtc::LocalVideoTrack::write_i420_at)
 //! consumes, so a decode → transform → re-encode bridge needs no conversion in
 //! between.
 //!
@@ -39,8 +39,10 @@ pub struct VideoFrame {
     /// The time of the frame from the first frame of the remote track, from
     /// the RTP timestamps. It does not wrap like `rtp_timestamp`, so it can be
     /// the `pts` of
-    /// [`LocalVideoTrack::write_i420`](crate::rtc::LocalVideoTrack::write_i420).
-    pub pts: Duration,
+    /// [`LocalVideoTrack::write_i420_at`](crate::rtc::LocalVideoTrack::write_i420_at).
+    /// A late frame can have an `elapsed` that is not after the previous one,
+    /// and a frame before the first frame has the `elapsed` 0.
+    pub elapsed: Duration,
 }
 
 /// Chroma plane dimensions for a `width`x`height` I420 frame.
@@ -126,7 +128,7 @@ impl VideoFrame {
             height: dh,
             data,
             rtp_timestamp: self.rtp_timestamp,
-            pts: self.pts,
+            elapsed: self.elapsed,
         }
     }
 
@@ -187,7 +189,7 @@ mod tests {
             height,
             data,
             rtp_timestamp: 900,
-            pts: Duration::ZERO,
+            elapsed: Duration::ZERO,
         }
     }
 

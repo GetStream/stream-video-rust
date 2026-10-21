@@ -117,7 +117,7 @@ pub enum RtcError {
 
     /// A server-managed layered track was given input that cannot be split
     /// safely into independent encodings by the SDK.
-    #[error("{input} is unsupported for server-managed layered video; use write_i420")]
+    #[error("{input} is unsupported for server-managed layered video; use write_i420_at")]
     UnsupportedLayeredInput {
         /// The rejected input path.
         input: &'static str,

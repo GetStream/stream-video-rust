@@ -142,7 +142,11 @@ fn spawn_blue_video_at(track: LocalVideoTrack, width: u32, height: u32) -> JoinH
         let mut pts = Duration::ZERO;
         loop {
             interval.tick().await;
-            if track.write_i420(&frame, width, height, pts).await.is_err() {
+            if track
+                .write_i420_at(&frame, width, height, pts)
+                .await
+                .is_err()
+            {
                 return;
             }
             pts += Duration::from_millis(100);

@@ -741,7 +741,7 @@ impl VpxDecoder {
     }
 
     /// Decode one reassembled VP8/VP9 frame, returning every picture libvpx
-    /// produced. `rtp_timestamp` and the `pts` from it are copied onto each
+    /// produced. `rtp_timestamp` and the `elapsed` from it are copied onto each
     /// frame.
     ///
     /// An empty result is normal, not an error: with frame threading libvpx may
@@ -756,7 +756,9 @@ impl VpxDecoder {
             ticks.saturating_add(i64::from(rtp_timestamp.wrapping_sub(last) as i32))
         });
         self.last_rtp_timestamp = Some((rtp_timestamp, ticks));
-        let pts = Duration::from_nanos(u64::try_from(ticks).unwrap_or(0) * 100_000 / 9);
+        let ticks = u64::try_from(ticks).unwrap_or(0);
+        let elapsed = Duration::from_secs(ticks / 90_000)
+            + Duration::from_nanos(ticks % 90_000 * 100_000 / 9);
         // A VP8 frame changes its size only on a keyframe.
         if self.codec == VpxCodec::Vp8 {
             let mut info = vpx_codec_stream_info_t {
@@ -809,7 +811,7 @@ impl VpxDecoder {
                 if img.is_null() {
                     break;
                 }
-                match copy_i420(&*img, rtp_timestamp, pts) {
+                match copy_i420(&*img, rtp_timestamp, elapsed) {
                     Some(frame) => frames.push(frame),
                     None => tracing::debug!(
                         fmt = ?(*img).fmt,
@@ -843,7 +845,11 @@ impl Drop for VpxDecoder {
 ///
 /// `img` must be a live `vpx_image_t` returned by `vpx_codec_get_frame`, whose
 /// planes stay valid until the next `vpx_codec_decode` call.
-unsafe fn copy_i420(img: &vpx_image_t, rtp_timestamp: u32, pts: Duration) -> Option<VideoFrame> {
+unsafe fn copy_i420(
+    img: &vpx_image_t,
+    rtp_timestamp: u32,
+    elapsed: Duration,
+) -> Option<VideoFrame> {
     if img.fmt != VPX_IMG_FMT_I420 {
         return None;
     }
@@ -882,7 +888,7 @@ unsafe fn copy_i420(img: &vpx_image_t, rtp_timestamp: u32, pts: Duration) -> Opt
         height,
         data,
         rtp_timestamp,
-        pts,
+        elapsed,
     })
 }
 
@@ -1138,7 +1144,7 @@ mod tests {
     }
 
     #[test]
-    fn decoded_pts_continues_across_the_rtp_timestamp_wrap() {
+    fn decoded_elapsed_continues_across_the_rtp_timestamp_wrap() {
         let mut enc = VpxEncoder::new(VpxCodec::Vp9, 320, 240, 1_000).expect("encoder");
         let mut dec = VpxDecoder::new(VpxCodec::Vp9).expect("decoder");
         let source = ramp_i420(320, 240);
@@ -1151,8 +1157,26 @@ mod tests {
             }
         }
 
-        let pts: Vec<Duration> = frames.iter().map(|frame| frame.pts).collect();
-        assert_eq!(pts, [Duration::ZERO, Duration::from_secs(1) / 30]);
+        let elapsed: Vec<Duration> = frames.iter().map(|frame| frame.elapsed).collect();
+        assert_eq!(elapsed, [Duration::ZERO, Duration::from_secs(1) / 30]);
+    }
+
+    /// A remote sender controls the RTP timestamps, so the ticks can reach the
+    /// end of their range.
+    #[test]
+    fn decoded_elapsed_stays_large_at_the_end_of_the_tick_range() {
+        let mut enc = VpxEncoder::new(VpxCodec::Vp9, 320, 240, 1_000).expect("encoder");
+        let mut dec = VpxDecoder::new(VpxCodec::Vp9).expect("decoder");
+        dec.last_rtp_timestamp = Some((0, i64::MAX - 1));
+        let source = ramp_i420(320, 240);
+
+        let mut frames = Vec::new();
+        for packet in &enc.encode(&source, 0, 33, true).expect("encode") {
+            frames.extend(dec.decode(&packet.data, 3_000).expect("decode"));
+        }
+
+        // i64::MAX ticks at 90 kHz are about 1e14 seconds.
+        assert!(frames[0].elapsed > Duration::from_secs(100_000_000_000_000));
     }
 
     /// `copy_i420` reads the dimensions off each image, so one decoder must
