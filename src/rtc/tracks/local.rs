@@ -401,6 +401,13 @@ impl RtpTimeline {
         timestamp
     }
 
+    /// Return the timestamp of a frame captured at `source` on a clock of the
+    /// caller. The first captured frame gets the timestamp of the next frame.
+    fn capture(&mut self, source: u32) -> u32 {
+        self.timestamp.get_or_insert_with(random_u32);
+        self.forward(source)
+    }
+
     /// Return the timestamp of a forwarded packet with the inbound timestamp
     /// `source`. The first forwarded packet gets the timestamp of the next
     /// frame, or keeps `source` when there was no earlier write.
@@ -1038,7 +1045,10 @@ struct VideoEncoder {
 /// The presentation clock. The RTP timestamps of all encodings come from the
 /// RTP timeline of the first encoding.
 struct VideoClock {
+    /// The presentation time of the next frame, or of the last captured frame.
     next_pts: i64,
+    /// The capture time of the last frame of `write_i420_at`.
+    last_capture: Option<Duration>,
 }
 
 impl VideoClock {
@@ -1049,6 +1059,36 @@ impl VideoClock {
         self.next_pts = self.next_pts.saturating_add(dur_ms);
         current
     }
+
+    /// Return the presentation time of a frame captured at `capture_time`, and
+    /// the milliseconds since the previous captured frame (at least 1). The
+    /// first captured frame gets the presentation time of the next frame. A
+    /// capture time that is not after the previous one is an error.
+    fn capture(&mut self, capture_time: Duration) -> Result<(i64, i64)> {
+        let step = match self.last_capture {
+            Some(last) if capture_time <= last => {
+                return Err(RtcError::Media(format!(
+                    "capture time {capture_time:?} is not after the previous capture time {last:?}"
+                )));
+            }
+            Some(last) => {
+                i64::try_from(capture_time.as_millis() - last.as_millis()).unwrap_or(i64::MAX)
+            }
+            None => 0,
+        };
+        self.last_capture = Some(capture_time);
+        self.next_pts = self.next_pts.saturating_add(step);
+        Ok((self.next_pts, step.max(1)))
+    }
+}
+
+/// The timing of a raw video frame.
+#[derive(Clone, Copy)]
+enum FrameTime {
+    /// The length of the frame. The next frame starts after it.
+    Duration(Duration),
+    /// The capture time of the frame on a clock of the caller.
+    Capture(Duration),
 }
 
 struct VideoEncoding {
@@ -1081,6 +1121,32 @@ struct VideoInner {
     svc_temporal_layers: AtomicU8,
     svc_max_spatial_layers: AtomicU8,
     svc_max_temporal_layers: AtomicU8,
+}
+
+impl VideoInner {
+    /// Move the presentation clock and the RTP timeline past a frame. Return
+    /// the presentation time of the frame, its length in milliseconds for the
+    /// encoder, and its RTP timestamp.
+    fn time_frame(&self, time: FrameTime) -> Result<(i64, i64, u32)> {
+        let core = &self.encodings[0].core;
+        let mut clock = self.clock.lock().unwrap_or_else(|e| e.into_inner());
+        let mut rtp = core.rtp.lock().unwrap_or_else(|e| e.into_inner());
+        Ok(match time {
+            FrameTime::Duration(duration) => {
+                let dur_ms = i64::try_from(duration.as_millis().max(1)).unwrap_or(i64::MAX);
+                let samples = (duration.as_secs_f64() * f64::from(core.clock_rate)) as u32;
+                (clock.advance(dur_ms), dur_ms, rtp.advance(samples))
+            }
+            FrameTime::Capture(capture_time) => {
+                let (pts, dur_ms) = clock.capture(capture_time)?;
+                // Rounded to the nearest tick: 1/30 s is 3 000 ticks at 90 kHz.
+                let ticks = (capture_time.as_nanos() * u128::from(core.clock_rate) + 500_000_000)
+                    / 1_000_000_000;
+                // RTP timestamps wrap at 32 bits.
+                (pts, dur_ms, rtp.capture(ticks as u32))
+            }
+        })
+    }
 }
 
 /// Controls whether a local video track uses one encoding or lets the SFU
@@ -1252,7 +1318,10 @@ impl LocalVideoTrack {
                 encodings,
                 codec_id,
                 encode_gate: Arc::new(Semaphore::new(1)),
-                clock: StdMutex::new(VideoClock { next_pts: 0 }),
+                clock: StdMutex::new(VideoClock {
+                    next_pts: 0,
+                    last_capture: None,
+                }),
                 active_encoding_count: AtomicU8::new(1),
                 layering: config.layering,
                 planned_width: AtomicU32::new(0),
@@ -1269,9 +1338,11 @@ impl LocalVideoTrack {
     ///
     /// `data` is the packed I420 buffer (`width*height` luma bytes, then two
     /// `width/2*height/2` chroma planes; `len >= width*height*3/2`). `width` and
-    /// `height` must be even. `duration` is the frame's on-wire duration and
-    /// advances the RTP timestamp. The SDK encodes to the track's codec, forcing
-    /// a periodic keyframe (see `KEYFRAME_INTERVAL_MS`) so late
+    /// `height` must be even. `duration` is the length of this frame: the RTP
+    /// timestamp of the next frame is `duration` after the one of this frame.
+    /// For a source that gives capture times, use
+    /// [`write_i420_at`](Self::write_i420_at). The SDK encodes to the track's
+    /// codec, forcing a periodic keyframe (see `KEYFRAME_INTERVAL_MS`) so late
     /// subscribers can decode, then packetizes and writes RTP.
     pub async fn write_i420(
         &self,
@@ -1280,14 +1351,43 @@ impl LocalVideoTrack {
         height: u32,
         duration: Duration,
     ) -> Result<()> {
+        self.write_i420_inner(data, width, height, FrameTime::Duration(duration))
+            .await
+    }
+
+    /// Encode and publish a raw I420 frame captured at `capture_time`. The
+    /// other arguments are as for [`write_i420`](Self::write_i420).
+    ///
+    /// `capture_time` is the time of the frame on a clock of the caller, for
+    /// example the presentation time of a decoded frame. The RTP timestamps
+    /// keep the spacing of the capture times, and the first frame continues
+    /// the RTP timeline of the track. Each capture time must be after the
+    /// previous one, else the call returns [`RtcError::Media`] and writes
+    /// nothing. Do not call `write_i420` after this method on the same track:
+    /// its frame gets the RTP timestamp of the previous frame.
+    pub async fn write_i420_at(
+        &self,
+        data: &[u8],
+        width: u32,
+        height: u32,
+        capture_time: Duration,
+    ) -> Result<()> {
+        self.write_i420_inner(data, width, height, FrameTime::Capture(capture_time))
+            .await
+    }
+
+    async fn write_i420_inner(
+        &self,
+        data: &[u8],
+        width: u32,
+        height: u32,
+        time: FrameTime,
+    ) -> Result<()> {
         if self.inner.encodings[0].core.stopped.load(Ordering::SeqCst) {
             return Err(RtcError::IllegalState(
                 "write to a stopped track".to_owned(),
             ));
         }
-        let dur_ms = i64::try_from(duration.as_millis().max(1)).unwrap_or(i64::MAX);
-        let samples =
-            (duration.as_secs_f64() * f64::from(self.inner.encodings[0].core.clock_rate)) as u32;
         if self
             .inner
             .encodings
@@ -1298,17 +1398,7 @@ impl LocalVideoTrack {
             .all(|encoding| encoding.core.is_output_paused())
         {
             // The RTP clock keeps time while no frame goes out.
-            self.inner
-                .clock
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .advance(dur_ms);
-            self.inner.encodings[0]
-                .core
-                .rtp
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .advance(samples);
+            self.inner.time_frame(time)?;
             return Ok(());
         }
         if width == 0 || height == 0 || !width.is_multiple_of(2) || !height.is_multiple_of(2) {
@@ -1375,7 +1465,7 @@ impl LocalVideoTrack {
         let frame = data[..expected].to_vec();
         let encoded_layers = tokio::task::spawn_blocking(move || {
             let _permit = permit;
-            encode_i420_layers(&inner, &frame, width, height, dur_ms, samples)
+            encode_i420_layers(&inner, &frame, width, height, time)
         })
         .await
         .map_err(|error| RtcError::Media(format!("video encode worker failed: {error}")))??;
@@ -1814,20 +1904,9 @@ fn encode_i420_layers(
     data: &[u8],
     width: u32,
     height: u32,
-    dur_ms: i64,
-    samples: u32,
+    time: FrameTime,
 ) -> Result<Vec<(usize, Vec<RtpPacket>)>> {
-    let pts = inner
-        .clock
-        .lock()
-        .unwrap_or_else(|error| error.into_inner())
-        .advance(dur_ms);
-    let timestamp = inner.encodings[0]
-        .core
-        .rtp
-        .lock()
-        .unwrap_or_else(|error| error.into_inner())
-        .advance(samples);
+    let (pts, dur_ms, timestamp) = inner.time_frame(time)?;
     let count = usize::from(inner.active_encoding_count.load(Ordering::SeqCst));
     let mut output = Vec::with_capacity(count);
     for (index, encoding) in inner.encodings.iter().take(count).enumerate() {
@@ -3052,6 +3131,65 @@ mod tests {
         let _ = receiver.close().await;
     }
 
+    #[tokio::test]
+    async fn write_i420_at_spaces_rtp_timestamps_by_capture_time() {
+        use webrtc::rtp_transceiver::rtp_codec::RTPCodecType;
+
+        let track = LocalVideoTrack::vp9().expect("vp9 track");
+        let sender = peer::new_peer_connection(&[]).await.expect("sender");
+        sender
+            .add_track(track.webrtc_track())
+            .await
+            .expect("add track");
+        let (receiver, mut remote_rx) = peer::connect_receiver(&sender, RTPCodecType::Video).await;
+        let frame = vec![128_u8; 320 * 240 * 3 / 2];
+
+        // 30 fps, a pause of one second, then 30 fps again.
+        for thirtieths in [0, 1, 2, 32, 33] {
+            track
+                .write_i420_at(&frame, 320, 240, Duration::from_secs(thirtieths) / 30)
+                .await
+                .expect("frame");
+        }
+        let remote = tokio::time::timeout(Duration::from_secs(5), remote_rx.recv())
+            .await
+            .expect("remote track")
+            .expect("remote track channel");
+        let mut timestamps = Vec::new();
+        while let Ok(Ok((packet, _))) =
+            tokio::time::timeout(Duration::from_millis(100), remote.read_rtp()).await
+        {
+            if timestamps.last() != Some(&packet.header.timestamp) {
+                timestamps.push(packet.header.timestamp);
+            }
+        }
+
+        let steps: Vec<u32> = timestamps
+            .windows(2)
+            .map(|pair| pair[1].wrapping_sub(pair[0]))
+            .collect();
+        assert_eq!(steps, [3_000, 3_000, 90_000, 3_000]);
+        let _ = sender.close().await;
+        let _ = receiver.close().await;
+    }
+
+    #[tokio::test]
+    async fn write_i420_at_rejects_a_capture_time_that_does_not_increase() {
+        let track = LocalVideoTrack::vp9().expect("vp9 track");
+        let frame = vec![128_u8; 320 * 240 * 3 / 2];
+        let capture_time = Duration::from_millis(100);
+        track
+            .write_i420_at(&frame, 320, 240, capture_time)
+            .await
+            .expect("frame");
+
+        let error = track
+            .write_i420_at(&frame, 320, 240, capture_time)
+            .await
+            .expect_err("a second frame at the same capture time");
+        assert!(matches!(error, RtcError::Media(_)), "error was: {error}");
+    }
+
     /// The first RTP timestamp of a new track is random over 32 bits. The
     /// probability that all three first timestamps are below 65536 is 2^-48.
     #[tokio::test]
@@ -3594,8 +3732,9 @@ mod tests {
             .expect("configure layers");
         let frame = vec![128; 320 * 240 * 3 / 2];
 
+        let frame_time = FrameTime::Duration(Duration::from_millis(100));
         let first =
-            encode_i420_layers(&track.inner, &frame, 320, 240, 100, 9_000).expect("first picture");
+            encode_i420_layers(&track.inner, &frame, 320, 240, frame_time).expect("first picture");
         let first_packets = &first[0].1;
         let first_last = first_packets.last().expect("first RTP packet");
         assert_eq!(
@@ -3613,7 +3752,7 @@ mod tests {
             scale_resolution_down_by: 1.0,
             ..Default::default()
         }]);
-        let second = encode_i420_layers(&track.inner, &frame, 320, 240, 100, 9_000)
+        let second = encode_i420_layers(&track.inner, &frame, 320, 240, frame_time)
             .expect("reconfigured picture");
         let second_first = second[0].1.first().expect("second RTP packet");
 
@@ -3645,10 +3784,11 @@ mod tests {
         ] {
             let small = vec![128; 320 * 240 * 3 / 2];
             let large = vec![128; 640 * 480 * 3 / 2];
-            let first = encode_i420_layers(&track.inner, &small, 320, 240, 100, 9_000)
+            let frame_time = FrameTime::Duration(Duration::from_millis(100));
+            let first = encode_i420_layers(&track.inner, &small, 320, 240, frame_time)
                 .expect("first frame");
             // A new size sets up the encoder again.
-            let second = encode_i420_layers(&track.inner, &large, 640, 480, 100, 9_000)
+            let second = encode_i420_layers(&track.inner, &large, 640, 480, frame_time)
                 .expect("frame at the new size");
 
             let first_id = picture_id(&first[0].1[0].payload, offset);
