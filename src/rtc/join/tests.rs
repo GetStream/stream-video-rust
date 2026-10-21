@@ -1843,6 +1843,127 @@ async fn forced_strategy_failures_reach_timeout_and_refresh_over_http() {
     }
 }
 
+/// A local SFU WebSocket that accepts every connection. The first `JoinRequest`
+/// gets a `JoinResponse` with a long fast-reconnect deadline, each later one
+/// gets `answer`.
+async fn fake_sfu_answering_fast_reconnects(answer: sfu_event::EventPayload) -> Credentials {
+    use futures_util::{SinkExt, StreamExt};
+    use prost::Message as _;
+    use tokio_tungstenite::tungstenite::Message;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind fake SFU");
+    let address = listener.local_addr().expect("fake SFU address");
+    tokio::spawn(async move {
+        let mut first = true;
+        while let Ok((stream, _)) = listener.accept().await {
+            let payload = if std::mem::take(&mut first) {
+                sfu_event::EventPayload::JoinResponse(JoinResponse {
+                    fast_reconnect_deadline_seconds: 60,
+                    ..Default::default()
+                })
+            } else {
+                answer.clone()
+            };
+            tokio::spawn(async move {
+                let mut socket = tokio_tungstenite::accept_async(stream)
+                    .await
+                    .expect("SFU WebSocket handshake");
+                while let Some(Ok(message)) = socket.next().await {
+                    let Message::Binary(bytes) = message else {
+                        continue;
+                    };
+                    let request = event::SfuRequest::decode(bytes).expect("SFU request");
+                    if matches!(
+                        request.request_payload,
+                        Some(event::sfu_request::RequestPayload::JoinRequest(_))
+                    ) {
+                        let response = SfuEvent {
+                            event_payload: Some(payload.clone()),
+                        };
+                        let _ = socket
+                            .send(Message::Binary(response.encode_to_vec().into()))
+                            .await;
+                    }
+                }
+            });
+        }
+    });
+    Credentials {
+        server: coordinator::SfuServer {
+            edge_name: "fake-edge".to_owned(),
+            url: "http://127.0.0.1:9/twirp".to_owned(),
+            ws_endpoint: format!("ws://{address}/ws"),
+        },
+        token: "sfu-token".to_owned(),
+        ice_servers: Vec::new(),
+    }
+}
+
+#[tokio::test]
+async fn fast_reconnect_the_sfu_does_not_resume_falls_back_to_rejoin() {
+    let not_resumed = sfu_event::EventPayload::JoinResponse(JoinResponse {
+        reconnected: false,
+        ..Default::default()
+    });
+    let participant_not_found = sfu_event::EventPayload::Error(event::Error {
+        error: Some(models::Error {
+            code: models::ErrorCode::ParticipantNotFound as i32,
+            message: "participant not found".to_owned(),
+            should_retry: false,
+        }),
+        reconnect_strategy: models::WebsocketReconnectStrategy::Unspecified as i32,
+    });
+    for answer in [not_resumed, participant_not_found] {
+        let core = test_core();
+        let generation = prepare_joined_core(&core, "alice");
+        let credentials = fake_sfu_answering_fast_reconnects(answer.clone()).await;
+        let connection = core
+            .clone()
+            .establish(
+                &credentials,
+                0,
+                ReconnectStrategy::Fast,
+                None,
+                generation,
+                None,
+            )
+            .await
+            .expect("establish against fake SFU");
+        connection.ws_healthy.store(false, Ordering::SeqCst);
+        *core.connection.lock().await = Some(connection);
+        let probe = Arc::new(ReconnectProbe::default());
+        probe.fail_once(
+            ReconnectStrategy::Rejoin,
+            ReconnectFaultPoint::BeforeAttempt,
+        );
+        core.install_reconnect_probe(probe.clone());
+
+        core.trigger_reconnect(generation, ReconnectStrategy::Fast, "ws closed".to_owned());
+        let attempts = || {
+            probe
+                .attempts
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .clone()
+        };
+        wait_for(
+            Duration::from_secs(3),
+            || attempts().len() >= 2,
+            "second reconnect attempt",
+        )
+        .await;
+
+        assert_eq!(
+            attempts()[..2],
+            [ReconnectStrategy::Fast, ReconnectStrategy::Rejoin],
+            "answer: {answer:?}"
+        );
+        core.leave("test leave").await.expect("leave");
+    }
+}
+
 #[tokio::test]
 async fn leave_cancels_reconnect_task_before_next_generation() {
     let core = test_core();
