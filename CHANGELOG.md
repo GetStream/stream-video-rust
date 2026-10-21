@@ -1,19 +1,37 @@
 # Unreleased
 
-## New Features
+## Breaking Changes
 
-### Video frames with a capture time
+### Video frames carry their own time
 
-`LocalVideoTrack::write_i420_at` takes the capture time of a frame instead of
-its length. The RTP timestamps keep the spacing of the capture times. With
-`write_i420`, the `duration` of a frame sets the RTP timestamp of the next
-frame. A source with timestamps knows that length only when the next frame
-arrives, so a caller had to hold each frame for one frame interval, or send
-timestamps that were one frame late when the frame rate changed. Each capture
-time must be after the previous one, else `write_i420_at` returns
-`RtcError::Media`.
+`LocalVideoTrack::write_i420` and `LocalVideoTrack::write_sample` take the
+`pts` of a frame instead of its length. `pts` is the time of the frame on a
+clock of the caller, for example the capture time of a camera frame. The RTP
+timestamps keep the spacing of the `pts` values. Before, the length of a frame
+set the RTP timestamp of the next frame. A source with timestamps knows that
+length only when the next frame arrives, so a caller had to hold each frame for
+one frame interval, or send timestamps that were one frame late when the frame
+rate changed. A source at a fixed rate can give the frame number times the
+frame interval. Each `pts` must be after the previous one, else the call
+returns `RtcError::Media`. All writes to one video track must use one clock.
+
+`VideoFrame` adds `pts: Duration`: the time of the frame from the first frame
+of the remote track. It does not wrap like `rtp_timestamp`, so it can be the
+`pts` of `write_i420`. Code that builds `VideoFrame` with a struct literal must
+set `pts`.
+
+The encoder gets frames at the maximum frame rate of the encoding, or at 30 fps
+when the SFU sets no maximum, as in libwebrtc. libvpx rate control does not
+work well with the real frame intervals.
 
 ## Fixes
+
+- A track that takes over the sender of a stopped track counts the time from
+  the last video frame or forwarded RTP packet of the stopped track to its own
+  first write. Before, it counted the time from the stop, so its first frame
+  could get almost the same timestamp as the last frame of the stopped track.
+  After `write_rtp`, the next `write_pcm` or `write_sample` of an audio track
+  also counts the time since the last forwarded packet.
 
 - `stop_publish` uses the track type of the publication, not the track type of
   its argument. Before, a screen share stopped with `LocalTrack::from(track)`
