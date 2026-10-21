@@ -1846,7 +1846,7 @@ async fn forced_strategy_failures_reach_timeout_and_refresh_over_http() {
 /// A local SFU WebSocket that accepts every connection. The first `JoinRequest`
 /// gets a `JoinResponse` with a long fast-reconnect deadline, each later one
 /// gets `answer`.
-async fn fake_sfu_answering_rejoins(answer: sfu_event::EventPayload) -> Credentials {
+async fn fake_sfu_answering_fast_reconnects(answer: sfu_event::EventPayload) -> Credentials {
     use futures_util::{SinkExt, StreamExt};
     use prost::Message as _;
     use tokio_tungstenite::tungstenite::Message;
@@ -1918,7 +1918,7 @@ async fn fast_reconnect_the_sfu_does_not_resume_falls_back_to_rejoin() {
     for answer in [not_resumed, participant_not_found] {
         let core = test_core();
         let generation = prepare_joined_core(&core, "alice");
-        let credentials = fake_sfu_answering_rejoins(answer.clone()).await;
+        let credentials = fake_sfu_answering_fast_reconnects(answer.clone()).await;
         let connection = core
             .clone()
             .establish(
