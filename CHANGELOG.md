@@ -7,6 +7,11 @@
   sent a mute for `VIDEO`, and the screen share stayed published for the other
   participants. Screen-share audio stopped as `LocalTrack::Audio` had the same
   problem.
+- The minimum `rustls` is 0.23.46, and the lockfile uses `rustls-webpki`
+  0.103.16, `webpki-roots` 1.0.10 and `webpki-root-certs` 1.0.10. These
+  releases fix RUSTSEC-2026-0346,
+  RUSTSEC-2026-0347, RUSTSEC-2026-0348, RUSTSEC-2026-0349, RUSTSEC-2026-0381,
+  RUSTSEC-2026-0382 and RUSTSEC-2026-0383.
 
 # v0.1.0
 
