@@ -1,5 +1,18 @@
 # Unreleased
 
+## New Features
+
+### Video frames with a capture time
+
+`LocalVideoTrack::write_i420_at` takes the capture time of a frame instead of
+its length. The RTP timestamps keep the spacing of the capture times. With
+`write_i420`, the `duration` of a frame sets the RTP timestamp of the next
+frame. A source with timestamps knows that length only when the next frame
+arrives, so a caller had to hold each frame for one frame interval, or send
+timestamps that were one frame late when the frame rate changed. Each capture
+time must be after the previous one, else `write_i420_at` returns
+`RtcError::Media`.
+
 ## Fixes
 
 - `stop_publish` uses the track type of the publication, not the track type of
