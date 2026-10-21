@@ -198,8 +198,6 @@ bounded channel absorbs short track-event bursts, and a `JoinSet` owns every
 media task so shutdown can cancel and reap them.
 
 ```rust,no_run
-use std::time::Duration;
-
 use getstream::rtc::proto::models::TrackType;
 use getstream::rtc::{
     LocalAudioTrack, LocalVideoTrack, RemoteTrack, RtcResult, SubscriptionConfig,
@@ -226,12 +224,7 @@ async fn transform_track(
             while let Some(frame) = track.next_video_frame().await {
                 let frame = frame.downscale_to_fit(512);
                 outbound_video
-                    .write_i420(
-                        &frame.data,
-                        frame.width,
-                        frame.height,
-                        Duration::from_millis(33),
-                    )
+                    .write_i420(&frame.data, frame.width, frame.height, frame.pts)
                     .await?;
             }
         }

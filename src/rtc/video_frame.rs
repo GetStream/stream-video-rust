@@ -11,6 +11,8 @@
 //! this crate. [`VideoFrame::to_rgb8`] and [`VideoFrame::downscale`] cover what a
 //! bot needs to hand a frame to a vision model or shrink it before re-encoding.
 
+use std::time::Duration;
+
 /// One decoded video frame in packed I420.
 ///
 /// `data` layout, for `w = width` and `h = height`:
@@ -34,6 +36,11 @@ pub struct VideoFrame {
     /// The RTP timestamp (90 kHz video clock) of the sample this was decoded
     /// from. Use it to order or pace frames; it is not a wall clock.
     pub rtp_timestamp: u32,
+    /// The time of the frame from the first frame of the remote track, from
+    /// the RTP timestamps. It does not wrap like `rtp_timestamp`, so it can be
+    /// the `pts` of
+    /// [`LocalVideoTrack::write_i420`](crate::rtc::LocalVideoTrack::write_i420).
+    pub pts: Duration,
 }
 
 /// Chroma plane dimensions for a `width`x`height` I420 frame.
@@ -119,6 +126,7 @@ impl VideoFrame {
             height: dh,
             data,
             rtp_timestamp: self.rtp_timestamp,
+            pts: self.pts,
         }
     }
 
@@ -179,6 +187,7 @@ mod tests {
             height,
             data,
             rtp_timestamp: 900,
+            pts: Duration::ZERO,
         }
     }
 

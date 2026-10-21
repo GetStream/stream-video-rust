@@ -444,23 +444,25 @@ mod tests {
         let takeover = take_over_audio_sender(AudioWriter::Pcm, AudioWriter::Rtp).await;
 
         // One 20 ms frame, then the time from the stop to the replace.
-        takeover.assert_continues_after(960);
+        takeover.assert_continues(960, takeover.waited, takeover.replaced);
     }
 
     #[tokio::test]
     async fn a_forwarding_track_continues_the_rtp_timeline_of_a_retired_forwarding_track() {
         let takeover = take_over_audio_sender(AudioWriter::Rtp, AudioWriter::Rtp).await;
 
-        // The time from the stop to the replace.
-        takeover.assert_continues_after(0);
+        // The time from the last packet of the first track to the first
+        // packet of the second track.
+        takeover.assert_continues(0, takeover.waited, takeover.total);
     }
 
     #[tokio::test]
     async fn a_pcm_track_continues_the_rtp_timeline_of_a_retired_forwarding_track() {
         let takeover = take_over_audio_sender(AudioWriter::Rtp, AudioWriter::Pcm).await;
 
-        // The time from the stop to the replace.
-        takeover.assert_continues_after(0);
+        // The time from the last packet of the first track to the first
+        // packet of the second track.
+        takeover.assert_continues(0, takeover.waited, takeover.total);
     }
 
     /// How a test track writes its audio.
@@ -511,12 +513,14 @@ mod tests {
         waited: Duration,
         /// The maximum time from the stop to the replace.
         replaced: Duration,
+        /// The time from the start of the first track to the receipt of `next`.
+        total: Duration,
     }
 
     impl AudioTakeover {
         /// Assert that `next` follows `last`, and that its timestamp advanced
-        /// by `frame` samples plus the time from the stop to the replace.
-        fn assert_continues_after(&self, frame: u32) {
+        /// by `frame` samples plus a time from `shortest` to `longest`.
+        fn assert_continues(&self, frame: u32, shortest: Duration, longest: Duration) {
             assert_eq!(
                 self.next.header.sequence_number,
                 self.last.header.sequence_number.wrapping_add(1)
@@ -528,10 +532,8 @@ mod tests {
                 .timestamp
                 .wrapping_sub(self.last.header.timestamp);
             assert!(
-                (expected(self.waited)..=expected(self.replaced)).contains(&advanced),
-                "the timestamp advanced {advanced} samples over a stop of {:?} to {:?}",
-                self.waited,
-                self.replaced
+                (expected(shortest)..=expected(longest)).contains(&advanced),
+                "the timestamp advanced {advanced} samples over {shortest:?} to {longest:?}"
             );
         }
     }
@@ -554,6 +556,7 @@ mod tests {
             .await
             .expect("first transceiver");
         let (receiver, mut remote_rx) = peer::connect_audio_receiver(&publisher).await;
+        let started = Instant::now();
         first.start(&first_track, 0).await;
         let remote = tokio::time::timeout(Duration::from_secs(5), remote_rx.recv())
             .await
@@ -588,6 +591,7 @@ mod tests {
             .await
             .expect("the receiver takes the packets of the second track")
             .expect("second track packet");
+        let total = started.elapsed();
 
         track.stop();
         reader.abort();
@@ -601,6 +605,7 @@ mod tests {
             next,
             waited,
             replaced,
+            total,
         }
     }
 
@@ -619,24 +624,30 @@ mod tests {
         let (receiver, mut remote_rx) =
             peer::connect_receiver(&publisher, RTPCodecType::Video).await;
         let frame = vec![128_u8; 320 * 240 * 3 / 2];
-        let frame_time = Duration::from_millis(33);
+        let pts = |frame: u32| Duration::from_millis(33) * frame;
         first
-            .write_i420(&frame, 320, 240, frame_time)
+            .write_i420(&frame, 320, 240, pts(0))
             .await
             .expect("first frame");
         let remote = tokio::time::timeout(Duration::from_secs(5), remote_rx.recv())
             .await
             .expect("remote track")
             .expect("remote track channel");
-        for _ in 0..3 {
+        for n in 1..3 {
             first
-                .write_i420(&frame, 320, 240, frame_time)
+                .write_i420(&frame, 320, 240, pts(n))
                 .await
                 .expect("frame");
         }
-        let before_stop = Instant::now();
+        let before_last_frame = Instant::now();
+        first
+            .write_i420(&frame, 320, 240, pts(3))
+            .await
+            .expect("last frame");
+        let after_last_frame = Instant::now();
+        // The first track stops some time after its last frame.
+        tokio::time::sleep(Duration::from_millis(100)).await;
         retired.stop();
-        let stopped = Instant::now();
         let mut last = None;
         while let Ok(Ok((packet, _))) =
             tokio::time::timeout(Duration::from_millis(200), remote.read_rtp()).await
@@ -644,7 +655,6 @@ mod tests {
             last = Some(packet);
         }
         let last = last.expect("packets of the first track");
-        let waited = stopped.elapsed();
 
         let second = LocalVideoTrack::vp9().expect("second track");
         let track = LocalTrack::Video {
@@ -655,11 +665,12 @@ mod tests {
             .await
             .expect("replace the retired track")
             .expect("the retired sender");
-        let replaced = before_stop.elapsed();
+        let before_next_frame = Instant::now();
         second
-            .write_i420(&frame, 320, 240, frame_time)
+            .write_i420(&frame, 320, 240, pts(0))
             .await
             .expect("second track frame");
+        let after_next_frame = Instant::now();
         let (next, _) = tokio::time::timeout(Duration::from_secs(5), remote.read_rtp())
             .await
             .expect("the receiver takes the packets of the second track")
@@ -669,12 +680,15 @@ mod tests {
             next.header.sequence_number,
             last.header.sequence_number.wrapping_add(1)
         );
-        // One 33 ms frame, then the time from the stop to the replace.
-        let expected = |gap: Duration| 2_970 + (gap.as_secs_f64() * 90_000.0) as u32;
+        // The time from the last frame of the first track to the first frame
+        // of the second track.
+        let ticks = |gap: Duration| (gap.as_secs_f64() * 90_000.0) as u32;
+        let shortest = ticks(before_next_frame - after_last_frame);
+        let longest = ticks(after_next_frame - before_last_frame);
         let advanced = next.header.timestamp.wrapping_sub(last.header.timestamp);
         assert!(
-            (expected(waited)..=expected(replaced)).contains(&advanced),
-            "the timestamp advanced {advanced} samples over a stop of {waited:?} to {replaced:?}"
+            (shortest..=longest).contains(&advanced),
+            "the timestamp advanced {advanced} ticks, not {shortest} to {longest}"
         );
         assert!(
             tokio::time::timeout(Duration::from_millis(200), remote_rx.recv())
@@ -705,6 +719,7 @@ mod tests {
             .expect("first transceiver");
         let (receiver, mut remote_rx) =
             peer::connect_receiver(&publisher, RTPCodecType::Video).await;
+        let started = Instant::now();
         let forwarding = first.clone();
         tokio::spawn(async move {
             let mut packet = RtpPacket {
@@ -726,7 +741,6 @@ mod tests {
             .expect("remote track")
             .expect("remote track channel");
         let (mut last, _) = remote.read_rtp().await.expect("first packet");
-        let before_stop = Instant::now();
         retired.stop();
         let stopped = Instant::now();
         while let Ok(Ok((packet, _))) =
@@ -745,27 +759,28 @@ mod tests {
             .await
             .expect("replace the retired track")
             .expect("the retired sender");
-        let replaced = before_stop.elapsed();
         let frame = vec![128_u8; 320 * 240 * 3 / 2];
         second
-            .write_i420(&frame, 320, 240, Duration::from_millis(33))
+            .write_i420(&frame, 320, 240, Duration::ZERO)
             .await
             .expect("second track frame");
         let (next, _) = tokio::time::timeout(Duration::from_secs(5), remote.read_rtp())
             .await
             .expect("the receiver takes the packets of the second track")
             .expect("second track packet");
+        let total = started.elapsed();
 
         assert_eq!(
             next.header.sequence_number,
             last.header.sequence_number.wrapping_add(1)
         );
-        // The time from the stop to the replace.
+        // The time from the last packet of the first track to the first frame
+        // of the second track.
         let expected = |gap: Duration| (gap.as_secs_f64() * 90_000.0) as u32;
         let advanced = next.header.timestamp.wrapping_sub(last.header.timestamp);
         assert!(
-            (expected(waited)..=expected(replaced)).contains(&advanced),
-            "the timestamp advanced {advanced} samples over a stop of {waited:?} to {replaced:?}"
+            (expected(waited)..=expected(total)).contains(&advanced),
+            "the timestamp advanced {advanced} ticks over {waited:?} to {total:?}"
         );
         track.stop();
         reader.abort();
@@ -802,9 +817,9 @@ mod tests {
             .expect("replace the retired track")
             .expect("the retired sender");
         let frame = vec![128_u8; 320 * 240 * 3 / 2];
-        let frame_time = Duration::from_millis(33);
+        let pts = |frame: u32| Duration::from_millis(33) * frame;
         second
-            .write_i420(&frame, 320, 240, frame_time)
+            .write_i420(&frame, 320, 240, pts(0))
             .await
             .expect("first frame");
         let remote = tokio::time::timeout(Duration::from_secs(5), remote_rx.recv())
@@ -823,9 +838,9 @@ mod tests {
             .expect("send PLI");
         let mut keyframes = 0;
         // Ten frames are far below the periodic keyframe interval.
-        for _ in 0..10 {
+        for n in 1..=10 {
             second
-                .write_i420(&frame, 320, 240, frame_time)
+                .write_i420(&frame, 320, 240, pts(n))
                 .await
                 .expect("frame");
             while let Ok(Ok((packet, _))) =
