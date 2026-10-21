@@ -41,7 +41,7 @@ pub enum RtcError {
         code: i32,
         /// Human-readable message from the SFU.
         message: String,
-        /// Whether the SFU hinted the call is retryable.
+        /// Whether the same request may be retried.
         should_retry: bool,
     },
 
@@ -330,7 +330,8 @@ pub struct SfuJoinError {
     pub code: i32,
     /// Human-readable message from the SFU.
     pub message: String,
-    /// Whether the SFU hinted retry is possible.
+    /// Not set by the SFU on an `Error` event. Use `reconnect_strategy` to
+    /// decide what to do.
     pub should_retry: bool,
     /// The `WebsocketReconnectStrategy` the SFU asked the client to follow.
     pub reconnect_strategy: i32,
