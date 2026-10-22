@@ -99,7 +99,7 @@ for the commands.
 ## Installation
 
 ```bash
-cargo add getstream@0.2.0-preview.1 tracing
+cargo add getstream@0.2.0 tracing
 cargo add tokio --features macros,rt-multi-thread,signal
 ```
 
@@ -107,13 +107,10 @@ Or in `Cargo.toml`:
 
 ```toml
 [dependencies]
-getstream = "0.2.0-preview.1"
+getstream = "0.2.0"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
 tracing = "0.1"
 ```
-
-`getstream = "0.2"` will not match this preview. Cargo only selects a pre-release
-when the version requirement includes one.
 
 The API reference is published at [docs.rs/getstream](https://docs.rs/getstream);
 from a checkout, generate it locally with `cargo doc --open`.

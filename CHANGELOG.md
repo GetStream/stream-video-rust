@@ -1,3 +1,8 @@
+# v0.2.0
+
+First release of 0.2 without a pre-release suffix. The code is the same as in
+v0.2.0-preview.1. `getstream = "0.2"` now selects this release.
+
 # v0.2.0-preview.1
 
 ## Breaking Changes
