@@ -7,6 +7,8 @@
   attempt has 60 s for the full download. An HTTP 404 status is not retried.
   Before, a connection that dropped partway through the download stopped the
   build, and a stalled connection made the build wait with no limit.
+- The minimum `tokio` is 1.53.3, and the lockfile uses `tokio` 1.54.1 and
+  `ctutils` 0.4.6. These releases fix RUSTSEC-2026-0386 and RUSTSEC-2026-0385.
 
 # v0.2.0
 
