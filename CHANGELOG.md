@@ -1,3 +1,10 @@
+# Unreleased
+
+## Fixes
+
+- The minimum `tokio` is 1.53.3, and the lockfile uses `tokio` 1.54.1 and
+  `ctutils` 0.4.6. These releases fix RUSTSEC-2026-0386 and RUSTSEC-2026-0385.
+
 # v0.2.0
 
 First release of 0.2 without a pre-release suffix. The code is the same as in
