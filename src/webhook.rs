@@ -184,6 +184,9 @@ pub enum WebhookEvent {
     CallRtmpBroadcastStarted(CallEvent),
     CallRtmpBroadcastStopped(CallEvent),
     CallRing(CallEvent),
+    /// Sent once per ring when it has a final outcome. `ring_id`, `outcome`,
+    /// `settle_reason`, `settled_by` and `targets` are in [`CallEvent::extra`].
+    CallRingSettled(CallEvent),
     CallMissed(CallEvent),
     CallNotification(CallEvent),
     CallAccepted(CallEvent),
@@ -250,6 +253,7 @@ impl WebhookEvent {
             | WebhookEvent::CallRtmpBroadcastStarted(e)
             | WebhookEvent::CallRtmpBroadcastStopped(e)
             | WebhookEvent::CallRing(e)
+            | WebhookEvent::CallRingSettled(e)
             | WebhookEvent::CallMissed(e)
             | WebhookEvent::CallNotification(e)
             | WebhookEvent::CallAccepted(e)
@@ -332,6 +336,7 @@ pub fn parse_event(body: &[u8]) -> std::result::Result<WebhookEvent, WebhookErro
         "call.rtmp_broadcast_started" => WebhookEvent::CallRtmpBroadcastStarted(call_event()?),
         "call.rtmp_broadcast_stopped" => WebhookEvent::CallRtmpBroadcastStopped(call_event()?),
         "call.ring" => WebhookEvent::CallRing(call_event()?),
+        "call.ring_settled" => WebhookEvent::CallRingSettled(call_event()?),
         "call.missed" => WebhookEvent::CallMissed(call_event()?),
         "call.notification" => WebhookEvent::CallNotification(call_event()?),
         "call.accepted" => WebhookEvent::CallAccepted(call_event()?),
@@ -395,6 +400,38 @@ mod tests {
             }
             other => panic!("expected CallCreated, got {:?}", other.event_type()),
         }
+    }
+
+    #[test]
+    fn parses_ring_settled_event_with_its_outcome() {
+        let body = json!({
+            "type": "call.ring_settled",
+            "created_at": "2026-11-04T07:00:33Z",
+            "call_cid": "audio_call:abc",
+            "session_id": "session-1",
+            "ring_id": "ring-1",
+            "initiated_by": "sara",
+            "rang_at": "2026-11-04T07:00:00Z",
+            "outcome": "missed_all",
+            "settled_at": "2026-11-04T07:00:33Z",
+            "settled_by": "server",
+            "settle_reason": "timeout",
+            "targets": {
+                "ben": {"state": "missed", "state_at": "2026-11-04T07:00:33Z"}
+            }
+        })
+        .to_string();
+
+        let event = parse_event(body.as_bytes()).expect("parse ring settled webhook");
+        assert_eq!(event.event_type(), "call.ring_settled");
+        let WebhookEvent::CallRingSettled(event) = event else {
+            panic!("expected CallRingSettled, got {:?}", event.event_type());
+        };
+        assert_eq!(event.call_cid.as_deref(), Some("audio_call:abc"));
+        assert_eq!(event.session_id.as_deref(), Some("session-1"));
+        assert_eq!(event.extra["ring_id"], "ring-1");
+        assert_eq!(event.extra["outcome"], "missed_all");
+        assert_eq!(event.extra["targets"]["ben"]["state"], "missed");
     }
 
     #[test]
