@@ -4,6 +4,11 @@
 
 - The minimum `tokio` is 1.53.3, and the lockfile uses `tokio` 1.54.1 and
   `ctutils` 0.4.6. These releases fix RUSTSEC-2026-0386 and RUSTSEC-2026-0385.
+- The minimum `webrtc` is 0.17.3, and the lockfile uses `dtls` 0.17.3 and
+  `ctutils` 0.4.8. `dtls` 0.17.3 moves to `p256` and `p384` 0.14, which drop
+  `crypto-bigint` 0.5 and fix RUSTSEC-2026-0387. webrtc 0.17.3 also resends the
+  final DTLS flight when the peer retransmits, and a socket that stops accepting
+  writes no longer stops the ICE connectivity checks.
 
 # v0.2.0
 
