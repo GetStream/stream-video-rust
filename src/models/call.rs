@@ -639,6 +639,12 @@ pub struct CallTranscription {
     pub session_id: String,
     pub start_time: Timestamp,
     pub url: String,
+    /// Language of the transcription text. `None` when the language is unknown,
+    /// for example for transcriptions made before Stream reported it.
+    pub language: Option<String>,
+    /// `Some(true)` when this transcription translates the call's transcription
+    /// into [`Self::language`]. `None` for the original transcription.
+    pub translated: Option<bool>,
 }
 
 /// `list_transcriptions` response.
@@ -1207,6 +1213,45 @@ mod tests {
                 "translated": false
             })
         );
+    }
+
+    #[test]
+    fn transcriptions_expose_language_and_translation() {
+        let response: ListTranscriptionsResponse = serde_json::from_value(json!({
+            "duration": "1ms",
+            "transcriptions": [
+                {
+                    "filename": "original.jsonl",
+                    "session_id": "session-1",
+                    "url": "https://example.com/original.jsonl",
+                    "language": "en",
+                    "translated": false
+                },
+                {
+                    "filename": "translated.jsonl",
+                    "session_id": "session-1",
+                    "url": "https://example.com/translated.jsonl",
+                    "language": "fr",
+                    "translated": true
+                },
+                {
+                    "filename": "legacy.jsonl",
+                    "session_id": "session-0",
+                    "url": "https://example.com/legacy.jsonl"
+                }
+            ]
+        }))
+        .expect("transcriptions should deserialize");
+
+        let [original, translated, legacy] = response.transcriptions.as_slice() else {
+            panic!("expected three transcriptions");
+        };
+        assert_eq!(original.language.as_deref(), Some("en"));
+        assert_eq!(original.translated, Some(false));
+        assert_eq!(translated.language.as_deref(), Some("fr"));
+        assert_eq!(translated.translated, Some(true));
+        assert_eq!(legacy.language, None);
+        assert_eq!(legacy.translated, None);
     }
 
     #[test]
