@@ -19,7 +19,7 @@ pub use client::{
     ClientConfig, DEFAULT_BASE_URL, DEFAULT_COORDINATOR_WS_URL, NetworkLimits, RetryConfig,
 };
 #[doc(inline)]
-pub use error::{ApiError, Error, Result, TokenError, WebhookError};
+pub use error::{ApiError, Error, RateLimitInfo, Result, TokenError, WebhookError};
 #[doc(inline)]
 pub use token::{TokenClaims, TokenOptions};
 #[doc(inline)]
