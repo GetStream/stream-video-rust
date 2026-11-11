@@ -10,6 +10,14 @@ example for an older transcription. `translated` is `Some(true)` for a
 translation of the call's transcription made from translated closed captions,
 and `None` for the original transcription.
 
+### API errors carry the rate-limit window
+
+`ApiError::rate_limit` holds the `limit`, `remaining` and `reset` of the
+endpoint's rate-limit window, read from the `X-RateLimit-Limit`,
+`X-RateLimit-Remaining` and `X-RateLimit-Reset` headers of the error response.
+It is set for every API error, not only for HTTP 429, and is `None` when one of
+the headers is missing. `RateLimitInfo` is exported from the crate root.
+
 ## Fixes
 
 - The minimum `tokio` is 1.53.3, and the lockfile uses `tokio` 1.54.1 and
