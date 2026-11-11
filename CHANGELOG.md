@@ -10,6 +10,13 @@
   final DTLS flight when the peer retransmits, and a socket that stops accepting
   writes no longer stops the ICE connectivity checks.
 
+## Changes
+
+- The vendored SFU protocol adds the `NoiseCancellationEngine` enum and the
+  `engine` and `model` fields of `StartNoiseCancellationRequest` and
+  `StopNoiseCancellationRequest`. `start_noise_cancellation` and
+  `stop_noise_cancellation` leave them at their defaults.
+
 # v0.2.0
 
 First release of 0.2 without a pre-release suffix. The code is the same as in
