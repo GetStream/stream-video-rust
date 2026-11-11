@@ -20,7 +20,7 @@ use serde::de::DeserializeOwned;
 use serde_json::Value;
 use url::Url;
 
-use crate::error::{ApiError, Error, Result};
+use crate::error::{ApiError, Error, RateLimitInfo, Result};
 use crate::token;
 
 /// Default coordinator base URL (matches getstream-go's `DefaultBaseURL`).
@@ -608,6 +608,7 @@ fn build_api_error(status: StatusCode, headers: &HeaderMap, body: &[u8]) -> ApiE
             unrecoverable: false,
             exception_fields: Default::default(),
             retry_after: None,
+            rate_limit: None,
         };
         e.message = if body.is_empty() {
             "empty response body".to_string()
@@ -623,7 +624,17 @@ fn build_api_error(status: StatusCode, headers: &HeaderMap, body: &[u8]) -> ApiE
     if status == StatusCode::TOO_MANY_REQUESTS {
         err.retry_after = parse_retry_after(headers);
     }
+    err.rate_limit = parse_rate_limit(headers);
     err
+}
+
+fn parse_rate_limit(headers: &HeaderMap) -> Option<RateLimitInfo> {
+    let header = |name| headers.get(name)?.to_str().ok()?.trim().parse::<u64>().ok();
+    Some(RateLimitInfo {
+        limit: header("x-ratelimit-limit")?,
+        remaining: header("x-ratelimit-remaining")?,
+        reset: UNIX_EPOCH.checked_add(Duration::from_secs(header("x-ratelimit-reset")?))?,
+    })
 }
 
 fn parse_retry_after(headers: &HeaderMap) -> Option<Duration> {
@@ -675,6 +686,68 @@ mod tests {
         }
         assert_eq!(redacted.matches("<redacted>").count(), 4);
         assert!(redacted.contains("visible"));
+    }
+
+    fn rate_limit_headers(limit: &str, remaining: &str, reset: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert("X-RateLimit-Limit", limit.parse().expect("header value"));
+        headers.insert(
+            "X-RateLimit-Remaining",
+            remaining.parse().expect("header value"),
+        );
+        headers.insert("X-RateLimit-Reset", reset.parse().expect("header value"));
+        headers
+    }
+
+    #[test]
+    fn api_errors_carry_the_rate_limit_window() {
+        let mut headers = rate_limit_headers("60", "0", "1767225600");
+        headers.insert("Retry-After", "7".parse().expect("header value"));
+        let body = br#"{"code":9,"message":"Too many requests","StatusCode":429}"#;
+
+        let error = build_api_error(StatusCode::TOO_MANY_REQUESTS, &headers, body);
+
+        let rate_limit = error.rate_limit.expect("rate limit headers");
+        assert_eq!(rate_limit.limit, 60);
+        assert_eq!(rate_limit.remaining, 0);
+        assert_eq!(
+            rate_limit.reset,
+            UNIX_EPOCH + Duration::from_secs(1_767_225_600)
+        );
+        assert_eq!(error.retry_after, Some(Duration::from_secs(7)));
+
+        let error = build_api_error(
+            StatusCode::BAD_REQUEST,
+            &rate_limit_headers("1000", "999", "1767225600"),
+            b"not json",
+        );
+        assert_eq!(error.rate_limit.map(|r| r.remaining), Some(999));
+    }
+
+    #[test]
+    fn api_errors_without_a_complete_rate_limit_window_have_none() {
+        let body = br#"{"code":4,"message":"bad request","StatusCode":400}"#;
+        assert!(
+            build_api_error(StatusCode::BAD_REQUEST, &HeaderMap::new(), body)
+                .rate_limit
+                .is_none()
+        );
+        let mut partial = rate_limit_headers("60", "10", "1767225600");
+        partial.remove("X-RateLimit-Reset");
+        assert!(
+            build_api_error(StatusCode::BAD_REQUEST, &partial, body)
+                .rate_limit
+                .is_none()
+        );
+        assert!(
+            build_api_error(
+                StatusCode::BAD_REQUEST,
+                &rate_limit_headers("60", "-1", "1767225600"),
+                body
+            )
+            .rate_limit
+            .is_none()
+        );
     }
 
     #[test]

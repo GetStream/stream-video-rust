@@ -1,3 +1,37 @@
+# Unreleased
+
+## New Features
+
+### Transcriptions carry their language
+
+`CallTranscription` has `language` and `translated`. `language` is the language
+of the transcription text, and is `None` when Stream does not know it, for
+example for an older transcription. `translated` is `Some(true)` for a
+translation of the call's transcription made from translated closed captions,
+and `None` for the original transcription.
+
+### API errors carry the rate-limit window
+
+`ApiError::rate_limit` holds the `limit`, `remaining` and `reset` of the
+endpoint's rate-limit window, read from the `X-RateLimit-Limit`,
+`X-RateLimit-Remaining` and `X-RateLimit-Reset` headers of the error response.
+It is set for every API error, not only for HTTP 429, and is `None` when one of
+the headers is missing. `RateLimitInfo` is exported from the crate root.
+
+## Fixes
+
+- The minimum `tokio` is 1.53.3, and the lockfile uses `tokio` 1.54.1 and
+  `ctutils` 0.4.6. These releases fix RUSTSEC-2026-0386 and RUSTSEC-2026-0385.
+- The minimum `webrtc` is 0.17.3, and the lockfile uses `dtls` 0.17.3 and
+  `ctutils` 0.4.8. `dtls` 0.17.3 moves to `p256` and `p384` 0.14, which drop
+  `crypto-bigint` 0.5 and fix RUSTSEC-2026-0387. webrtc 0.17.3 also resends the
+  final DTLS flight when the peer retransmits, and a socket that stops accepting
+  writes no longer stops the ICE connectivity checks.
+- The vendored SFU protocol adds the `NoiseCancellationEngine` enum and the
+  `engine` and `model` fields of `StartNoiseCancellationRequest` and
+  `StopNoiseCancellationRequest`. `start_noise_cancellation` and
+  `stop_noise_cancellation` leave them at their defaults.
+
 # v0.2.0
 
 First release of 0.2 without a pre-release suffix. The code is the same as in
