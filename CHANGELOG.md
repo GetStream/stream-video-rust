@@ -10,6 +10,14 @@ Stream sends to the backend once per ring when the ring has a final outcome.
 `ring_id`, `outcome`, `settle_reason`, `settled_by` and `targets` are in
 `CallEvent::extra`. Before, the event was `WebhookEvent::Unknown`.
 
+### Transcriptions carry their language
+
+`CallTranscription` has `language` and `translated`. `language` is the language
+of the transcription text, and is `None` when Stream does not know it, for
+example for an older transcription. `translated` is `Some(true)` for a
+translation of the call's transcription made from translated closed captions,
+and `None` for the original transcription.
+
 ## Fixes
 
 - A build from a git checkout tries the download of the libvpx or libopus
@@ -24,9 +32,6 @@ Stream sends to the backend once per ring when the ring has a final outcome.
   `crypto-bigint` 0.5 and fix RUSTSEC-2026-0387. webrtc 0.17.3 also resends the
   final DTLS flight when the peer retransmits, and a socket that stops accepting
   writes no longer stops the ICE connectivity checks.
-
-## Changes
-
 - The vendored SFU protocol adds the `NoiseCancellationEngine` enum and the
   `engine` and `model` fields of `StartNoiseCancellationRequest` and
   `StopNoiseCancellationRequest`. `start_noise_cancellation` and
