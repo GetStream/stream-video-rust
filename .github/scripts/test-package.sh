@@ -20,7 +20,8 @@ curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
 
 cargo test --locked --lib
 
-bin=$(find target/debug/deps -maxdepth 1 -type f -perm -100 -name "getstream-*")
+# Cargo 1.100 builds the test binary in build/getstream/<hash>/out, not deps.
+bin=$(find target/debug -type f -perm -100 -name "getstream-*")
 test -n "$bin"
 # A static musl binary makes ldd fail, which is also a pass.
 ! ldd $bin | grep -E "libvpx|libopus"
