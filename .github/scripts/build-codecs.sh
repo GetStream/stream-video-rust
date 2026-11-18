@@ -1,7 +1,7 @@
 #!/bin/sh
 # Builds the static libvpx and libopus with build.rs in a manylinux or Alpine
 # container. Run it in the repository root; the archives end up in
-# target/debug/build/getstream-*/out/native/<target>.
+# out/native/<target> of the getstream build script under target/debug/build.
 set -eu
 
 nasm=""

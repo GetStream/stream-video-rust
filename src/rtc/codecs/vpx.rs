@@ -435,9 +435,14 @@ impl VpxSvcEncoder {
                 2 => &[67, 100],
                 _ => &[60, 80, 100],
             };
-            for temporal_id in 0..usize::from(mode.temporal_layers()) {
-                cfg.ts_rate_decimator[temporal_id] =
-                    1_u32 << (usize::from(mode.temporal_layers()) - temporal_id - 1);
+            let temporal_layers = usize::from(mode.temporal_layers());
+            for (temporal_id, decimator) in cfg
+                .ts_rate_decimator
+                .iter_mut()
+                .take(temporal_layers)
+                .enumerate()
+            {
+                *decimator = 1_u32 << (temporal_layers - temporal_id - 1);
             }
             let spatial_weights: &[u32] = match mode.spatial_layers() {
                 1 => &[1],

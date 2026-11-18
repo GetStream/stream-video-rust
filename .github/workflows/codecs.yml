@@ -48,7 +48,11 @@ jobs:
       - name: Collect
         run: |
           mkdir -p artifact
-          cp target/debug/build/getstream-*/out/native/${{ matrix.target }}/* artifact/
+          # Cargo 1.100 moved OUT_DIR from build/getstream-<hash>/out to
+          # build/getstream/<hash>/out.
+          dir=$(find target/debug/build -type d -path "*/out/native/${{ matrix.target }}")
+          test -n "$dir"
+          cp "$dir"/* artifact/
           for f in artifact/*.a; do
             echo "${{ matrix.target }} $(basename "$f") raw=$(wc -c <"$f") gzip=$(gzip -9c "$f" | wc -c)"
           done | tee -a "$GITHUB_STEP_SUMMARY"
