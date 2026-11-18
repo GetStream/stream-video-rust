@@ -1,3 +1,12 @@
+# Unreleased
+
+## Fixes
+
+- A build from a git checkout retries the download of the libvpx or libopus
+  source up to three times, and prints a cargo warning for each failed attempt.
+  Before, a connection that dropped partway through the download stopped the
+  build.
+
 # v0.2.0
 
 First release of 0.2 without a pre-release suffix. The code is the same as in
