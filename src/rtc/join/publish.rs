@@ -363,7 +363,10 @@ impl RtcCore {
             ));
         };
         signal
-            .start_noise_cancellation(signal::StartNoiseCancellationRequest { session_id })
+            .start_noise_cancellation(signal::StartNoiseCancellationRequest {
+                session_id,
+                ..Default::default()
+            })
             .await?;
         Ok(())
     }
@@ -378,7 +381,10 @@ impl RtcCore {
             ));
         };
         signal
-            .stop_noise_cancellation(signal::StopNoiseCancellationRequest { session_id })
+            .stop_noise_cancellation(signal::StopNoiseCancellationRequest {
+                session_id,
+                ..Default::default()
+            })
             .await?;
         Ok(())
     }

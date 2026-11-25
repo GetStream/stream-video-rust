@@ -7,7 +7,7 @@
 //! gates retries.
 
 use std::collections::HashMap;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use serde::Deserialize;
 
@@ -237,6 +237,11 @@ pub struct ApiError {
     /// Parsed `Retry-After` header on HTTP 429. Not part of the JSON body.
     #[serde(skip)]
     pub retry_after: Option<Duration>,
+
+    /// The rate-limit window of the endpoint, from the `X-RateLimit-*`
+    /// response headers. `None` when a header is missing or is not a number.
+    #[serde(skip)]
+    pub rate_limit: Option<RateLimitInfo>,
 }
 
 impl ApiError {
@@ -244,6 +249,19 @@ impl ApiError {
     pub fn is_rate_limited(&self) -> bool {
         self.status == 429
     }
+}
+
+/// The rate-limit values of one endpoint for the current rate-limit window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct RateLimitInfo {
+    /// The maximum number of requests in a window (`X-RateLimit-Limit`).
+    pub limit: u64,
+    /// The number of requests that the current window still permits
+    /// (`X-RateLimit-Remaining`).
+    pub remaining: u64,
+    /// The end time of the current window (`X-RateLimit-Reset`).
+    pub reset: SystemTime,
 }
 
 /// Webhook verification / parsing failures.
