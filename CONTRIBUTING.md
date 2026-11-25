@@ -145,9 +145,17 @@ downloads, use `cargo yank --version <version>`.
 ### Later releases (GitHub Actions)
 
 After the crate exists, configure Trusted Publishing on the crate settings
-page: repository `GetStream/stream-video-rust`, workflow `publish.yml`, no
-environment. That lets GitHub Actions publish without storing a crates.io
-token.
+page: repository `GetStream/stream-video-rust`, workflow `publish.yml`,
+environment `crates-io`. That lets GitHub Actions publish without storing a
+crates.io token.
+
+Then configure these GitHub repository settings:
+
+- Add required reviewers to the `crates-io` environment.
+- Set the deployment branches and tags of `crates-io` to **Selected**, and add
+  only the tag rule `v*`.
+- Add a tag ruleset for `refs/tags/v*` that blocks creation, update, and
+  deletion. Let only the release maintainers bypass it.
 
 Bump `version` in `Cargo.toml`, merge to `main`, then tag the same value:
 
@@ -157,8 +165,9 @@ git tag -a v0.1.0-preview.1 -m "v0.1.0-preview.1"
 git push origin v0.1.0-preview.1
 ```
 
-The [Publish](.github/workflows/publish.yml) workflow verifies the tag matches
-`Cargo.toml` and runs `cargo publish --locked`.
+The [Publish](.github/workflows/publish.yml) workflow waits until a reviewer of
+the `crates-io` environment approves the job. Then it makes sure that the tag is
+on `main` and matches `Cargo.toml`, and runs `cargo publish --locked`.
 
 ## Pull requests
 
