@@ -639,11 +639,13 @@ pub struct CallTranscription {
     pub session_id: String,
     pub start_time: Timestamp,
     pub url: String,
-    /// Language of the transcription text. `None` when the language is unknown,
-    /// for example for transcriptions made before Stream reported it.
+    /// The language of the transcription text. `None` when Stream does not
+    /// know the language, for example for a transcription that Stream made
+    /// before it added this field.
     pub language: Option<String>,
-    /// `Some(true)` when this transcription translates the call's transcription
-    /// into [`Self::language`]. `None` for the original transcription.
+    /// `Some(true)` when this transcription is a translation of the call
+    /// transcription into [`Self::language`]. `None` for the original
+    /// transcription.
     pub translated: Option<bool>,
 }
 

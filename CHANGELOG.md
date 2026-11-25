@@ -10,21 +10,24 @@ Stream sends to the backend once per ring when the ring has a final outcome.
 `ring_id`, `outcome`, `settle_reason`, `settled_by` and `targets` are in
 `CallEvent::extra`. Before, the event was `WebhookEvent::Unknown`.
 
-### Transcriptions carry their language
+### Transcriptions show their language
 
-`CallTranscription` has `language` and `translated`. `language` is the language
-of the transcription text, and is `None` when Stream does not know it, for
-example for an older transcription. `translated` is `Some(true)` for a
-translation of the call's transcription made from translated closed captions,
-and `None` for the original transcription.
+`CallTranscription` has two new fields: `language` and `translated`.
+`language` is the language of the transcription text. It is `None` when Stream
+does not know the language, for example for a transcription that Stream made
+before it added this field. `translated` is `Some(true)` when the transcription
+is a translation of the call transcription. Stream makes this translation from
+translated closed captions. `translated` is `None` for the original
+transcription.
 
-### API errors carry the rate-limit window
+### API errors show the rate-limit window
 
-`ApiError::rate_limit` holds the `limit`, `remaining` and `reset` of the
-endpoint's rate-limit window, read from the `X-RateLimit-Limit`,
-`X-RateLimit-Remaining` and `X-RateLimit-Reset` headers of the error response.
-It is set for every API error, not only for HTTP 429, and is `None` when one of
-the headers is missing. `RateLimitInfo` is exported from the crate root.
+`ApiError::rate_limit` contains the `limit`, `remaining` and `reset` values of
+the rate-limit window of the endpoint. The SDK reads these values from the
+`X-RateLimit-Limit`, `X-RateLimit-Remaining` and `X-RateLimit-Reset` headers of
+the error response. The SDK sets `rate_limit` for all API errors, not only for
+HTTP 429. `rate_limit` is `None` when a header is missing or is not a number.
+The crate root exports `RateLimitInfo`.
 
 ## Fixes
 
@@ -36,14 +39,15 @@ the headers is missing. `RateLimitInfo` is exported from the crate root.
 - The minimum `tokio` is 1.53.3, and the lockfile uses `tokio` 1.54.1 and
   `ctutils` 0.4.6. These releases fix RUSTSEC-2026-0386 and RUSTSEC-2026-0385.
 - The minimum `webrtc` is 0.17.3, and the lockfile uses `dtls` 0.17.3 and
-  `ctutils` 0.4.8. `dtls` 0.17.3 moves to `p256` and `p384` 0.14, which drop
-  `crypto-bigint` 0.5 and fix RUSTSEC-2026-0387. webrtc 0.17.3 also resends the
-  final DTLS flight when the peer retransmits, and a socket that stops accepting
-  writes no longer stops the ICE connectivity checks.
-- The vendored SFU protocol adds the `NoiseCancellationEngine` enum and the
-  `engine` and `model` fields of `StartNoiseCancellationRequest` and
+  `ctutils` 0.4.8. `dtls` 0.17.3 uses `p256` and `p384` 0.14, so the lockfile
+  no longer has `crypto-bigint` 0.5, which has the vulnerability
+  RUSTSEC-2026-0387. In webrtc 0.17.3, DTLS sends its final flight again when
+  the peer retransmits. A socket whose writes do not complete no longer stops
+  the ICE connectivity checks.
+- The vendored SFU protocol adds the `NoiseCancellationEngine` enum. It also
+  adds the `engine` and `model` fields to `StartNoiseCancellationRequest` and
   `StopNoiseCancellationRequest`. `start_noise_cancellation` and
-  `stop_noise_cancellation` leave them at their defaults.
+  `stop_noise_cancellation` set these fields to their default values.
 
 # v0.2.0
 

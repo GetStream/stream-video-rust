@@ -238,8 +238,8 @@ pub struct ApiError {
     #[serde(skip)]
     pub retry_after: Option<Duration>,
 
-    /// The endpoint's rate-limit window from the `X-RateLimit-*` response
-    /// headers. `None` when the response did not carry all three headers.
+    /// The rate-limit window of the endpoint, from the `X-RateLimit-*`
+    /// response headers. `None` when a header is missing or is not a number.
     #[serde(skip)]
     pub rate_limit: Option<RateLimitInfo>,
 }
@@ -251,15 +251,16 @@ impl ApiError {
     }
 }
 
-/// The quota and usage of one endpoint for the current rate-limit window.
+/// The rate-limit values of one endpoint for the current rate-limit window.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct RateLimitInfo {
-    /// Maximum number of calls in a window (`X-RateLimit-Limit`).
+    /// The maximum number of requests in a window (`X-RateLimit-Limit`).
     pub limit: u64,
-    /// Calls left in the current window (`X-RateLimit-Remaining`).
+    /// The number of requests that the current window still permits
+    /// (`X-RateLimit-Remaining`).
     pub remaining: u64,
-    /// When the current window ends (`X-RateLimit-Reset`).
+    /// The end time of the current window (`X-RateLimit-Reset`).
     pub reset: SystemTime,
 }
 
