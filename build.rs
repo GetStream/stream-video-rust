@@ -228,8 +228,8 @@ impl<'a> Cache<'a> {
     }
 
     /// Downloads the archive to a temporary file and keeps it only when its
-    /// SHA-256 matches. A failed transfer is retried, because a mirror can drop
-    /// the connection partway through.
+    /// SHA-256 matches. A failed transfer other than an HTTP 404 is retried,
+    /// because a mirror can drop the connection partway through.
     fn download(&self, archive: &Path) {
         const ATTEMPTS: u64 = 3;
         let url = self.source.url;
@@ -237,13 +237,13 @@ impl<'a> Cache<'a> {
         for attempt in 1..=ATTEMPTS {
             match fetch(url, &partial) {
                 Ok(()) => break,
-                Err(e) if attempt < ATTEMPTS => {
+                Err(e) if attempt < ATTEMPTS && !matches!(e, ureq::Error::StatusCode(404)) => {
                     println!(
                         "cargo:warning=cannot download {url} (attempt {attempt} of {ATTEMPTS}): {e}"
                     );
                     thread::sleep(Duration::from_secs(2 * attempt));
                 }
-                Err(e) => panic!("cannot download {url} after {ATTEMPTS} attempts: {e}"),
+                Err(e) => panic!("cannot download {url} (attempt {attempt} of {ATTEMPTS}): {e}"),
             }
         }
         let actual = sha256(&partial);
@@ -287,7 +287,11 @@ impl<'a> Cache<'a> {
 }
 
 fn fetch(url: &str, path: &Path) -> Result<(), ureq::Error> {
-    let response = ureq::get(url).call()?;
+    let response = ureq::get(url)
+        .config()
+        .timeout_global(Some(Duration::from_secs(60)))
+        .build()
+        .call()?;
     let mut file = File::create(path)?;
     io::copy(&mut response.into_body().into_reader(), &mut file)?;
     Ok(())
