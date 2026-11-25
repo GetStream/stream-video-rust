@@ -1,4 +1,4 @@
-# Unreleased
+# v0.2.1
 
 ## New Features
 
@@ -31,6 +31,16 @@ The crate root exports `RateLimitInfo`.
 
 ## Fixes
 
+- `Stream::create_token_with` does not make a token without an `exp` claim
+  when `TokenOptions::expiration` is `Some`. `Some(Duration::ZERO)` returns
+  `TokenError::InvalidClaims`. A lifetime shorter than one second gives an
+  `exp` one second after `iat`. Before, a lifetime shorter than one second
+  made a token with no `exp` claim, and this token did not expire. For example,
+  `saturating_duration_since` on a deadline in the past gives
+  `Duration::ZERO`.
+- `TokenOptions::call_cids` set to `Some` with an empty list returns
+  `TokenError::InvalidClaims`. Before, the token had no `call_cids` claim, so
+  it was not limited to specific calls.
 - A build from a git checkout tries the download of the libvpx or libopus
   source up to three times, and prints a cargo warning before each retry. Each
   attempt has 60 s for the full download. An HTTP 404 status is not retried.

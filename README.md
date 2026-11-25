@@ -99,7 +99,7 @@ for the commands.
 ## Installation
 
 ```bash
-cargo add getstream@0.2.0 tracing
+cargo add getstream@0.2.1 tracing
 cargo add tokio --features macros,rt-multi-thread,signal
 ```
 
@@ -107,7 +107,7 @@ Or in `Cargo.toml`:
 
 ```toml
 [dependencies]
-getstream = "0.2.0"
+getstream = "0.2.1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
 tracing = "0.1"
 ```
