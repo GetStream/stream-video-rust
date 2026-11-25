@@ -44,6 +44,8 @@ The crate root exports `RateLimitInfo`.
   RUSTSEC-2026-0387. In webrtc 0.17.3, DTLS sends its final flight again when
   the peer retransmits. A socket whose writes do not complete no longer stops
   the ICE connectivity checks.
+- The minimum `url` is 2.5.9. `url` 2.5.8 and earlier have the vulnerability
+  RUSTSEC-2026-0592.
 - The vendored SFU protocol adds the `NoiseCancellationEngine` enum. It also
   adds the `engine` and `model` fields to `StartNoiseCancellationRequest` and
   `StopNoiseCancellationRequest`. `start_noise_cancellation` and
