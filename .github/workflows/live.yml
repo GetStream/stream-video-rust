@@ -16,10 +16,6 @@ concurrency:
 env:
   CARGO_INCREMENTAL: "0"
   CARGO_TERM_COLOR: always
-  STREAM_API_KEY: ${{ secrets.STREAM_API_KEY }}
-  STREAM_API_SECRET: ${{ secrets.STREAM_API_SECRET }}
-  OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-  OPENAI_REALTIME_MODEL: ${{ secrets.OPENAI_REALTIME_MODEL }}
 
 jobs:
   live:
@@ -28,16 +24,30 @@ jobs:
     timeout-minutes: 55
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: ./.github/actions/setup-rust
         with:
           toolchain: stable
+      # The credentials are set on the two steps that read them, not on the workflow, so
+      # checkout and setup-rust never see them.
       - name: Require credentials
+        env:
+          STREAM_API_KEY: ${{ secrets.STREAM_API_KEY }}
+          STREAM_API_SECRET: ${{ secrets.STREAM_API_SECRET }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
         run: |
           if [[ -z "${STREAM_API_KEY:-}" || -z "${STREAM_API_SECRET:-}" || -z "${OPENAI_API_KEY:-}" ]]; then
             echo "STREAM_API_KEY, STREAM_API_SECRET, and OPENAI_API_KEY are required." >&2
             exit 1
           fi
-      - run: >-
+      - name: Live tests
+        env:
+          STREAM_API_KEY: ${{ secrets.STREAM_API_KEY }}
+          STREAM_API_SECRET: ${{ secrets.STREAM_API_SECRET }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          OPENAI_REALTIME_MODEL: ${{ secrets.OPENAI_REALTIME_MODEL }}
+        run: >-
           cargo test --locked
           --test video_rest
           --test rtc_join

@@ -37,6 +37,8 @@ jobs:
             runner: macos-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       # `docker run` instead of a job container: JavaScript actions cannot run
       # in an Alpine (musl) container.
       - name: Build in container
