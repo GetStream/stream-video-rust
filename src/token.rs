@@ -41,12 +41,22 @@ const RESERVED_CLAIMS: [&str; 7] = [
 /// [`crate::Stream::decode_token`].
 #[derive(Debug, Clone, Default)]
 pub struct TokenOptions {
-    /// Token lifetime. When set, an `exp` claim is added (`iat + expiration`).
+    /// Token lifetime.
+    ///
+    /// - `None`: no `exp` claim; the token does not expire.
+    /// - `Some(d)`: an `exp` claim of `iat + d` in whole seconds. Fractional
+    ///   seconds are truncated, except that a positive lifetime under one
+    ///   second rounds up to one second. `Some(Duration::ZERO)` is rejected
+    ///   with [`TokenError::InvalidClaims`] rather than minting a token that
+    ///   never expires, and a lifetime whose `exp` would not fit in an `i64`
+    ///   is rejected with [`TokenError::TimestampOverflow`].
     pub expiration: Option<Duration>,
     /// Role claim for the user.
     pub role: Option<String>,
     /// Call CIDs the token grants access to (`call_cids` claim). Required for
-    /// call tokens.
+    /// call tokens. `Some` with an empty list is rejected with
+    /// [`TokenError::InvalidClaims`] rather than minting a token that is not
+    /// call-scoped; use `None` for that.
     pub call_cids: Option<Vec<String>>,
     /// Additional custom claims merged into the token payload.
     pub custom: Map<String, Value>,
@@ -182,22 +192,27 @@ fn create_user_token_at(
     claims.insert("user_id".into(), Value::String(user_id.to_string()));
     claims.insert("iat".into(), Value::Number(now.into()));
 
-    if let Some(exp) = opts.expiration {
-        let secs = exp.as_secs();
-        if secs > 0 {
-            let secs = i64::try_from(secs).map_err(|_| TokenError::TimestampOverflow)?;
-            let expires_at = now.checked_add(secs).ok_or(TokenError::TimestampOverflow)?;
-            claims.insert("exp".into(), Value::Number(expires_at.into()));
-        }
+    if let Some(expiration) = opts.expiration {
+        let expires_at = now
+            .checked_add(lifetime_seconds(expiration)?)
+            .ok_or(TokenError::TimestampOverflow)?;
+        claims.insert("exp".into(), Value::Number(expires_at.into()));
     }
     if let Some(role) = &opts.role
         && !role.is_empty()
     {
         claims.insert("role".into(), Value::String(role.clone()));
     }
-    if let Some(cids) = &opts.call_cids
-        && !cids.is_empty()
-    {
+    if let Some(cids) = &opts.call_cids {
+        // An explicit but empty scope must not silently widen into an
+        // unscoped token.
+        if cids.is_empty() {
+            return Err(TokenError::InvalidClaims(
+                "call_cids must not be empty when set; use None for a token that is not call-scoped"
+                    .into(),
+            )
+            .into());
+        }
         claims.insert(
             "call_cids".into(),
             Value::Array(cids.iter().cloned().map(Value::String).collect()),
@@ -205,6 +220,28 @@ fn create_user_token_at(
     }
 
     encode_jwt(secret, &Value::Object(claims))
+}
+
+/// Convert a requested token lifetime into whole seconds for the `exp` claim.
+///
+/// An explicitly requested lifetime always yields an `exp` claim or an error;
+/// it never falls back to a non-expiring token. `Duration::ZERO` (for example
+/// from `saturating_duration_since` on a deadline that has already passed) is
+/// rejected. A positive sub-second lifetime rounds up to one second, the
+/// smallest lifetime `exp` can express. Longer lifetimes are truncated to whole
+/// seconds, so the token never outlives the requested lifetime by more than the
+/// one-second minimum.
+fn lifetime_seconds(expiration: Duration) -> Result<i64> {
+    if expiration.is_zero() {
+        return Err(TokenError::InvalidClaims(
+            "expiration must be greater than zero; use None for a token without exp".into(),
+        )
+        .into());
+    }
+    let seconds = expiration.as_secs().max(1);
+    i64::try_from(seconds)
+        .map_err(|_| TokenError::TimestampOverflow)
+        .map_err(Into::into)
 }
 
 /// Verify a token's HS256 signature against `secret` and return its claims.
@@ -570,6 +607,104 @@ mod tests {
                     .expect_err("timestamp overflow")
             ),
             TokenError::TimestampOverflow
+        ));
+    }
+
+    fn minted_exp(expiration: Duration, now: i64) -> Result<Option<i64>> {
+        let options = TokenOptions {
+            expiration: Some(expiration),
+            ..Default::default()
+        };
+        let token = create_user_token_at(SECRET, "user", &options, now)?;
+        Ok(decode_token(SECRET, &token)?.exp)
+    }
+
+    #[test]
+    fn zero_expiration_is_rejected_instead_of_minting_a_non_expiring_token() {
+        assert!(matches!(
+            token_error(minted_exp(Duration::ZERO, 100).expect_err("zero expiration")),
+            TokenError::InvalidClaims(message) if message.contains("expiration")
+        ));
+    }
+
+    #[test]
+    fn sub_second_expiration_rounds_up_to_one_second() {
+        for expiration in [
+            Duration::from_nanos(1),
+            Duration::from_millis(1),
+            Duration::from_millis(999),
+        ] {
+            assert_eq!(
+                minted_exp(expiration, 100).expect("sub-second expiration"),
+                Some(101),
+                "{expiration:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn whole_second_expirations_truncate_fractional_seconds() {
+        assert_eq!(
+            minted_exp(Duration::from_secs(1), 100).expect("1s"),
+            Some(101)
+        );
+        assert_eq!(
+            minted_exp(Duration::from_millis(1_999), 100).expect("1.999s"),
+            Some(101)
+        );
+        assert_eq!(
+            minted_exp(Duration::from_secs(3_600), 100).expect("1h"),
+            Some(3_700)
+        );
+    }
+
+    #[test]
+    fn very_large_expirations_mint_or_overflow_but_never_drop_exp() {
+        let hundred_years = Duration::from_secs(100 * 365 * 24 * 60 * 60);
+        assert_eq!(
+            minted_exp(hundred_years, 1_700_000_000).expect("100 years"),
+            Some(1_700_000_000 + 3_153_600_000)
+        );
+
+        let largest = Duration::from_secs(u64::try_from(i64::MAX - 100).expect("fits"));
+        assert_eq!(
+            minted_exp(largest, 100).expect("exp at i64::MAX"),
+            Some(i64::MAX)
+        );
+
+        for expiration in [
+            Duration::from_secs(u64::try_from(i64::MAX - 99).expect("fits")),
+            Duration::from_secs(u64::MAX),
+            Duration::MAX,
+        ] {
+            assert!(
+                matches!(
+                    token_error(minted_exp(expiration, 100).expect_err("overflow")),
+                    TokenError::TimestampOverflow
+                ),
+                "{expiration:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn absent_expiration_mints_no_exp_claim() {
+        let token = create_user_token_at(SECRET, "user", &TokenOptions::default(), 100)
+            .expect("token without expiration");
+        assert_eq!(decode_token(SECRET, &token).expect("claims").exp, None);
+    }
+
+    #[test]
+    fn empty_call_cids_are_rejected_instead_of_minting_an_unscoped_token() {
+        let options = TokenOptions {
+            call_cids: Some(Vec::new()),
+            ..Default::default()
+        };
+        assert!(matches!(
+            token_error(
+                create_user_token_at(SECRET, "user", &options, 100).expect_err("empty call_cids")
+            ),
+            TokenError::InvalidClaims(message) if message.contains("call_cids")
         ));
     }
 

@@ -112,7 +112,9 @@ pub enum TokenError {
     #[error("JWT signature verification failed")]
     SignatureMismatch,
 
-    /// Reserved claims were absent or had incompatible JSON types.
+    /// Reserved claims were absent or had incompatible JSON types, or token
+    /// options requested claims that cannot be minted safely (for example a
+    /// zero expiration or an empty `call_cids` list).
     #[error("invalid JWT claims: {0}")]
     InvalidClaims(String),
 
