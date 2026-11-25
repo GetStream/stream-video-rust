@@ -15,6 +15,8 @@ use std::fs::{self, File};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::thread;
+use std::time::Duration;
 
 use sha2::{Digest, Sha256};
 
@@ -226,16 +228,24 @@ impl<'a> Cache<'a> {
     }
 
     /// Downloads the archive to a temporary file and keeps it only when its
-    /// SHA-256 matches.
+    /// SHA-256 matches. A failed transfer other than an HTTP 404 is retried,
+    /// because a mirror can drop the connection partway through.
     fn download(&self, archive: &Path) {
+        const ATTEMPTS: u64 = 3;
         let url = self.source.url;
         let partial = self.dir.join("source.tar.gz.part");
-        let response = ureq::get(url)
-            .call()
-            .unwrap_or_else(|e| panic!("cannot download {url}: {e}"));
-        let mut file = File::create(&partial).expect("create the download file");
-        io::copy(&mut response.into_body().into_reader(), &mut file)
-            .unwrap_or_else(|e| panic!("cannot download {url}: {e}"));
+        for attempt in 1..=ATTEMPTS {
+            match fetch(url, &partial) {
+                Ok(()) => break,
+                Err(e) if attempt < ATTEMPTS && !matches!(e, ureq::Error::StatusCode(404)) => {
+                    println!(
+                        "cargo:warning=cannot download {url} (attempt {attempt} of {ATTEMPTS}): {e}"
+                    );
+                    thread::sleep(Duration::from_secs(2 * attempt));
+                }
+                Err(e) => panic!("cannot download {url} (attempt {attempt} of {ATTEMPTS}): {e}"),
+            }
+        }
         let actual = sha256(&partial);
         if actual != self.source.sha256 {
             let _ = fs::remove_file(&partial);
@@ -274,6 +284,17 @@ impl<'a> Cache<'a> {
         fs::write(&stamp, key).expect("write the build stamp");
         build
     }
+}
+
+fn fetch(url: &str, path: &Path) -> Result<(), ureq::Error> {
+    let response = ureq::get(url)
+        .config()
+        .timeout_global(Some(Duration::from_secs(60)))
+        .build()
+        .call()?;
+    let mut file = File::create(path)?;
+    io::copy(&mut response.into_body().into_reader(), &mut file)?;
+    Ok(())
 }
 
 fn sha256(path: &Path) -> String {

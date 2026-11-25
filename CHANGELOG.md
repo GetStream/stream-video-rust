@@ -1,3 +1,13 @@
+# Unreleased
+
+## Fixes
+
+- A build from a git checkout tries the download of the libvpx or libopus
+  source up to three times, and prints a cargo warning before each retry. Each
+  attempt has 60 s for the full download. An HTTP 404 status is not retried.
+  Before, a connection that dropped partway through the download stopped the
+  build, and a stalled connection made the build wait with no limit.
+
 # v0.2.0
 
 First release of 0.2 without a pre-release suffix. The code is the same as in
