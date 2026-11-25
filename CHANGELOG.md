@@ -1,5 +1,15 @@
 # Unreleased
 
+## New Features
+
+### Typed `call.ring_settled` webhook
+
+`parse_event` and `Stream::parse_webhook` return
+`WebhookEvent::CallRingSettled` for the `call.ring_settled` webhook, which
+Stream sends to the backend once per ring when the ring has a final outcome.
+`ring_id`, `outcome`, `settle_reason`, `settled_by` and `targets` are in
+`CallEvent::extra`. Before, the event was `WebhookEvent::Unknown`.
+
 ## Fixes
 
 - A build from a git checkout tries the download of the libvpx or libopus
