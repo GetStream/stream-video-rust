@@ -41,8 +41,10 @@ jobs:
         with:
           # Full history, for the ancestry check below.
           fetch-depth: 0
-      # Anyone who can push can push a v* tag, on any commit. Only publish a tag whose
-      # commit has already been merged to main.
+      # Only publish a tag whose commit has already been merged to main. This catches a tag
+      # pushed on the wrong commit. It cannot stop a deliberate one, because a tag push runs
+      # the tagged commit's copy of this file; the tag ruleset and this environment's
+      # reviewers do that.
       - name: Verify the tag is on main
         env:
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
