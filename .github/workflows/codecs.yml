@@ -44,6 +44,9 @@ jobs:
       - name: Build in container
         if: matrix.image
         run: docker run --rm -v "$PWD:/w" -w /w "${{ matrix.image }}" sh .github/scripts/build-codecs.sh
+      - name: Install Rust toolchain
+        if: '!matrix.image'
+        uses: dtolnay/rust-toolchain@stable
       - name: Build
         if: '!matrix.image'
         run: cargo check --locked --lib
