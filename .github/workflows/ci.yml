@@ -48,7 +48,7 @@ jobs:
 
   test:
     name: ${{ matrix.name }}
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ matrix.os == 'macos-latest' && fromJSON('{"group":"scaleway-macos"}') || matrix.os }}
     timeout-minutes: 35
     strategy:
       fail-fast: false
