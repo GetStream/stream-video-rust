@@ -41,6 +41,9 @@ jobs:
         with:
           # The check in the next step needs the full git history.
           fetch-depth: 0
+          # The ancestry check is local and cargo publish authenticates with the crates.io
+          # token, so nothing here needs GITHUB_TOKEN in .git/config.
+          persist-credentials: false
       # Publish only a tag that points at a commit on main. This step stops a tag on an
       # incorrect commit. It does not stop a tag on a commit that changes this file, because
       # a tag push uses the file from that commit. The tag ruleset and the reviewers of this
